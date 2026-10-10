@@ -3,14 +3,14 @@ setlocal EnableExtensions EnableDelayedExpansion
 
 REM ============================================================
 REM CrowdGPT Universal Installer for Windows
-REM v7
+REM v8
 REM  - venv created at FINAL path (no relocation)
 REM  - AMD DirectML: transformers pinned to 4.x (torch 2.4.1 ceiling)
 REM  - CUDA/ROCm/Intel/CPU: transformers 5.x as normal
 REM  - torch <-> transformers compatibility verified BEFORE launch
 REM  - uninstaller self-deletes via delayed cmd
 REM  - ROCm GPU allow-list matches AMD's real Windows matrix
-REM  - no TRANSFORMERS_DISABLE_TORCH_CHECK hack (no longer needed)
+REM  - v8: fixed unescaped parens in echo inside if() block
 REM ============================================================
 
 set "REPO_URL=https://github.com/Vxtzq/CrowdGPT.git"
@@ -69,12 +69,12 @@ exit /b 0
 
 echo.
 echo ============================================================
-echo                 CrowdGPT Installer  (v7)
+echo                 CrowdGPT Installer  (v8)
 echo ============================================================
 echo.
 
 REM ------------------------------------------------------------
-REM 0. Paths (venv goes straight to its final home)
+REM 0. Paths
 REM ------------------------------------------------------------
 set "APP_DIR=%LOCALAPPDATA%\CrowdGPT"
 set "BIN_DIR=%APP_DIR%"
@@ -283,7 +283,7 @@ goto :pytorch_cpu
 :pytorch_amd_rocm
 echo [INFO] Trying official AMD ROCm PyTorch for Windows...
 echo        Requires Radeon RX 7900 XTX/XT/GRE, RX 9070 XT/9070,
-echo        or Ryzen AI Max/Max+ (Strix Halo).
+echo        or Ryzen AI Max/Max+ Strix Halo.
 "!APP_PY!" -m pip install torch torchvision torchaudio --index-url https://repo.radeon.com/rocm/windows/rocm-rel-6.4.4/
 if not errorlevel 1 goto :pytorch_done
 echo.
@@ -352,12 +352,13 @@ del "!TMP_REQ!" >nul 2>nul
 
 REM ------------------------------------------------------------
 REM 7b. AMD DirectML: pin transformers to 4.x
-REM     (torch-directml is upstream-stuck on torch 2.4.1;
-REM      transformers 5.x refuses torch < 2.5)
+REM     torch-directml is upstream-stuck on torch 2.4.1;
+REM     transformers 5.x refuses torch < 2.5.
 REM ------------------------------------------------------------
 if /I "!BACKEND!"=="amd" (
     echo.
-    echo [INFO] AMD DirectML: pinning transformers to 4.x (torch 2.4.1 ceiling)...
+    REM >>> FIX v8: parens escaped with ^ so cmd block parser is happy
+    echo [INFO] AMD DirectML: pinning transformers to 4.x ^(torch 2.4.1 ceiling^)...
     "!APP_PY!" -m pip install --upgrade "transformers>=4.45,<5.0"
     if errorlevel 1 (
         echo [ERROR] Failed to pin transformers to 4.x for AMD DirectML.
@@ -392,7 +393,7 @@ if "!WV2_FOUND!"=="1" (
 )
 
 REM ------------------------------------------------------------
-REM 9. Verify - torch, transformers link, backend device
+REM 9. Verify
 REM ------------------------------------------------------------
 echo.
 echo ============================================================
@@ -401,7 +402,6 @@ echo ============================================================
 "!APP_PY!" -c "import sys, torch; print('  Python:', sys.version.split()[0]); print('  Torch:  ', torch.__version__); print('  CUDA:   ', torch.cuda.is_available(), ('' if not torch.cuda.is_available() else '(' + torch.cuda.get_device_name(0) + ')'))"
 if errorlevel 1 echo [WARN] Torch import failed.
 
-REM --- THE important check: can transformers actually use torch? ---
 "!APP_PY!" -c "import transformers, torch; assert transformers.utils.is_torch_available(), 'transformers refuses to use installed torch (version mismatch)'; print('  transformers:', transformers.__version__, '-> torch', torch.__version__, 'linked OK')"
 if errorlevel 1 (
     echo.
@@ -410,15 +410,14 @@ if errorlevel 1 (
     if /I "!BACKEND!"=="amd" (
         echo         Expected fix: transformers should have been pinned to 4.x.
         echo         Try manually:
-        echo           "!APP_PY!" -m pip install "transformers^>=4.45,^<5.0"
+        echo           pip install "transformers>=4.45,<5.0"
     ) else (
         echo         Try reinstalling transformers:
-        echo           "!APP_PY!" -m pip install --force-reinstall transformers
+        echo           pip install --force-reinstall transformers
     )
     goto :fatal
 )
 
-REM --- DirectML device sanity check (AMD only) ---
 if /I "!BACKEND!"=="amd" (
     "!APP_PY!" -c "import torch_directml as d; assert d.is_available(), 'no DirectML device'; print('  DirectML:', d.device_name(0))"
     if errorlevel 1 (
@@ -529,7 +528,7 @@ set "REG_PS=%TEMP%\crowdgpt-reg-%RANDOM%.ps1"
 > "!REG_PS!"  echo $k = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\CrowdGPT'
 >> "!REG_PS!" echo New-Item -Path $k -Force ^| Out-Null
 >> "!REG_PS!" echo Set-ItemProperty -Path $k -Name 'DisplayName'     -Value 'CrowdGPT'
->> "!REG_PS!" echo Set-ItemProperty -Path $k -Name 'DisplayVersion'  -Value '0.7'
+>> "!REG_PS!" echo Set-ItemProperty -Path $k -Name 'DisplayVersion'  -Value '0.8'
 >> "!REG_PS!" echo Set-ItemProperty -Path $k -Name 'Publisher'       -Value 'CrowdGPT Project'
 >> "!REG_PS!" echo Set-ItemProperty -Path $k -Name 'InstallLocation' -Value '!APP_DIR!'
 >> "!REG_PS!" echo Set-ItemProperty -Path $k -Name 'UninstallString' -Value ('"' + '!APP_DIR!\uninstall.bat' + '"')
@@ -538,7 +537,7 @@ set "REG_PS=%TEMP%\crowdgpt-reg-%RANDOM%.ps1"
 powershell -NoProfile -ExecutionPolicy Bypass -File "!REG_PS!"
 del "!REG_PS!" >nul 2>nul
 
-REM ---- Uninstaller (self-deletes via delayed external cmd) ----
+REM ---- Uninstaller ----
 > "!APP_DIR!\uninstall.bat"  echo @echo off
 >> "!APP_DIR!\uninstall.bat" echo setlocal
 >> "!APP_DIR!\uninstall.bat" echo echo Uninstalling CrowdGPT...
@@ -649,7 +648,6 @@ exit /b 1
 
 :detect_no_nvidia
 
-REM --- Intel Arc? ---
 powershell -NoProfile -Command "try { $g = Get-CimInstance Win32_VideoController | Select-Object -ExpandProperty Name; if ($g -match 'Intel.*Arc') { exit 0 } else { exit 1 } } catch { exit 1 }"
 if not errorlevel 1 (
     set "BACKEND=intel"
@@ -658,7 +656,6 @@ if not errorlevel 1 (
     exit /b 0
 )
 
-REM --- AMD? ---
 set "AMD_GPU_NAME="
 for /f "usebackq delims=" %%G in (`powershell -NoProfile -Command "$g = Get-CimInstance Win32_VideoController ^| Select-Object -ExpandProperty Name; $a = $g ^| Where-Object { $_ -match 'AMD^|Radeon' }; if ($a) { $a -join ' / ' }"`) do set "AMD_GPU_NAME=%%G"
 
@@ -669,10 +666,6 @@ if not defined AMD_GPU_NAME (
     exit /b 0
 )
 
-REM AMD's real Windows ROCm support matrix (ROCm 6.4):
-REM   Radeon RX 7900 XTX / XT / GRE
-REM   Radeon RX 9070 XT / 9070
-REM   Ryzen AI Max / Max+  (Strix Halo)
 echo !AMD_GPU_NAME! | findstr /I /C:"RX 7900" /C:"RX 9070" /C:"Ryzen AI Max" >nul
 if not errorlevel 1 (
     set "BACKEND=amd-rocm"

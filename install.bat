@@ -3,7 +3,7 @@ setlocal EnableExtensions EnableDelayedExpansion
 
 REM ============================================================
 REM CrowdGPT Universal Installer for Windows
-REM v9
+REM v9.1
 REM  - venv created at FINAL path (no relocation)
 REM  - AMD DirectML: transformers pinned to 4.x (torch 2.4.1 ceiling)
 REM  - CUDA/ROCm/Intel/CPU: transformers 5.x as normal
@@ -13,6 +13,8 @@ REM  - ROCm GPU allow-list matches AMD's real Windows matrix
 REM  - v8: fixed unescaped parens in echo inside if() block
 REM  - v9: AMD GPU name captured via temp file (v5 approach);
 REM        the for/f+inline-PowerShell variant was broken
+REM  - v9.1: collapse whitespace in AMD GPU name; drop redundant
+REM          "AMD " prefix in WHEEL_NOTE (was showing "AMD AMD")
 REM ============================================================
 
 set "REPO_URL=https://github.com/Vxtzq/CrowdGPT.git"
@@ -71,7 +73,7 @@ exit /b 0
 
 echo.
 echo ============================================================
-echo                 CrowdGPT Installer  (v9)
+echo                 CrowdGPT Installer  (v9.1)
 echo ============================================================
 echo.
 
@@ -547,7 +549,7 @@ set "REG_PS=%TEMP%\crowdgpt-reg-%RANDOM%.ps1"
 > "!REG_PS!"  echo $k = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\CrowdGPT'
 >> "!REG_PS!" echo New-Item -Path $k -Force ^| Out-Null
 >> "!REG_PS!" echo Set-ItemProperty -Path $k -Name 'DisplayName'     -Value 'CrowdGPT'
->> "!REG_PS!" echo Set-ItemProperty -Path $k -Name 'DisplayVersion'  -Value '0.9'
+>> "!REG_PS!" echo Set-ItemProperty -Path $k -Name 'DisplayVersion'  -Value '0.9.1'
 >> "!REG_PS!" echo Set-ItemProperty -Path $k -Name 'Publisher'       -Value 'CrowdGPT Project'
 >> "!REG_PS!" echo Set-ItemProperty -Path $k -Name 'InstallLocation' -Value '!APP_DIR!'
 >> "!REG_PS!" echo Set-ItemProperty -Path $k -Name 'UninstallString' -Value ('"' + '!APP_DIR!\uninstall.bat' + '"')
@@ -679,11 +681,17 @@ REM --- AMD: capture GPU name via temp file (v5 approach) ---
 REM     Do NOT use for/f with inline PowerShell here: CMD eats the
 REM     ^| escapes and the inner cmd.exe sees the pipes, so nothing
 REM     is captured. A temp file sidesteps the whole problem.
+REM     v9.1: collapse runs of whitespace inside PowerShell so names
+REM     like "AMD  Radeon" become "AMD Radeon".
 set "AMD_GPU_NAME="
 set "AMD_GPU_TMP=%TEMP%\crowdgpt-amd-%RANDOM%.txt"
-powershell -NoProfile -Command "(Get-CimInstance Win32_VideoController | Where-Object { $_.Name -match 'AMD|Radeon' } | Select-Object -ExpandProperty Name) -join ' / '" > "%AMD_GPU_TMP%" 2>nul
-if exist "%AMD_GPU_TMP%" set /p AMD_GPU_NAME=<"%AMD_GPU_TMP%"
-if exist "%AMD_GPU_TMP%" del "%AMD_GPU_TMP%" >nul 2>nul
+powershell -NoProfile -Command "((Get-CimInstance Win32_VideoController | Where-Object { $_.Name -match 'AMD|Radeon' } | Select-Object -ExpandProperty Name) -replace '\s+', ' ') -join ' / '" > "%AMD_GPU_TMP%" 2>nul
+if exist "%AMD_GPU_TMP%" (
+    for /f "usebackq delims=" %%A in ("%AMD_GPU_TMP%") do (
+        if not defined AMD_GPU_NAME set "AMD_GPU_NAME=%%A"
+    )
+    del "%AMD_GPU_TMP%" >nul 2>nul
+)
 
 if not defined AMD_GPU_NAME (
     set "BACKEND=cpu"
@@ -700,13 +708,13 @@ echo !AMD_GPU_NAME! | findstr /I /C:"RX 7900" /C:"RX 9070" /C:"Ryzen AI Max" >nu
 if not errorlevel 1 (
     set "BACKEND=amd-rocm"
     set "TORCH_INDEX=https://repo.radeon.com/rocm/windows/rocm-rel-6.4.4/"
-    set "WHEEL_NOTE=AMD !AMD_GPU_NAME! -^> ROCm 6.4.4 wheel for Windows"
+    set "WHEEL_NOTE=!AMD_GPU_NAME! -^> ROCm 6.4.4 wheel for Windows"
     exit /b 0
 )
 
 set "BACKEND=amd"
 set "TORCH_INDEX="
-set "WHEEL_NOTE=AMD !AMD_GPU_NAME! -^> DirectML (not on AMD's ROCm Windows list)"
+set "WHEEL_NOTE=!AMD_GPU_NAME! -^> DirectML (not on AMD's ROCm Windows list)"
 exit /b 0
 
 :fatal

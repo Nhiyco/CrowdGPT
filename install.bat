@@ -3,21 +3,26 @@ setlocal EnableExtensions EnableDelayedExpansion
 
 REM ============================================================
 REM CrowdGPT Universal Installer for Windows
-REM v5 - ROCm on Windows + DirectML fallback + transformers override
+REM v6
+REM  - venv is created at its FINAL path (no relocation, no
+REM    text-rewriting of .exe / .pyc files)
+REM  - uninstaller self-deletes via delayed external cmd
+REM  - narrower ROCm GPU allow-list (matches AMD's real matrix)
+REM  - filtered requirements written as ASCII (no UTF-16 BOM)
+REM  - PowerShell helpers use PS 5.1-compatible syntax
+REM  - no `!` inside regex / echoed content with delayed exp on
+REM  - no inline `if` expressions in PS
 REM ============================================================
 
 set "REPO_URL=https://github.com/Vxtzq/CrowdGPT.git"
 set "REPO_DIR=CrowdGPT"
-set "VENV_DIR="
 set "BACKEND="
 set "TORCH_INDEX="
-set "TORCH_EXTRA="
 set "WHEEL_NOTE="
 set "LAUNCH=1"
 set "INTEGRATE=1"
 set "BACKEND_OVERRIDE="
 set "AMD_GPU_NAME="
-set "AMD_ROCM_ELIGIBLE=0"
 
 REM ---------- arg parsing ----------
 :parse_args
@@ -65,9 +70,23 @@ exit /b 0
 
 echo.
 echo ============================================================
-echo                 CrowdGPT Installer
+echo                 CrowdGPT Installer  (v6)
 echo ============================================================
 echo.
+
+REM ------------------------------------------------------------
+REM 0. Paths (decided BEFORE venv creation so we never relocate)
+REM ------------------------------------------------------------
+set "APP_DIR=%LOCALAPPDATA%\CrowdGPT"
+set "BIN_DIR=%APP_DIR%"
+set "START_MENU=%APPDATA%\Microsoft\Windows\Start Menu\Programs"
+
+if "!INTEGRATE!"=="1" (
+    set "VENV_DIR=!APP_DIR!\.venv"
+) else (
+    set "VENV_DIR=%CD%\.venv"
+)
+set "APP_PY=!VENV_DIR!\Scripts\python.exe"
 
 REM ------------------------------------------------------------
 REM 1. Install uv
@@ -78,11 +97,9 @@ if errorlevel 1 (
     where winget >nul 2>nul
     if not errorlevel 1 (
         winget install --id=astral-sh.uv -e --source winget --accept-source-agreements --accept-package-agreements
-        if errorlevel 1 goto :fatal
     ) else (
         echo [INFO] Installing uv via official installer...
         powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://astral.sh/uv/install.ps1 | iex"
-        if errorlevel 1 goto :fatal
     )
     set "PATH=%USERPROFILE%\.local\bin;%LOCALAPPDATA%\uv;%PATH%"
 )
@@ -163,6 +180,7 @@ if not exist "client.py" (
     echo [ERROR] client.py not found in the CrowdGPT repository.
     goto :fatal
 )
+set "SRC_DIR=%CD%"
 
 REM ------------------------------------------------------------
 REM 4. Hardware detection
@@ -173,37 +191,8 @@ echo [INFO] Detecting hardware backend...
 call :detect_backend
 if errorlevel 1 goto :fatal
 
-if not "!BACKEND_OVERRIDE!"=="" (
-    if /I "!BACKEND_OVERRIDE!"=="nvidia" (
-        set "BACKEND=nvidia"
-        set "TORCH_INDEX=https://download.pytorch.org/whl/cu121"
-        set "TORCH_EXTRA="
-        set "WHEEL_NOTE=forced: nvidia/cu121"
-    ) else if /I "!BACKEND_OVERRIDE!"=="amd" (
-        set "BACKEND=amd"
-        set "TORCH_INDEX="
-        set "TORCH_EXTRA="
-        set "WHEEL_NOTE=forced: amd/directml"
-    ) else if /I "!BACKEND_OVERRIDE!"=="amd-rocm" (
-        set "BACKEND=amd-rocm"
-        set "TORCH_INDEX="
-        set "TORCH_EXTRA="
-        set "WHEEL_NOTE=forced: amd/rocm"
-    ) else if /I "!BACKEND_OVERRIDE!"=="intel" (
-        set "BACKEND=intel"
-        set "TORCH_INDEX=https://download.pytorch.org/whl/xpu"
-        set "TORCH_EXTRA=https://pypi.org/simple"
-        set "WHEEL_NOTE=forced: intel/xpu"
-    ) else if /I "!BACKEND_OVERRIDE!"=="cpu" (
-        set "BACKEND=cpu"
-        set "TORCH_INDEX=https://download.pytorch.org/whl/cpu"
-        set "TORCH_EXTRA="
-        set "WHEEL_NOTE=forced: cpu"
-    ) else (
-        echo [ERROR] --backend must be one of: nvidia ^| amd ^| amd-rocm ^| intel ^| cpu
-        goto :fatal
-    )
-)
+if not "!BACKEND_OVERRIDE!"=="" call :apply_override
+if errorlevel 1 goto :fatal
 
 echo.
 echo ============================================================
@@ -211,44 +200,36 @@ echo                       Backend
 echo ============================================================
 echo   Detected:    !BACKEND!
 if defined TORCH_INDEX echo   Torch index: !TORCH_INDEX!
-if defined TORCH_EXTRA echo   Extra index: !TORCH_EXTRA!
 echo   Note:        !WHEEL_NOTE!
 echo ============================================================
 echo.
 
 REM ------------------------------------------------------------
-REM 5. Install paths
+REM 5. Create venv AT ITS FINAL LOCATION (no relocation later)
 REM ------------------------------------------------------------
-set "APP_DIR=%LOCALAPPDATA%\CrowdGPT"
-set "BIN_DIR=%APP_DIR%"
-set "START_MENU=%APPDATA%\Microsoft\Windows\Start Menu\Programs"
-set "APP_PY=!APP_DIR!\.venv\Scripts\python.exe"
+if "!INTEGRATE!"=="1" (
+    if not exist "!APP_DIR!" mkdir "!APP_DIR!"
+)
 
-REM ------------------------------------------------------------
-REM 6. Build venv with Python 3.11 via uv (SEEDED with pip)
-REM ------------------------------------------------------------
-set "BUILD_VENV=%CD%\.venv"
+echo [INFO] Creating venv with Python 3.11 at !VENV_DIR!...
+if exist "!VENV_DIR!" rmdir /s /q "!VENV_DIR!" >nul 2>nul
 
-echo [INFO] Creating build venv with Python 3.11...
-if exist "%BUILD_VENV%" rmdir /s /q "%BUILD_VENV%" >nul 2>nul
-
-uv venv --python 3.11 --seed "%BUILD_VENV%"
+uv venv --python 3.11 --seed "!VENV_DIR!"
 if errorlevel 1 (
     echo [ERROR] Failed to create venv with uv.
     goto :fatal
 )
 
-set "BUILD_PY=%BUILD_VENV%\Scripts\python.exe"
-if not exist "%BUILD_PY%" (
-    echo [ERROR] Build venv Python missing.
+if not exist "!APP_PY!" (
+    echo [ERROR] venv Python missing at !APP_PY!
     goto :fatal
 )
 
-"%BUILD_PY%" -m pip --version >nul 2>nul
+"!APP_PY!" -m pip --version >nul 2>nul
 if errorlevel 1 (
     echo [WARN] pip missing from venv, bootstrapping with ensurepip...
-    "%BUILD_PY%" -m ensurepip --upgrade >nul 2>nul
-    "%BUILD_PY%" -m pip --version >nul 2>nul
+    "!APP_PY!" -m ensurepip --upgrade >nul 2>nul
+    "!APP_PY!" -m pip --version >nul 2>nul
     if errorlevel 1 (
         echo [ERROR] Could not bootstrap pip into the venv.
         goto :fatal
@@ -256,53 +237,51 @@ if errorlevel 1 (
 )
 
 echo [INFO] Upgrading pip...
-"%BUILD_PY%" -m pip install --upgrade pip >nul 2>nul
+"!APP_PY!" -m pip install --upgrade pip >nul 2>nul
 
 REM ------------------------------------------------------------
-REM 7. Install PyTorch - GOTO-BASED, NO PARENS IN ECHOES
+REM 6. Install PyTorch
 REM ------------------------------------------------------------
 echo.
 echo ============================================================
 echo                   Installing PyTorch
 echo ============================================================
 
-"%BUILD_PY%" -m pip uninstall -y torch torchvision torchaudio torch-directml >nul 2>nul
+"!APP_PY!" -m pip uninstall -y torch torchvision torchaudio torch-directml >nul 2>nul
 
-if /I "!BACKEND!"=="nvidia" goto :pytorch_nvidia
-if /I "!BACKEND!"=="amd" goto :pytorch_amd
+if /I "!BACKEND!"=="nvidia"   goto :pytorch_nvidia
+if /I "!BACKEND!"=="amd"      goto :pytorch_amd
 if /I "!BACKEND!"=="amd-rocm" goto :pytorch_amd_rocm
-if /I "!BACKEND!"=="intel" goto :pytorch_intel
+if /I "!BACKEND!"=="intel"    goto :pytorch_intel
 goto :pytorch_cpu
 
 :pytorch_nvidia
 echo [INFO] Trying PyTorch CUDA 12.1 cu121...
-"%BUILD_PY%" -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+"!APP_PY!" -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
 if not errorlevel 1 goto :pytorch_done
 echo.
 echo [WARN] cu121 failed. Trying CUDA 11.8 cu118...
-"%BUILD_PY%" -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+"!APP_PY!" -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
 if not errorlevel 1 goto :pytorch_done
 goto :pytorch_cpu
 
 :pytorch_amd
 echo [INFO] Trying PyTorch DirectML...
-"%BUILD_PY%" -m pip install torch-directml
+"!APP_PY!" -m pip install torch-directml
 if not errorlevel 1 goto :pytorch_amd_directml_done
 goto :pytorch_amd_rocm
 
 :pytorch_amd_directml_done
 echo [WARN] torch-directml is based on PyTorch 2.4.x.
-echo        Setting TRANSFORMERS_DISABLE_TORCH_CHECK=1 to prevent
-echo        transformers from disabling PyTorch at import time.
-REM ---- Persistent env var for the installed app ----
-set "TRANSFORMERS_DISABLE_TORCH_CHECK=1"
-setx TRANSFORMERS_DISABLE_TORCH_CHECK 1 >nul 2>nul
+echo        TRANSFORMERS_DISABLE_TORCH_CHECK will be set only
+echo        for the CrowdGPT launcher (not system-wide).
 goto :pytorch_done
 
 :pytorch_amd_rocm
 echo [INFO] Trying official AMD ROCm PyTorch for Windows...
-echo        Requires Radeon RX 7000/9000 series or Ryzen AI APU.
-"%BUILD_PY%" -m pip install torch torchvision torchaudio --index-url https://repo.radeon.com/rocm/windows/rocm-rel-6.4.4/
+echo        Requires Radeon RX 7900 XTX/XT/GRE, RX 9070 XT/9070,
+echo        or Ryzen AI Max/Max+ (Strix Halo).
+"!APP_PY!" -m pip install torch torchvision torchaudio --index-url https://repo.radeon.com/rocm/windows/rocm-rel-6.4.4/
 if not errorlevel 1 goto :pytorch_done
 echo.
 echo [WARN] ROCm PyTorch install failed. Falling back to CPU PyTorch.
@@ -311,81 +290,107 @@ goto :pytorch_cpu
 
 :pytorch_intel
 echo [INFO] Trying PyTorch XPU...
-"%BUILD_PY%" -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/xpu --extra-index-url https://pypi.org/simple
+"!APP_PY!" -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/xpu --extra-index-url https://pypi.org/simple
 if not errorlevel 1 goto :pytorch_done
 goto :pytorch_cpu
 
 :pytorch_cpu
 echo.
 echo [WARN] Installing CPU-only PyTorch. Training will be very slow.
-"%BUILD_PY%" -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+"!APP_PY!" -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
 if errorlevel 1 goto :fatal
 
 :pytorch_done
 
 REM ------------------------------------------------------------
-REM 8. Install project requirements
+REM 7. Install project requirements (torch lines filtered out)
 REM ------------------------------------------------------------
-if exist "requirements.txt" (
-    echo.
-    echo ============================================================
-    echo               Installing project dependencies
-    echo ============================================================
-    set "TMP_REQ=%TEMP%\crowdgpt-req-!RANDOM!.txt"
-    powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-        "Get-Content -LiteralPath 'requirements.txt' | Where-Object { $_ -notmatch '^\s*(torch|torchvision|torchaudio|torch-directml)(\s|[<>=!~]|$)' } | Set-Content -LiteralPath '!TMP_REQ!'"
-    if errorlevel 1 goto :fatal
-
-    for %%A in ("!TMP_REQ!") do set "TMP_SIZE=%%~zA"
-    if "!TMP_SIZE!"=="0" (
-        echo [WARN] requirements.txt contained only torch packages; nothing else to install.
-    ) else (
-        "%BUILD_PY%" -m pip install -r "!TMP_REQ!"
-        if errorlevel 1 goto :fatal
-    )
-    del /q "!TMP_REQ!" >nul 2>nul
-) else (
+if not exist "requirements.txt" (
     echo [WARN] requirements.txt not found; skipping project deps.
+    goto :reqs_done
 )
 
+echo.
+echo ============================================================
+echo               Installing project dependencies
+echo ============================================================
+
+set "TMP_REQ=%TEMP%\crowdgpt-req-%RANDOM%.txt"
+set "FILTER_PS=%TEMP%\crowdgpt-filter-%RANDOM%.ps1"
+
+REM Write the filter script via echo. NOTE: no `!` chars in
+REM the regex (delayed expansion would eat them), and we use
+REM \b instead of a char class.
+> "!FILTER_PS!"  echo $in  = '!SRC_DIR!\requirements.txt'
+>> "!FILTER_PS!" echo $out = '!TMP_REQ!'
+>> "!FILTER_PS!" echo $rx  = '^\s*(torch^|torchvision^|torchaudio^|torch-directml)\b'
+>> "!FILTER_PS!" echo Get-Content -LiteralPath $in ^| Where-Object { $_ -notmatch $rx } ^| Set-Content -LiteralPath $out -Encoding ASCII
+
+powershell -NoProfile -ExecutionPolicy Bypass -File "!FILTER_PS!"
+del "!FILTER_PS!" >nul 2>nul
+
+if not exist "!TMP_REQ!" (
+    echo [WARN] No filtered requirements produced.
+    goto :reqs_done
+)
+
+for %%A in ("!TMP_REQ!") do set "TMP_SIZE=%%~zA"
+if "!TMP_SIZE!"=="0" (
+    echo [WARN] requirements.txt contained only torch packages; nothing else to install.
+    del "!TMP_REQ!" >nul 2>nul
+    goto :reqs_done
+)
+
+"!APP_PY!" -m pip install -r "!TMP_REQ!"
+if errorlevel 1 (
+    del "!TMP_REQ!" >nul 2>nul
+    goto :fatal
+)
+del "!TMP_REQ!" >nul 2>nul
+
+:reqs_done
+
 REM ------------------------------------------------------------
-REM 9. GUI backend check - WebView2
+REM 8. GUI backend check - WebView2
 REM ------------------------------------------------------------
 echo.
 echo ============================================================
 echo           GUI backend for pywebview - WebView2
 echo ============================================================
 
+set "WV2_FOUND=0"
 reg query "HKLM\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}" >nul 2>nul
-if errorlevel 1 (
+if not errorlevel 1 set "WV2_FOUND=1"
+if "!WV2_FOUND!"=="0" (
     reg query "HKLM\SOFTWARE\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}" >nul 2>nul
+    if not errorlevel 1 set "WV2_FOUND=1"
 )
-if errorlevel 1 (
+if "!WV2_FOUND!"=="1" (
+    echo [OK] WebView2 Runtime present.
+) else (
     echo [WARN] Microsoft Edge WebView2 Runtime not detected.
     echo        pywebview needs it to display the GUI window.
     echo        Windows 11 and recent Windows 10 already include it.
     echo        If the client fails to open a window, install it from:
     echo          https://developer.microsoft.com/microsoft-edge/webview2/
     echo.
-) else (
-    echo [OK] WebView2 Runtime present.
 )
 
 REM ------------------------------------------------------------
-REM 10. Verify the venv
+REM 9. Verify
 REM ------------------------------------------------------------
 echo.
 echo ============================================================
 echo                    Verifying install
 echo ============================================================
-"%BUILD_PY%" -c "import sys, torch; print('  Python:', sys.version.split()[0]); print('  Torch:  ', torch.__version__); print('  CUDA:   ', torch.cuda.is_available(), end=''); print('  (' + torch.cuda.get_device_name(0) + ')' if torch.cuda.is_available() else '')"
+"!APP_PY!" -c "import sys, torch; print('  Python:', sys.version.split()[0]); print('  Torch:  ', torch.__version__); print('  CUDA:   ', torch.cuda.is_available(), ('' if not torch.cuda.is_available() else '(' + torch.cuda.get_device_name(0) + ')'))"
 if errorlevel 1 echo [WARN] Verification failed, but install may still work.
 
-"%BUILD_PY%" -c "import webview; print('  pywebview: OK')" 2>nul
+"!APP_PY!" -c "import webview; print('  pywebview: OK')" 2>nul
 if errorlevel 1 echo [WARN] pywebview import failed.
 
 REM ------------------------------------------------------------
-REM 11. Desktop integration
+REM 10. Desktop integration (copies source only; venv already in place)
 REM ------------------------------------------------------------
 if "!INTEGRATE!"=="1" (
     call :do_integration
@@ -393,18 +398,18 @@ if "!INTEGRATE!"=="1" (
 )
 
 REM ------------------------------------------------------------
-REM 12. Launch
+REM 11. Launch
 REM ------------------------------------------------------------
 if "!LAUNCH!"=="1" (
     echo Launching client.py...
     echo.
+    if /I "!BACKEND!"=="amd" set "TRANSFORMERS_DISABLE_TORCH_CHECK=1"
     if "!INTEGRATE!"=="1" (
         "!APP_PY!" "!APP_DIR!\client.py"
-        set "EXITCODE=!ERRORLEVEL!"
     ) else (
-        "!BUILD_PY!" "%CD%\client.py"
-        set "EXITCODE=!ERRORLEVEL!"
+        "!APP_PY!" "!SRC_DIR!\client.py"
     )
+    set "EXITCODE=!ERRORLEVEL!"
     echo.
     echo CrowdGPT exited with code !EXITCODE!.
     exit /b !EXITCODE!
@@ -412,7 +417,7 @@ if "!LAUNCH!"=="1" (
     if "!INTEGRATE!"=="1" (
         echo To launch later:  crowdgpt
     ) else (
-        echo To launch later:  "!BUILD_PY!" "%CD%\client.py"
+        echo To launch later:  "!APP_PY!" "!SRC_DIR!\client.py"
     )
     exit /b 0
 )
@@ -429,17 +434,10 @@ echo [INFO] Install location: !APP_DIR!
 
 if not exist "!APP_DIR!" mkdir "!APP_DIR!"
 
-echo [INFO] Copying app files...
-robocopy "%CD%" "!APP_DIR!" /E /XD .git .venv __pycache__ checkpoints pending_uploads /NFL /NDL /NJH /NJS /NC /NS >nul
+echo [INFO] Copying app files (venv excluded; already in place)...
+robocopy "!SRC_DIR!" "!APP_DIR!" /E /XD .git .venv __pycache__ checkpoints pending_uploads /NFL /NDL /NJH /NJS /NC /NS /NP >nul
 if errorlevel 8 (
     echo [ERROR] Failed to copy files to !APP_DIR!
-    exit /b 1
-)
-
-if exist "!APP_DIR!\.venv" rmdir /s /q "!APP_DIR!\.venv" >nul 2>nul
-move "!BUILD_VENV!" "!APP_DIR!\.venv" >nul
-if errorlevel 1 (
-    echo [ERROR] Failed to move venv into app dir.
     exit /b 1
 )
 
@@ -448,44 +446,30 @@ if not exist "!APP_PY!" (
     exit /b 1
 )
 
-echo [INFO] Rewriting venv paths...
-> "%TEMP%\crowdgpt_path.ps1" echo $old = '%CD%\.venv'
->> "%TEMP%\crowdgpt_path.ps1" echo $new = '!APP_DIR!\.venv'
->> "%TEMP%\crowdgpt_path.ps1" echo $root = '!APP_DIR!\.venv'
->> "%TEMP%\crowdgpt_path.ps1" echo Get-ChildItem -Path $root -Recurse -File -ErrorAction SilentlyContinue ^| ForEach-Object {
->> "%TEMP%\crowdgpt_path.ps1" echo   if ($_.Length -gt 200000) { return }
->> "%TEMP%\crowdgpt_path.ps1" echo   try { $c = [System.IO.File]::ReadAllText($_.FullName) } catch { return }
->> "%TEMP%\crowdgpt_path.ps1" echo   if ($c -like ('*' + $old + '*')) {
->> "%TEMP%\crowdgpt_path.ps1" echo     $c = $c.Replace($old, $new)
->> "%TEMP%\crowdgpt_path.ps1" echo     try { [System.IO.File]::WriteAllText($_.FullName, $c) } catch {}
->> "%TEMP%\crowdgpt_path.ps1" echo   }
->> "%TEMP%\crowdgpt_path.ps1" echo }
-powershell -NoProfile -ExecutionPolicy Bypass -File "%TEMP%\crowdgpt_path.ps1"
-del "%TEMP%\crowdgpt_path.ps1" >nul 2>nul
-
-REM ---- CMD shim ----
+REM ---- CMD shim (also sets the AMD DirectML env var, if needed) ----
 > "!BIN_DIR!\crowdgpt.cmd" echo @echo off
+if /I "!BACKEND!"=="amd" >>"!BIN_DIR!\crowdgpt.cmd" echo set "TRANSFORMERS_DISABLE_TORCH_CHECK=1"
 >>"!BIN_DIR!\crowdgpt.cmd" echo "!APP_PY!" "!APP_DIR!\client.py" %%*
 
 REM ---- GUI launcher - no console window ----
-> "!BIN_DIR!\crowdgpt-gui.vbs" echo Set WshShell = CreateObject("WScript.Shell")
->>"!BIN_DIR!\crowdgpt-gui.vbs" echo WshShell.Run """!APP_PY!"" ""!APP_DIR!\client.py""", 0, False
+REM Written line-by-line so we don't have to fight cmd quoting.
+set "GUI_VBS=!BIN_DIR!\crowdgpt-gui.vbs"
+> "!GUI_VBS!"  echo Set WshShell = CreateObject("WScript.Shell")
+>> "!GUI_VBS!" echo Set WshEnv = WshShell.Environment("Process")
+if /I "!BACKEND!"=="amd" >>"!GUI_VBS!" echo WshEnv("TRANSFORMERS_DISABLE_TORCH_CHECK") = "1"
+>> "!GUI_VBS!" echo WshShell.Run """!APP_PY!"" ""!APP_DIR!\client.py""", 0, False
 
-REM ---- Add to user PATH ----
-> "%TEMP%\crowdgpt_env.ps1" echo $p = [Environment]::GetEnvironmentVariable('Path', 'User')
->> "%TEMP%\crowdgpt_env.ps1" echo if ($null -eq $p) { $p = '' }
->> "%TEMP%\crowdgpt_env.ps1" echo if ($p -notlike '*!BIN_DIR!*') {
->> "%TEMP%\crowdgpt_env.ps1" echo   $new = if ($p) { $p + ';!BIN_DIR!' } else { '!BIN_DIR!' }
->> "%TEMP%\crowdgpt_env.ps1" echo   [Environment]::SetEnvironmentVariable('Path', $new, 'User')
->> "%TEMP%\crowdgpt_env.ps1" echo   Write-Host 'Added to user PATH'
->> "%TEMP%\crowdgpt_env.ps1" echo }
-powershell -NoProfile -ExecutionPolicy Bypass -File "%TEMP%\crowdgpt_env.ps1"
-del "%TEMP%\crowdgpt_env.ps1" >nul 2>nul
-
-REM ---- Set TRANSFORMERS_DISABLE_TORCH_CHECK for AMD DirectML users ----
-if /I "!BACKEND!"=="amd" (
-    setx TRANSFORMERS_DISABLE_TORCH_CHECK 1 >nul 2>nul
-)
+REM ---- Add to user PATH (PS 5.1-compatible, no inline if) ----
+set "ENV_PS=%TEMP%\crowdgpt-env-%RANDOM%.ps1"
+> "!ENV_PS!"  echo $p = [Environment]::GetEnvironmentVariable('Path', 'User')
+>> "!ENV_PS!" echo if ($null -eq $p) { $p = '' }
+>> "!ENV_PS!" echo if ($p -notlike '*!BIN_DIR!*') {
+>> "!ENV_PS!" echo   if ($p) { $new = $p + ';!BIN_DIR!' } else { $new = '!BIN_DIR!' }
+>> "!ENV_PS!" echo   [Environment]::SetEnvironmentVariable('Path', $new, 'User')
+>> "!ENV_PS!" echo   Write-Host 'Added to user PATH'
+>> "!ENV_PS!" echo }
+powershell -NoProfile -ExecutionPolicy Bypass -File "!ENV_PS!"
+del "!ENV_PS!" >nul 2>nul
 
 REM ---- Icon path ----
 set "APP_ICON="
@@ -493,41 +477,46 @@ if exist "!APP_DIR!\docs\logo-app.ico" set "APP_ICON=!APP_DIR!\docs\logo-app.ico
 if not defined APP_ICON if exist "!APP_DIR!\docs\logo-app.svg" set "APP_ICON=!APP_DIR!\docs\logo-app.svg"
 
 REM ---- Start Menu shortcut ----
-> "%TEMP%\crowdgpt_shortcut.ps1" echo $ws = New-Object -ComObject WScript.Shell
->> "%TEMP%\crowdgpt_shortcut.ps1" echo $sc = $ws.CreateShortcut('!START_MENU!\CrowdGPT.lnk')
->> "%TEMP%\crowdgpt_shortcut.ps1" echo $sc.TargetPath = '!APP_DIR!\crowdgpt-gui.vbs'
->> "%TEMP%\crowdgpt_shortcut.ps1" echo $sc.WorkingDirectory = '!APP_DIR!'
->> "%TEMP%\crowdgpt_shortcut.ps1" echo if ('!APP_ICON!') { $sc.IconLocation = '!APP_ICON!' }
->> "%TEMP%\crowdgpt_shortcut.ps1" echo $sc.Description = 'Decentralized AI Training Client'
->> "%TEMP%\crowdgpt_shortcut.ps1" echo $sc.Save()
-powershell -NoProfile -ExecutionPolicy Bypass -File "%TEMP%\crowdgpt_shortcut.ps1"
-del "%TEMP%\crowdgpt_shortcut.ps1" >nul 2>nul
+set "SC_PS=%TEMP%\crowdgpt-sc-%RANDOM%.ps1"
+> "!SC_PS!"  echo $ws = New-Object -ComObject WScript.Shell
+>> "!SC_PS!" echo $sc = $ws.CreateShortcut('!START_MENU!\CrowdGPT.lnk')
+>> "!SC_PS!" echo $sc.TargetPath = '!GUI_VBS!'
+>> "!SC_PS!" echo $sc.WorkingDirectory = '!APP_DIR!'
+if defined APP_ICON >>"!SC_PS!" echo $sc.IconLocation = '!APP_ICON!'
+>> "!SC_PS!" echo $sc.Description = 'Decentralized AI Training Client'
+>> "!SC_PS!" echo $sc.Save()
+powershell -NoProfile -ExecutionPolicy Bypass -File "!SC_PS!"
+del "!SC_PS!" >nul 2>nul
 
 REM ---- Add/Remove Programs registry entry ----
-> "%TEMP%\crowdgpt_reg.ps1" echo $k = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\CrowdGPT'
->> "%TEMP%\crowdgpt_reg.ps1" echo New-Item -Path $k -Force ^| Out-Null
->> "%TEMP%\crowdgpt_reg.ps1" echo Set-ItemProperty -Path $k -Name 'DisplayName' -Value 'CrowdGPT'
->> "%TEMP%\crowdgpt_reg.ps1" echo Set-ItemProperty -Path $k -Name 'DisplayVersion' -Value '0.6'
->> "%TEMP%\crowdgpt_reg.ps1" echo Set-ItemProperty -Path $k -Name 'Publisher' -Value 'CrowdGPT Project'
->> "%TEMP%\crowdgpt_reg.ps1" echo Set-ItemProperty -Path $k -Name 'InstallLocation' -Value '!APP_DIR!'
->> "%TEMP%\crowdgpt_reg.ps1" echo Set-ItemProperty -Path $k -Name 'UninstallString' -Value ('\"' + '!APP_DIR!\uninstall.bat' + '\"')
->> "%TEMP%\crowdgpt_reg.ps1" echo Set-ItemProperty -Path $k -Name 'NoModify' -Value 1 -Type DWord
->> "%TEMP%\crowdgpt_reg.ps1" echo Set-ItemProperty -Path $k -Name 'NoRepair' -Value 1 -Type DWord
-powershell -NoProfile -ExecutionPolicy Bypass -File "%TEMP%\crowdgpt_reg.ps1"
-del "%TEMP%\crowdgpt_reg.ps1" >nul 2>nul
+set "REG_PS=%TEMP%\crowdgpt-reg-%RANDOM%.ps1"
+> "!REG_PS!"  echo $k = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\CrowdGPT'
+>> "!REG_PS!" echo New-Item -Path $k -Force ^| Out-Null
+>> "!REG_PS!" echo Set-ItemProperty -Path $k -Name 'DisplayName'     -Value 'CrowdGPT'
+>> "!REG_PS!" echo Set-ItemProperty -Path $k -Name 'DisplayVersion'  -Value '0.6'
+>> "!REG_PS!" echo Set-ItemProperty -Path $k -Name 'Publisher'       -Value 'CrowdGPT Project'
+>> "!REG_PS!" echo Set-ItemProperty -Path $k -Name 'InstallLocation' -Value '!APP_DIR!'
+>> "!REG_PS!" echo Set-ItemProperty -Path $k -Name 'UninstallString' -Value ('"' + '!APP_DIR!\uninstall.bat' + '"')
+>> "!REG_PS!" echo Set-ItemProperty -Path $k -Name 'NoModify'        -Value 1 -Type DWord
+>> "!REG_PS!" echo Set-ItemProperty -Path $k -Name 'NoRepair'        -Value 1 -Type DWord
+powershell -NoProfile -ExecutionPolicy Bypass -File "!REG_PS!"
+del "!REG_PS!" >nul 2>nul
 
 REM ---- Uninstaller ----
-> "!APP_DIR!\uninstall.bat" echo @echo off
->>"!APP_DIR!\uninstall.bat" echo setlocal
->>"!APP_DIR!\uninstall.bat" echo echo Uninstalling CrowdGPT...
->>"!APP_DIR!\uninstall.bat" echo del /q "!START_MENU!\CrowdGPT.lnk" 2^>nul
->>"!APP_DIR!\uninstall.bat" echo reg delete "HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\CrowdGPT" /f ^>nul 2^>nul
->>"!APP_DIR!\uninstall.bat" echo powershell -NoProfile -Command "$p = [Environment]::GetEnvironmentVariable('Path','User'); if ($p) { $p = ($p -split ';' ^| Where-Object { $_ -ne '!BIN_DIR!' }) -join ';'; [Environment]::SetEnvironmentVariable('Path', $p, 'User') }"
->>"!APP_DIR!\uninstall.bat" echo reg delete "HKCU\Environment" /v TRANSFORMERS_DISABLE_TORCH_CHECK /f ^>nul 2^>nul
->>"!APP_DIR!\uninstall.bat" echo cd /d "%%TEMP%%"
->>"!APP_DIR!\uninstall.bat" echo rmdir /s /q "!APP_DIR!"
->>"!APP_DIR!\uninstall.bat" echo echo Done. Log out and back in for PATH changes to take effect.
->>"!APP_DIR!\uninstall.bat" echo pause
+REM The uninstaller lives INSIDE !APP_DIR!. It must not try to
+REM rmdir itself while running: we spawn a detached cmd that
+REM waits 2s, then deletes the app dir. `start /min` means a
+REM brief console flashes on some systems - acceptable.
+> "!APP_DIR!\uninstall.bat"  echo @echo off
+>> "!APP_DIR!\uninstall.bat" echo setlocal
+>> "!APP_DIR!\uninstall.bat" echo echo Uninstalling CrowdGPT...
+>> "!APP_DIR!\uninstall.bat" echo del /q "!START_MENU!\CrowdGPT.lnk" 2^>nul
+>> "!APP_DIR!\uninstall.bat" echo reg delete "HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\CrowdGPT" /f ^>nul 2^>nul
+>> "!APP_DIR!\uninstall.bat" echo powershell -NoProfile -Command "$p = [Environment]::GetEnvironmentVariable('Path','User'); if ($p) { $p = ($p -split ';' ^| Where-Object { $_ -ne '!BIN_DIR!' }) -join ';'; [Environment]::SetEnvironmentVariable('Path', $p, 'User') }"
+>> "!APP_DIR!\uninstall.bat" echo cd /d "%TEMP%"
+>> "!APP_DIR!\uninstall.bat" echo start "" /min cmd /c "timeout /t 2 /nobreak ^>nul ^& rmdir /s /q "!APP_DIR!""
+>> "!APP_DIR!\uninstall.bat" echo echo Done. Log out and back in for PATH changes to take effect.
+>> "!APP_DIR!\uninstall.bat" echo pause
 
 echo.
 echo [OK] Installed command: crowdgpt
@@ -535,11 +524,48 @@ echo [OK] Start Menu shortcut: CrowdGPT
 echo [OK] Uninstall via: Settings ^> Apps ^> CrowdGPT
 echo.
 if /I "!BACKEND!"=="amd" (
-    echo [NOTE] TRANSFORMERS_DISABLE_TORCH_CHECK=1 has been set persistently.
-    echo        This is required for torch-directml to work with newer transformers.
+    echo [NOTE] The AMD DirectML env var is set only inside the
+    echo        crowdgpt launcher, not system-wide.
 )
 echo [NOTE] A new terminal is required for the "crowdgpt" command to work.
 exit /b 0
+
+REM ============================================================
+REM Subroutine: apply_override
+REM ============================================================
+:apply_override
+if /I "!BACKEND_OVERRIDE!"=="nvidia" (
+    set "BACKEND=nvidia"
+    set "TORCH_INDEX=https://download.pytorch.org/whl/cu121"
+    set "WHEEL_NOTE=forced: nvidia/cu121"
+    exit /b 0
+)
+if /I "!BACKEND_OVERRIDE!"=="amd" (
+    set "BACKEND=amd"
+    set "TORCH_INDEX="
+    set "WHEEL_NOTE=forced: amd/directml"
+    exit /b 0
+)
+if /I "!BACKEND_OVERRIDE!"=="amd-rocm" (
+    set "BACKEND=amd-rocm"
+    set "TORCH_INDEX=https://repo.radeon.com/rocm/windows/rocm-rel-6.4.4/"
+    set "WHEEL_NOTE=forced: amd/rocm"
+    exit /b 0
+)
+if /I "!BACKEND_OVERRIDE!"=="intel" (
+    set "BACKEND=intel"
+    set "TORCH_INDEX=https://download.pytorch.org/whl/xpu"
+    set "WHEEL_NOTE=forced: intel/xpu"
+    exit /b 0
+)
+if /I "!BACKEND_OVERRIDE!"=="cpu" (
+    set "BACKEND=cpu"
+    set "TORCH_INDEX=https://download.pytorch.org/whl/cpu"
+    set "WHEEL_NOTE=forced: cpu"
+    exit /b 0
+)
+echo [ERROR] --backend must be one of: nvidia, amd, amd-rocm, intel, cpu
+exit /b 1
 
 REM ============================================================
 REM Subroutine: detect_backend
@@ -547,84 +573,86 @@ REM ============================================================
 :detect_backend
 
 where nvidia-smi >nul 2>nul
-if not errorlevel 1 (
-    set "NVIDIA_DRIVER="
-    for /f "delims=" %%V in ('nvidia-smi --query-gpu^=driver_version --format^=csv,noheader 2^>nul') do (
-        if not defined NVIDIA_DRIVER set "NVIDIA_DRIVER=%%V"
-    )
-    if defined NVIDIA_DRIVER (
-        for /f "tokens=1 delims= " %%A in ("!NVIDIA_DRIVER!") do set "NVIDIA_DRIVER=%%A"
-    )
+if errorlevel 1 goto :detect_no_nvidia
 
-    if not defined NVIDIA_DRIVER (
-        set "BACKEND=nvidia"
-        set "TORCH_INDEX=https://download.pytorch.org/whl/cu121"
-        set "WHEEL_NOTE=NVIDIA GPU - could not read driver, defaulting to cu121"
-        exit /b 0
-    )
+set "NVIDIA_DRIVER="
+for /f "delims=" %%V in ('nvidia-smi --query-gpu^=driver_version --format^=csv,noheader 2^>nul') do (
+    if not defined NVIDIA_DRIVER set "NVIDIA_DRIVER=%%V"
+)
+if defined NVIDIA_DRIVER (
+    for /f "tokens=1 delims= " %%A in ("!NVIDIA_DRIVER!") do set "NVIDIA_DRIVER=%%A"
+)
 
-    set "DRIVER_MAJOR="
-    for /f "tokens=1 delims=." %%M in ("!NVIDIA_DRIVER!") do set "DRIVER_MAJOR=%%M"
-
-    if not defined DRIVER_MAJOR (
-        set "BACKEND=nvidia"
-        set "TORCH_INDEX=https://download.pytorch.org/whl/cu121"
-        set "WHEEL_NOTE=NVIDIA driver !NVIDIA_DRIVER! - defaulting to cu121"
-        exit /b 0
-    )
-
-    if !DRIVER_MAJOR! GEQ 525 (
-        set "BACKEND=nvidia"
-        set "TORCH_INDEX=https://download.pytorch.org/whl/cu121"
-        set "WHEEL_NOTE=NVIDIA driver !NVIDIA_DRIVER! -^> CUDA 12.1 wheel"
-    ) else if !DRIVER_MAJOR! GEQ 470 (
-        set "BACKEND=nvidia"
-        set "TORCH_INDEX=https://download.pytorch.org/whl/cu118"
-        set "WHEEL_NOTE=NVIDIA driver !NVIDIA_DRIVER! -^> CUDA 11.8 wheel - older driver"
-    ) else (
-        echo [ERROR] NVIDIA driver !NVIDIA_DRIVER! is too old for any PyTorch wheel.
-        echo         Update your GPU driver and rerun.
-        exit /b 1
-    )
+if not defined NVIDIA_DRIVER (
+    set "BACKEND=nvidia"
+    set "TORCH_INDEX=https://download.pytorch.org/whl/cu121"
+    set "WHEEL_NOTE=NVIDIA GPU - could not read driver, defaulting to cu121"
     exit /b 0
 )
 
+set "DRIVER_MAJOR="
+for /f "tokens=1 delims=." %%M in ("!NVIDIA_DRIVER!") do set "DRIVER_MAJOR=%%M"
+
+if not defined DRIVER_MAJOR (
+    set "BACKEND=nvidia"
+    set "TORCH_INDEX=https://download.pytorch.org/whl/cu121"
+    set "WHEEL_NOTE=NVIDIA driver !NVIDIA_DRIVER! - defaulting to cu121"
+    exit /b 0
+)
+
+if !DRIVER_MAJOR! GEQ 525 (
+    set "BACKEND=nvidia"
+    set "TORCH_INDEX=https://download.pytorch.org/whl/cu121"
+    set "WHEEL_NOTE=NVIDIA driver !NVIDIA_DRIVER! -^> CUDA 12.1 wheel"
+    exit /b 0
+)
+if !DRIVER_MAJOR! GEQ 470 (
+    set "BACKEND=nvidia"
+    set "TORCH_INDEX=https://download.pytorch.org/whl/cu118"
+    set "WHEEL_NOTE=NVIDIA driver !NVIDIA_DRIVER! -^> CUDA 11.8 wheel - older driver"
+    exit /b 0
+)
+echo [ERROR] NVIDIA driver !NVIDIA_DRIVER! is too old for any PyTorch wheel.
+echo         Update your GPU driver and rerun.
+exit /b 1
+
+:detect_no_nvidia
+
+REM --- Intel Arc? ---
 powershell -NoProfile -Command "try { $g = Get-CimInstance Win32_VideoController | Select-Object -ExpandProperty Name; if ($g -match 'Intel.*Arc') { exit 0 } else { exit 1 } } catch { exit 1 }"
 if not errorlevel 1 (
     set "BACKEND=intel"
     set "TORCH_INDEX=https://download.pytorch.org/whl/xpu"
-    set "TORCH_EXTRA=https://pypi.org/simple"
     set "WHEEL_NOTE=Intel Arc detected -^> XPU wheel"
     exit /b 0
 )
 
-REM --- AMD detection: check if ROCm-eligible ---
-powershell -NoProfile -Command "try { $g = Get-CimInstance Win32_VideoController | Select-Object -ExpandProperty Name; if ($g -match 'AMD|Radeon') { Write-Output $g } else { exit 1 } } catch { exit 1 }" > "%TEMP%\amd_gpu.txt" 2>nul
-set /p AMD_GPU_NAME=<"%TEMP%\amd_gpu.txt"
-del "%TEMP%\amd_gpu.txt" >nul 2>nul
+REM --- AMD? capture GPU name ---
+set "AMD_GPU_NAME="
+for /f "usebackq delims=" %%G in (`powershell -NoProfile -Command "$g = Get-CimInstance Win32_VideoController ^| Select-Object -ExpandProperty Name; $a = $g ^| Where-Object { $_ -match 'AMD^|Radeon' }; if ($a) { $a -join ' / ' }"`) do set "AMD_GPU_NAME=%%G"
 
-if defined AMD_GPU_NAME (
-    REM Check if it's a Radeon RX 7000/9000 series or Ryzen AI APU
-    echo !AMD_GPU_NAME! | findstr /I "RX 7 RX 9 7900 7800 7700 7600 9070 9060 9000 Ryzen AI" >nul
-    if not errorlevel 1 (
-        set "BACKEND=amd-rocm"
-        set "TORCH_INDEX=https://repo.radeon.com/rocm/windows/rocm-rel-6.4.4/"
-        set "TORCH_EXTRA="
-        set "WHEEL_NOTE=AMD !AMD_GPU_NAME! -^> ROCm 6.4.4 wheel for Windows"
-        exit /b 0
-    )
-    REM Not ROCm-eligible, use DirectML
-    set "BACKEND=amd"
-    set "TORCH_INDEX="
-    set "TORCH_EXTRA="
-    set "WHEEL_NOTE=AMD !AMD_GPU_NAME! detected -^> DirectML torch-directml. Not in ROCm Windows support list."
+if not defined AMD_GPU_NAME (
+    set "BACKEND=cpu"
+    set "TORCH_INDEX=https://download.pytorch.org/whl/cpu"
+    set "WHEEL_NOTE=No usable GPU detected -^> CPU wheel - training will be very slow"
     exit /b 0
 )
 
-set "BACKEND=cpu"
-set "TORCH_INDEX=https://download.pytorch.org/whl/cpu"
-set "TORCH_EXTRA="
-set "WHEEL_NOTE=No usable GPU detected -^> CPU wheel - training will be very slow"
+REM AMD's actual Windows ROCm support matrix (as of ROCm 6.4):
+REM   Radeon RX 7900 XTX / XT / GRE
+REM   Radeon RX 9070 XT / 9070
+REM   Ryzen AI Max / Max+  (Strix Halo)
+echo !AMD_GPU_NAME! | findstr /I /C:"RX 7900" /C:"RX 9070" /C:"Ryzen AI Max" >nul
+if not errorlevel 1 (
+    set "BACKEND=amd-rocm"
+    set "TORCH_INDEX=https://repo.radeon.com/rocm/windows/rocm-rel-6.4.4/"
+    set "WHEEL_NOTE=AMD !AMD_GPU_NAME! -^> ROCm 6.4.4 wheel for Windows"
+    exit /b 0
+)
+
+set "BACKEND=amd"
+set "TORCH_INDEX="
+set "WHEEL_NOTE=AMD !AMD_GPU_NAME! -^> DirectML torch-directml (not on AMD's ROCm Windows list)"
 exit /b 0
 
 :fatal

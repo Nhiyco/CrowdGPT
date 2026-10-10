@@ -3,18 +3,20 @@ setlocal EnableExtensions EnableDelayedExpansion
 
 REM ============================================================
 REM CrowdGPT Universal Installer for Windows
-REM v9.1
+REM v9.2
 REM  - venv created at FINAL path (no relocation)
 REM  - AMD DirectML: transformers pinned to 4.x (torch 2.4.1 ceiling)
 REM  - CUDA/ROCm/Intel/CPU: transformers 5.x as normal
 REM  - torch <-> transformers compatibility verified BEFORE launch
 REM  - uninstaller self-deletes via delayed cmd
-REM  - ROCm GPU allow-list matches AMD's real Windows matrix
+REM  - ROCm GPU allow-list matches AMD's REAL Windows matrix
+REM    (v9.2: RX 7800/7700/7600/7650 + Ryzen AI 9 added)
 REM  - v8: fixed unescaped parens in echo inside if() block
 REM  - v9: AMD GPU name captured via temp file (v5 approach);
 REM        the for/f+inline-PowerShell variant was broken
 REM  - v9.1: collapse whitespace in AMD GPU name; drop redundant
 REM          "AMD " prefix in WHEEL_NOTE (was showing "AMD AMD")
+REM  - v9.2: broaden ROCm allow-list to all RDNA3 consumer GPUs
 REM ============================================================
 
 set "REPO_URL=https://github.com/Vxtzq/CrowdGPT.git"
@@ -73,7 +75,7 @@ exit /b 0
 
 echo.
 echo ============================================================
-echo                 CrowdGPT Installer  (v9.1)
+echo                 CrowdGPT Installer  (v9.2)
 echo ============================================================
 echo.
 
@@ -208,6 +210,7 @@ echo ============================================================
 echo.
 
 if /I "!BACKEND!"=="amd" call :note_amd
+if /I "!BACKEND!"=="amd-rocm" call :note_amd_rocm
 
 REM ------------------------------------------------------------
 REM 5. Create venv AT ITS FINAL LOCATION
@@ -280,13 +283,14 @@ goto :pytorch_cpu
 
 :pytorch_amd_rocm
 echo [INFO] Trying official AMD ROCm PyTorch for Windows...
-echo        Requires Radeon RX 7900 XTX/XT/GRE, RX 9070 XT/9070,
+echo        Requires Radeon RX 9000 series, RX 7000 series,
 echo        or Ryzen AI Max/Max+ Strix Halo.
+echo        Also requires AMD HIP SDK for Windows to be installed.
 "!APP_PY!" -m pip install torch torchvision torchaudio --index-url https://repo.radeon.com/rocm/windows/rocm-rel-6.4.4/
 if not errorlevel 1 goto :pytorch_done
 echo.
 echo [WARN] ROCm PyTorch install failed. Falling back to CPU PyTorch.
-echo        Update your AMD GPU driver and rerun for ROCm support.
+echo        Ensure AMD HIP SDK for Windows is installed, then rerun.
 goto :pytorch_cpu
 
 :pytorch_intel
@@ -352,6 +356,7 @@ REM ------------------------------------------------------------
 REM 7b. AMD DirectML: pin transformers to 4.x
 REM     torch-directml is upstream-stuck on torch 2.4.1;
 REM     transformers 5.x refuses torch < 2.5.
+REM     ROCm torch is 2.6+, so no pin needed there.
 REM ------------------------------------------------------------
 if /I "!BACKEND!"=="amd" (
     echo.
@@ -417,6 +422,18 @@ if errorlevel 1 (
 
 if /I "!BACKEND!"=="amd" call :verify_directml_devices
 
+REM ROCm device check
+if /I "!BACKEND!"=="amd-rocm" (
+    "!APP_PY!" -c "import torch; assert torch.cuda.is_available(), 'ROCm wheel installed but torch.cuda.is_available() is False'; print('  ROCm device:', torch.cuda.get_device_name(0))"
+    if errorlevel 1 (
+        echo.
+        echo [ERROR] ROCm PyTorch is installed but cannot see the GPU.
+        echo         This usually means the AMD HIP SDK for Windows is missing.
+        echo         Install it from AMD, reboot, and rerun with --backend amd-rocm.
+        goto :fatal
+    )
+)
+
 "!APP_PY!" -c "import webview; print('  pywebview: OK')" 2>nul
 if errorlevel 1 echo [WARN] pywebview import failed.
 
@@ -466,6 +483,17 @@ echo        may pick the wrong DirectML device. To list devices:
 echo          .venv\Scripts\python.exe -c "import torch_directml as d; print([d.device_name(i) for i in range(8)])"
 echo        Then set CROWDGPT_DML_DEVICE to the desired index before
 echo        launching, e.g.:  set CROWDGPT_DML_DEVICE=1
+echo.
+exit /b 0
+
+REM ============================================================
+REM Subroutine: note_amd_rocm
+REM ============================================================
+:note_amd_rocm
+echo [NOTE] AMD ROCm backend selected.
+echo        This requires the AMD HIP SDK for Windows to be installed.
+echo        If torch.cuda.is_available() returns False after this
+echo        install, install the HIP SDK from AMD and rerun.
 echo.
 exit /b 0
 
@@ -549,7 +577,7 @@ set "REG_PS=%TEMP%\crowdgpt-reg-%RANDOM%.ps1"
 > "!REG_PS!"  echo $k = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\CrowdGPT'
 >> "!REG_PS!" echo New-Item -Path $k -Force ^| Out-Null
 >> "!REG_PS!" echo Set-ItemProperty -Path $k -Name 'DisplayName'     -Value 'CrowdGPT'
->> "!REG_PS!" echo Set-ItemProperty -Path $k -Name 'DisplayVersion'  -Value '0.9.1'
+>> "!REG_PS!" echo Set-ItemProperty -Path $k -Name 'DisplayVersion'  -Value '0.9.2'
 >> "!REG_PS!" echo Set-ItemProperty -Path $k -Name 'Publisher'       -Value 'CrowdGPT Project'
 >> "!REG_PS!" echo Set-ItemProperty -Path $k -Name 'InstallLocation' -Value '!APP_DIR!'
 >> "!REG_PS!" echo Set-ItemProperty -Path $k -Name 'UninstallString' -Value ('"' + '!APP_DIR!\uninstall.bat' + '"')
@@ -678,11 +706,6 @@ if not errorlevel 1 (
 )
 
 REM --- AMD: capture GPU name via temp file (v5 approach) ---
-REM     Do NOT use for/f with inline PowerShell here: CMD eats the
-REM     ^| escapes and the inner cmd.exe sees the pipes, so nothing
-REM     is captured. A temp file sidesteps the whole problem.
-REM     v9.1: collapse runs of whitespace inside PowerShell so names
-REM     like "AMD  Radeon" become "AMD Radeon".
 set "AMD_GPU_NAME="
 set "AMD_GPU_TMP=%TEMP%\crowdgpt-amd-%RANDOM%.txt"
 powershell -NoProfile -Command "((Get-CimInstance Win32_VideoController | Where-Object { $_.Name -match 'AMD|Radeon' } | Select-Object -ExpandProperty Name) -replace '\s+', ' ') -join ' / '" > "%AMD_GPU_TMP%" 2>nul
@@ -700,11 +723,13 @@ if not defined AMD_GPU_NAME (
     exit /b 0
 )
 
-REM AMD's real Windows ROCm support matrix (ROCm 6.4):
-REM   Radeon RX 7900 XTX / XT / GRE
-REM   Radeon RX 9070 XT / 9070
-REM   Ryzen AI Max / Max+  (Strix Halo)
-echo !AMD_GPU_NAME! | findstr /I /C:"RX 7900" /C:"RX 9070" /C:"Ryzen AI Max" >nul
+REM AMD's REAL Windows ROCm support matrix (ROCm 6.4+):
+REM   RDNA 4: RX 9070 XT / 9070 / 9060 XT / 9060 / 9050
+REM   RDNA 3: RX 7900 XTX / XT / GRE, RX 7800 XT, RX 7700 XT / 7700,
+REM           RX 7650 GRE / 7600 XT / 7600
+REM   APUs:   Ryzen AI Max / Max+ (Strix Halo), Ryzen AI 9
+REM v9.2: broadened to cover ALL RDNA3 consumer GPUs.
+echo !AMD_GPU_NAME! | findstr /I /C:"RX 7900" /C:"RX 7800" /C:"RX 7700" /C:"RX 7650" /C:"RX 7600" /C:"RX 9070" /C:"RX 9060" /C:"RX 9050" /C:"Ryzen AI Max" /C:"Ryzen AI 9" >nul
 if not errorlevel 1 (
     set "BACKEND=amd-rocm"
     set "TORCH_INDEX=https://repo.radeon.com/rocm/windows/rocm-rel-6.4.4/"

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-# CrowdGPT universal installer — Linux + macOS  (v7)
+# CrowdGPT universal installer — Linux + macOS  (v8)
 #
 #  - venv created at FINAL path (no relocation, no rewrites)
 #  - AMD ROCm: torch version detected, transformers pinned
@@ -9,6 +9,8 @@
 #  - verify checks torch <-> transformers linkage before launch
 #  - ROCm index chosen from detected ROCm version
 #  - Python >= 3.10 enforced
+#  - v8: verify step no longer dies from `set -e` before
+#        printing the actionable error message
 # ============================================================
 set -Eeuo pipefail
 
@@ -18,7 +20,6 @@ BACKEND_OVERRIDE=""
 LAUNCH=1
 INTEGRATE=1
 
-# ---------- colors ----------
 if [ -t 1 ]; then
     BOLD=$'\033[1m'; DIM=$'\033[2m'
     RED=$'\033[31m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'
@@ -34,7 +35,6 @@ hdr()  { printf '\n%s%s%s\n' "$BOLD" "$*" "$RESET"; }
 
 trap 'printf "\n%s[FAIL]%s Installer failed near line %s.\n" "$RED" "$RESET" "$LINENO" >&2' ERR
 
-# ---------- arg parsing ----------
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --backend)      BACKEND_OVERRIDE="${2:-}"; shift 2 ;;
@@ -60,14 +60,13 @@ done
 
 echo
 echo "============================================================"
-echo "                 CrowdGPT Installer  (v7)"
+echo "                 CrowdGPT Installer  (v8)"
 echo "============================================================"
 echo
 
 OS="$(uname -s)"
 ARCH="$(uname -m)"
 
-# ---------- helpers ----------
 run_as_root() {
     if [[ $EUID -eq 0 ]]; then
         "$@"
@@ -188,15 +187,12 @@ SRC_DIR="$PWD"
 # ============================================================
 # 4. Hardware detection
 # ============================================================
-# NOTE: for AMD ROCm we also compute TORCH_ROCM_INDEX from the
-# detected ROCm version so we pick a modern wheel when possible.
 detect_backend() {
     BACKEND=""
     TORCH_INDEX=""
     TORCH_EXTRA=""
     WHEEL_NOTE=""
 
-    # ---------- Apple ----------
     if [[ "$OS" == "Darwin" ]]; then
         if [[ "$ARCH" == "arm64" ]]; then
             BACKEND="apple"
@@ -210,15 +206,11 @@ detect_backend() {
         return
     fi
 
-    # ---------- Linux ----------
-
-    # NVIDIA
     if command -v nvidia-smi >/dev/null 2>&1; then
         local DRIVER MAJOR
         DRIVER="$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -n1 | tr -d '[:space:]' || true)"
 
         if [[ "$ARCH" == "aarch64" ]]; then
-            # Jetson — generic wheels will NOT work.
             BACKEND="cpu"
             TORCH_INDEX="https://download.pytorch.org/whl/cpu"
             WHEEL_NOTE="Jetson (aarch64) — generic CUDA wheels are incompatible. Using CPU for now."
@@ -236,18 +228,17 @@ detect_backend() {
         elif [[ "$MAJOR" =~ ^[0-9]+$ ]] && (( MAJOR >= 525 )); then
             BACKEND="nvidia"
             TORCH_INDEX="https://download.pytorch.org/whl/cu124"
-            WHEEL_NOTE="NVIDIA driver $DRIVER → CUDA 12.4 wheel"
+            WHEEL_NOTE="NVIDIA driver $DRIVER -> CUDA 12.4 wheel"
         elif [[ "$MAJOR" =~ ^[0-9]+$ ]] && (( MAJOR >= 470 )); then
             BACKEND="nvidia"
             TORCH_INDEX="https://download.pytorch.org/whl/cu118"
-            WHEEL_NOTE="NVIDIA driver $DRIVER → CUDA 11.8 wheel (older driver)"
+            WHEEL_NOTE="NVIDIA driver $DRIVER -> CUDA 11.8 wheel (older driver)"
         else
             die "NVIDIA driver '$DRIVER' is too old. Upgrade to >= 470."
         fi
         return
     fi
 
-    # AMD ROCm
     local ROCM_VER=""
     if [[ -f /opt/rocm/.info/version ]]; then
         ROCM_VER="$(cut -d. -f1,2 < /opt/rocm/.info/version 2>/dev/null || true)"
@@ -257,8 +248,6 @@ detect_backend() {
     fi
     if [[ -n "$ROCM_VER" ]] || [[ -d /opt/rocm ]] || command -v rocm-smi >/dev/null 2>&1; then
         BACKEND="amd"
-        # Pick the newest torch ROCm index we're reasonably sure works
-        # with the installed driver. ROCm 6.1 → torch 2.4.1; 6.2 → 2.5.x; 6.3 → 2.6.x
         case "$ROCM_VER" in
             6.3*|6.4*) TORCH_INDEX="https://download.pytorch.org/whl/rocm6.3" ;;
             6.2*)      TORCH_INDEX="https://download.pytorch.org/whl/rocm6.2" ;;
@@ -267,15 +256,14 @@ detect_backend() {
             5.*)       TORCH_INDEX="https://download.pytorch.org/whl/rocm5.7" ;;
             *)         TORCH_INDEX="https://download.pytorch.org/whl/rocm6.1" ;;
         esac
-        WHEEL_NOTE="AMD ROCm ${ROCM_VER:-unknown} → ${TORCH_INDEX##*/}"
-        # Correct HSA override hint for the two big consumer families
+        WHEEL_NOTE="AMD ROCm ${ROCM_VER:-unknown} -> ${TORCH_INDEX##*/}"
         if command -v rocminfo >/dev/null 2>&1; then
             local GFX
             GFX="$(rocminfo 2>/dev/null | grep -oE 'gfx[0-9a-f]+' | sort -u | head -n1 || true)"
             case "$GFX" in
                 gfx103*) warn "RX 6000 (Navi 2x) — you may need: export HSA_OVERRIDE_GFX_VERSION=10.3.0" ;;
                 gfx110*) warn "RX 7000 (Navi 3x) — you may need: export HSA_OVERRIDE_GFX_VERSION=11.0.0" ;;
-                gfx120*) : ;;  # RX 9000 series is native-supported
+                gfx120*) : ;;
                 "")      warn "Could not read GPU arch. If torch can't see the GPU, try HSA_OVERRIDE_GFX_VERSION matching your arch." ;;
                 *)       warn "GPU arch: $GFX — check AMD's ROCm compatibility matrix." ;;
             esac
@@ -283,16 +271,14 @@ detect_backend() {
         return
     fi
 
-    # Intel XPU
     if command -v sycl-ls >/dev/null 2>&1 || [[ -d /opt/intel/oneapi ]]; then
         BACKEND="intel"
         TORCH_INDEX="https://download.pytorch.org/whl/xpu"
         TORCH_EXTRA="https://pypi.org/simple"
-        WHEEL_NOTE="Intel Arc / Data Center GPU → XPU wheel"
+        WHEEL_NOTE="Intel Arc / Data Center GPU -> XPU wheel"
         return
     fi
 
-    # CPU
     BACKEND="cpu"
     TORCH_INDEX="https://download.pytorch.org/whl/cpu"
     WHEEL_NOTE="No GPU detected — CPU wheel (training will be very slow)"
@@ -331,7 +317,6 @@ else
     ICON_DIR="$HOME/.local/share/icons/hicolor/256x256/apps"
 fi
 
-# Where will the venv live? Decide BEFORE creating it.
 if [[ "$INTEGRATE" -eq 1 ]]; then
     VENV_DIR="$APP_DIR/.venv"
     mkdir -p "$APP_DIR"
@@ -343,7 +328,6 @@ APP_PY="$VENV_DIR/bin/python"
 # ============================================================
 # 6. Create venv AT ITS FINAL LOCATION
 # ============================================================
-# --system-site-packages so system PyGObject (gi) is visible if present.
 log "Creating venv (with system site-packages for GTK access) at $VENV_DIR..."
 rm -rf "$VENV_DIR"
 if ! "$PYTHON_EXE" -m venv "$VENV_DIR" --system-site-packages 2>/dev/null; then
@@ -377,7 +361,6 @@ if ! "$APP_PY" -m pip "${PIP_TORCH_ARGS[@]}"; then
     die "PyTorch install failed from $TORCH_INDEX"
 fi
 
-# Detect installed torch version (needed for transformers pin)
 TORCH_VER="$("$APP_PY" -c 'import torch; print(torch.__version__)' 2>/dev/null || echo "0")"
 TORCH_MAJOR_MINOR="$(printf '%s' "$TORCH_VER" | grep -oE '^[0-9]+\.[0-9]+' || echo "0.0")"
 log "Installed torch version: $TORCH_VER"
@@ -402,14 +385,11 @@ fi
 
 # ============================================================
 # 8b. Pin transformers when torch < 2.5
-#     (transformers 5.x refuses torch 2.4.x — this is what
-#     bites ROCm 6.1 wheels and Apple wheels on older macOS)
 # ============================================================
 NEED_OLD_TRANSFORMERS=0
 case "$TORCH_MAJOR_MINOR" in
     2.0|2.1|2.2|2.3|2.4) NEED_OLD_TRANSFORMERS=1 ;;
 esac
-# Apple MPS: default PyPI torch is 2.6+, so no pin needed. But defensive.
 
 if [[ "$NEED_OLD_TRANSFORMERS" -eq 1 ]]; then
     log "torch $TORCH_VER < 2.5 — pinning transformers to 4.x..."
@@ -424,14 +404,12 @@ fi
 # ============================================================
 hdr "GUI backend for pywebview"
 
-# Try GTK first (available via --system-site-packages if installed)
 GTK_WORKS=0
 if "$APP_PY" -c "import gi" 2>/dev/null; then
     GTK_WORKS=1
     ok "GTK bindings available (system PyGObject)"
 fi
 
-# Fall back to Qt (pip-installable, no sudo, works everywhere)
 if [[ "$GTK_WORKS" -eq 0 ]]; then
     log "GTK not available inside venv — installing PyQt6 fallback..."
     if ! "$APP_PY" -m pip install PyQt6 PyQt6-WebEngine; then
@@ -443,7 +421,7 @@ if [[ "$GTK_WORKS" -eq 0 ]]; then
     ok "Qt backend installed"
 fi
 
-"$APP_PY" - <<'PYEOF' || warn "pywebview preflight failed — the client may not open a window"
+if ! "$APP_PY" - <<'PYEOF'
 try:
     import webview  # noqa
     print("  pywebview: OK")
@@ -451,12 +429,16 @@ except Exception as e:
     print(f"  pywebview import error: {e}")
     raise SystemExit(1)
 PYEOF
+then
+    warn "pywebview preflight failed — the client may not open a window"
+fi
 
 # ============================================================
-# 10. Verify — torch, transformers linkage, backend device
+# 10. Verify
 # ============================================================
 hdr "Verifying install"
-"$APP_PY" - <<'PYEOF'
+
+"$APP_PY" - <<'PYEOF' || warn "torch verification print failed (continuing)"
 import sys, torch
 print("  Python:", sys.version.split()[0])
 print("  Torch:  ", torch.__version__)
@@ -478,8 +460,9 @@ except Exception:
     pass
 PYEOF
 
-# THE important check: can transformers actually see torch?
-"$APP_PY" - <<'PYEOF'
+# >>> FIX v8: use `if ! ...` so `set -e` doesn't exit before the
+#             actionable error message is printed.
+if ! "$APP_PY" - <<'PYEOF'
 import transformers, torch
 assert transformers.utils.is_torch_available(), (
     "transformers refuses to use installed torch — version mismatch "
@@ -487,14 +470,14 @@ assert transformers.utils.is_torch_available(), (
 )
 print(f"  transformers: {transformers.__version__} -> torch {torch.__version__} linked OK")
 PYEOF
-if [[ $? -ne 0 ]]; then
+then
     die "transformers cannot use the installed torch. Model loading WILL fail at runtime.
-    Fix: pip install 'transformers>=4.45,<5.0'  (or upgrade torch to >=2.5)
-    Then rerun this installer."
+    Fix: \"$APP_PY\" -m pip install 'transformers>=4.45,<5.0'
+    (or upgrade torch to >=2.5), then rerun this installer."
 fi
 
 # ============================================================
-# 11. Desktop + command integration (venv already in place)
+# 11. Desktop + command integration
 # ============================================================
 if [[ "$INTEGRATE" -eq 1 ]]; then
     hdr "Installing desktop integration"
@@ -511,7 +494,7 @@ if [[ "$INTEGRATE" -eq 1 ]]; then
 
     [[ -x "$APP_PY" ]] || die "Installed venv Python missing at $APP_PY"
 
-    # ---------- Linux: command + .desktop ----------
+    # ---------- Linux ----------
     if [[ "$OS" != "Darwin" ]]; then
         cat > "$BIN_DIR/crowdgpt" <<EOF
 #!/usr/bin/env bash
@@ -536,7 +519,6 @@ EOF
             fi
         fi
 
-        # Quote Exec= to survive spaces in $HOME
         cat > "$DESKTOP_DIR/crowdgpt.desktop" <<EOF
 [Desktop Entry]
 Version=1.0
@@ -583,7 +565,7 @@ EOF
         fi
     fi
 
-    # ---------- macOS: command + .app bundle ----------
+    # ---------- macOS ----------
     if [[ "$OS" == "Darwin" ]]; then
         if [[ -w "$BIN_DIR" ]]; then
             cat > "$BIN_DIR/crowdgpt" <<EOF
@@ -611,8 +593,8 @@ EOF
     <key>CFBundleName</key><string>CrowdGPT</string>
     <key>CFBundleDisplayName</key><string>CrowdGPT</string>
     <key>CFBundleIdentifier</key><string>net.crowdgpt.client</string>
-    <key>CFBundleVersion</key><string>0.7.0</string>
-    <key>CFBundleShortVersionString</key><string>0.7</string>
+    <key>CFBundleVersion</key><string>0.8.0</string>
+    <key>CFBundleShortVersionString</key><string>0.8</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleExecutable</key><string>launcher</string>
     <key>CFBundleIconFile</key><string>icon.icns</string>
@@ -686,9 +668,9 @@ EOF
     echo
     echo "  Launch from terminal:  crowdgpt"
     if [[ "$OS" == "Darwin" ]]; then
-        echo "  Launch from GUI:       Spotlight → CrowdGPT"
+        echo "  Launch from GUI:       Spotlight -> CrowdGPT"
     else
-        echo "  Launch from GUI:       Activities / app menu → CrowdGPT"
+        echo "  Launch from GUI:       Activities / app menu -> CrowdGPT"
     fi
     echo "  Uninstall:             crowdgpt-uninstall"
     echo

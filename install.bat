@@ -3,15 +3,14 @@ setlocal EnableExtensions EnableDelayedExpansion
 
 REM ============================================================
 REM CrowdGPT Universal Installer for Windows
-REM v6
-REM  - venv is created at its FINAL path (no relocation, no
-REM    text-rewriting of .exe / .pyc files)
-REM  - uninstaller self-deletes via delayed external cmd
-REM  - narrower ROCm GPU allow-list (matches AMD's real matrix)
-REM  - filtered requirements written as ASCII (no UTF-16 BOM)
-REM  - PowerShell helpers use PS 5.1-compatible syntax
-REM  - no `!` inside regex / echoed content with delayed exp on
-REM  - no inline `if` expressions in PS
+REM v7
+REM  - venv created at FINAL path (no relocation)
+REM  - AMD DirectML: transformers pinned to 4.x (torch 2.4.1 ceiling)
+REM  - CUDA/ROCm/Intel/CPU: transformers 5.x as normal
+REM  - torch <-> transformers compatibility verified BEFORE launch
+REM  - uninstaller self-deletes via delayed cmd
+REM  - ROCm GPU allow-list matches AMD's real Windows matrix
+REM  - no TRANSFORMERS_DISABLE_TORCH_CHECK hack (no longer needed)
 REM ============================================================
 
 set "REPO_URL=https://github.com/Vxtzq/CrowdGPT.git"
@@ -70,12 +69,12 @@ exit /b 0
 
 echo.
 echo ============================================================
-echo                 CrowdGPT Installer  (v6)
+echo                 CrowdGPT Installer  (v7)
 echo ============================================================
 echo.
 
 REM ------------------------------------------------------------
-REM 0. Paths (decided BEFORE venv creation so we never relocate)
+REM 0. Paths (venv goes straight to its final home)
 REM ------------------------------------------------------------
 set "APP_DIR=%LOCALAPPDATA%\CrowdGPT"
 set "BIN_DIR=%APP_DIR%"
@@ -204,8 +203,16 @@ echo   Note:        !WHEEL_NOTE!
 echo ============================================================
 echo.
 
+if /I "!BACKEND!"=="amd" (
+    echo [NOTE] AMD DirectML backend selected.
+    echo        torch-directml is pinned by upstream to torch 2.4.1, so
+    echo        transformers will be pinned to 4.x for this install.
+    echo        Some model operations may not be implemented on DirectML.
+    echo.
+)
+
 REM ------------------------------------------------------------
-REM 5. Create venv AT ITS FINAL LOCATION (no relocation later)
+REM 5. Create venv AT ITS FINAL LOCATION
 REM ------------------------------------------------------------
 if "!INTEGRATE!"=="1" (
     if not exist "!APP_DIR!" mkdir "!APP_DIR!"
@@ -268,14 +275,10 @@ goto :pytorch_cpu
 :pytorch_amd
 echo [INFO] Trying PyTorch DirectML...
 "!APP_PY!" -m pip install torch-directml
-if not errorlevel 1 goto :pytorch_amd_directml_done
-goto :pytorch_amd_rocm
-
-:pytorch_amd_directml_done
-echo [WARN] torch-directml is based on PyTorch 2.4.x.
-echo        TRANSFORMERS_DISABLE_TORCH_CHECK will be set only
-echo        for the CrowdGPT launcher (not system-wide).
-goto :pytorch_done
+if not errorlevel 1 goto :pytorch_done
+echo.
+echo [WARN] torch-directml install failed. Falling back to CPU.
+goto :pytorch_cpu
 
 :pytorch_amd_rocm
 echo [INFO] Trying official AMD ROCm PyTorch for Windows...
@@ -318,9 +321,6 @@ echo ============================================================
 set "TMP_REQ=%TEMP%\crowdgpt-req-%RANDOM%.txt"
 set "FILTER_PS=%TEMP%\crowdgpt-filter-%RANDOM%.ps1"
 
-REM Write the filter script via echo. NOTE: no `!` chars in
-REM the regex (delayed expansion would eat them), and we use
-REM \b instead of a char class.
 > "!FILTER_PS!"  echo $in  = '!SRC_DIR!\requirements.txt'
 >> "!FILTER_PS!" echo $out = '!TMP_REQ!'
 >> "!FILTER_PS!" echo $rx  = '^\s*(torch^|torchvision^|torchaudio^|torch-directml)\b'
@@ -351,6 +351,21 @@ del "!TMP_REQ!" >nul 2>nul
 :reqs_done
 
 REM ------------------------------------------------------------
+REM 7b. AMD DirectML: pin transformers to 4.x
+REM     (torch-directml is upstream-stuck on torch 2.4.1;
+REM      transformers 5.x refuses torch < 2.5)
+REM ------------------------------------------------------------
+if /I "!BACKEND!"=="amd" (
+    echo.
+    echo [INFO] AMD DirectML: pinning transformers to 4.x (torch 2.4.1 ceiling)...
+    "!APP_PY!" -m pip install --upgrade "transformers>=4.45,<5.0"
+    if errorlevel 1 (
+        echo [ERROR] Failed to pin transformers to 4.x for AMD DirectML.
+        goto :fatal
+    )
+)
+
+REM ------------------------------------------------------------
 REM 8. GUI backend check - WebView2
 REM ------------------------------------------------------------
 echo.
@@ -377,20 +392,46 @@ if "!WV2_FOUND!"=="1" (
 )
 
 REM ------------------------------------------------------------
-REM 9. Verify
+REM 9. Verify - torch, transformers link, backend device
 REM ------------------------------------------------------------
 echo.
 echo ============================================================
 echo                    Verifying install
 echo ============================================================
 "!APP_PY!" -c "import sys, torch; print('  Python:', sys.version.split()[0]); print('  Torch:  ', torch.__version__); print('  CUDA:   ', torch.cuda.is_available(), ('' if not torch.cuda.is_available() else '(' + torch.cuda.get_device_name(0) + ')'))"
-if errorlevel 1 echo [WARN] Verification failed, but install may still work.
+if errorlevel 1 echo [WARN] Torch import failed.
+
+REM --- THE important check: can transformers actually use torch? ---
+"!APP_PY!" -c "import transformers, torch; assert transformers.utils.is_torch_available(), 'transformers refuses to use installed torch (version mismatch)'; print('  transformers:', transformers.__version__, '-> torch', torch.__version__, 'linked OK')"
+if errorlevel 1 (
+    echo.
+    echo [ERROR] transformers cannot use the installed torch.
+    echo         This WILL break model loading at runtime.
+    if /I "!BACKEND!"=="amd" (
+        echo         Expected fix: transformers should have been pinned to 4.x.
+        echo         Try manually:
+        echo           "!APP_PY!" -m pip install "transformers^>=4.45,^<5.0"
+    ) else (
+        echo         Try reinstalling transformers:
+        echo           "!APP_PY!" -m pip install --force-reinstall transformers
+    )
+    goto :fatal
+)
+
+REM --- DirectML device sanity check (AMD only) ---
+if /I "!BACKEND!"=="amd" (
+    "!APP_PY!" -c "import torch_directml as d; assert d.is_available(), 'no DirectML device'; print('  DirectML:', d.device_name(0))"
+    if errorlevel 1 (
+        echo [WARN] torch-directml imported but no DirectML device is available.
+        echo        Check your GPU driver; the client may fall back to CPU.
+    )
+)
 
 "!APP_PY!" -c "import webview; print('  pywebview: OK')" 2>nul
 if errorlevel 1 echo [WARN] pywebview import failed.
 
 REM ------------------------------------------------------------
-REM 10. Desktop integration (copies source only; venv already in place)
+REM 10. Desktop integration
 REM ------------------------------------------------------------
 if "!INTEGRATE!"=="1" (
     call :do_integration
@@ -403,7 +444,6 @@ REM ------------------------------------------------------------
 if "!LAUNCH!"=="1" (
     echo Launching client.py...
     echo.
-    if /I "!BACKEND!"=="amd" set "TRANSFORMERS_DISABLE_TORCH_CHECK=1"
     if "!INTEGRATE!"=="1" (
         "!APP_PY!" "!APP_DIR!\client.py"
     ) else (
@@ -446,20 +486,16 @@ if not exist "!APP_PY!" (
     exit /b 1
 )
 
-REM ---- CMD shim (also sets the AMD DirectML env var, if needed) ----
+REM ---- CMD shim ----
 > "!BIN_DIR!\crowdgpt.cmd" echo @echo off
-if /I "!BACKEND!"=="amd" >>"!BIN_DIR!\crowdgpt.cmd" echo set "TRANSFORMERS_DISABLE_TORCH_CHECK=1"
 >>"!BIN_DIR!\crowdgpt.cmd" echo "!APP_PY!" "!APP_DIR!\client.py" %%*
 
-REM ---- GUI launcher - no console window ----
-REM Written line-by-line so we don't have to fight cmd quoting.
+REM ---- GUI launcher (no console window) ----
 set "GUI_VBS=!BIN_DIR!\crowdgpt-gui.vbs"
 > "!GUI_VBS!"  echo Set WshShell = CreateObject("WScript.Shell")
->> "!GUI_VBS!" echo Set WshEnv = WshShell.Environment("Process")
-if /I "!BACKEND!"=="amd" >>"!GUI_VBS!" echo WshEnv("TRANSFORMERS_DISABLE_TORCH_CHECK") = "1"
 >> "!GUI_VBS!" echo WshShell.Run """!APP_PY!"" ""!APP_DIR!\client.py""", 0, False
 
-REM ---- Add to user PATH (PS 5.1-compatible, no inline if) ----
+REM ---- Add to user PATH ----
 set "ENV_PS=%TEMP%\crowdgpt-env-%RANDOM%.ps1"
 > "!ENV_PS!"  echo $p = [Environment]::GetEnvironmentVariable('Path', 'User')
 >> "!ENV_PS!" echo if ($null -eq $p) { $p = '' }
@@ -471,7 +507,7 @@ set "ENV_PS=%TEMP%\crowdgpt-env-%RANDOM%.ps1"
 powershell -NoProfile -ExecutionPolicy Bypass -File "!ENV_PS!"
 del "!ENV_PS!" >nul 2>nul
 
-REM ---- Icon path ----
+REM ---- Icon ----
 set "APP_ICON="
 if exist "!APP_DIR!\docs\logo-app.ico" set "APP_ICON=!APP_DIR!\docs\logo-app.ico"
 if not defined APP_ICON if exist "!APP_DIR!\docs\logo-app.svg" set "APP_ICON=!APP_DIR!\docs\logo-app.svg"
@@ -488,12 +524,12 @@ if defined APP_ICON >>"!SC_PS!" echo $sc.IconLocation = '!APP_ICON!'
 powershell -NoProfile -ExecutionPolicy Bypass -File "!SC_PS!"
 del "!SC_PS!" >nul 2>nul
 
-REM ---- Add/Remove Programs registry entry ----
+REM ---- Add/Remove Programs entry ----
 set "REG_PS=%TEMP%\crowdgpt-reg-%RANDOM%.ps1"
 > "!REG_PS!"  echo $k = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\CrowdGPT'
 >> "!REG_PS!" echo New-Item -Path $k -Force ^| Out-Null
 >> "!REG_PS!" echo Set-ItemProperty -Path $k -Name 'DisplayName'     -Value 'CrowdGPT'
->> "!REG_PS!" echo Set-ItemProperty -Path $k -Name 'DisplayVersion'  -Value '0.6'
+>> "!REG_PS!" echo Set-ItemProperty -Path $k -Name 'DisplayVersion'  -Value '0.7'
 >> "!REG_PS!" echo Set-ItemProperty -Path $k -Name 'Publisher'       -Value 'CrowdGPT Project'
 >> "!REG_PS!" echo Set-ItemProperty -Path $k -Name 'InstallLocation' -Value '!APP_DIR!'
 >> "!REG_PS!" echo Set-ItemProperty -Path $k -Name 'UninstallString' -Value ('"' + '!APP_DIR!\uninstall.bat' + '"')
@@ -502,11 +538,7 @@ set "REG_PS=%TEMP%\crowdgpt-reg-%RANDOM%.ps1"
 powershell -NoProfile -ExecutionPolicy Bypass -File "!REG_PS!"
 del "!REG_PS!" >nul 2>nul
 
-REM ---- Uninstaller ----
-REM The uninstaller lives INSIDE !APP_DIR!. It must not try to
-REM rmdir itself while running: we spawn a detached cmd that
-REM waits 2s, then deletes the app dir. `start /min` means a
-REM brief console flashes on some systems - acceptable.
+REM ---- Uninstaller (self-deletes via delayed external cmd) ----
 > "!APP_DIR!\uninstall.bat"  echo @echo off
 >> "!APP_DIR!\uninstall.bat" echo setlocal
 >> "!APP_DIR!\uninstall.bat" echo echo Uninstalling CrowdGPT...
@@ -524,8 +556,7 @@ echo [OK] Start Menu shortcut: CrowdGPT
 echo [OK] Uninstall via: Settings ^> Apps ^> CrowdGPT
 echo.
 if /I "!BACKEND!"=="amd" (
-    echo [NOTE] The AMD DirectML env var is set only inside the
-    echo        crowdgpt launcher, not system-wide.
+    echo [NOTE] transformers pinned to 4.x for DirectML compatibility.
 )
 echo [NOTE] A new terminal is required for the "crowdgpt" command to work.
 exit /b 0
@@ -627,7 +658,7 @@ if not errorlevel 1 (
     exit /b 0
 )
 
-REM --- AMD? capture GPU name ---
+REM --- AMD? ---
 set "AMD_GPU_NAME="
 for /f "usebackq delims=" %%G in (`powershell -NoProfile -Command "$g = Get-CimInstance Win32_VideoController ^| Select-Object -ExpandProperty Name; $a = $g ^| Where-Object { $_ -match 'AMD^|Radeon' }; if ($a) { $a -join ' / ' }"`) do set "AMD_GPU_NAME=%%G"
 
@@ -638,7 +669,7 @@ if not defined AMD_GPU_NAME (
     exit /b 0
 )
 
-REM AMD's actual Windows ROCm support matrix (as of ROCm 6.4):
+REM AMD's real Windows ROCm support matrix (ROCm 6.4):
 REM   Radeon RX 7900 XTX / XT / GRE
 REM   Radeon RX 9070 XT / 9070
 REM   Ryzen AI Max / Max+  (Strix Halo)
@@ -652,7 +683,7 @@ if not errorlevel 1 (
 
 set "BACKEND=amd"
 set "TORCH_INDEX="
-set "WHEEL_NOTE=AMD !AMD_GPU_NAME! -^> DirectML torch-directml (not on AMD's ROCm Windows list)"
+set "WHEEL_NOTE=AMD !AMD_GPU_NAME! -^> DirectML (not on AMD's ROCm Windows list)"
 exit /b 0
 
 :fatal

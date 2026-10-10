@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # ============================================================
-# CrowdGPT universal installer — Linux + macOS
+# CrowdGPT universal installer — Linux + macOS  (v7)
 #
-# Detects hardware, installs matching PyTorch wheel, sets up a
-# `crowdgpt` command, registers the app with the OS launcher,
-# and ensures a working pywebview backend (GTK → PyQt fallback).
-#
-# Usage:  bash install.sh [--backend nvidia|amd|intel|apple|cpu]
-#                         [--dir PATH] [--no-launch] [--no-integrate]
-#                         [--help]
+#  - venv created at FINAL path (no relocation, no rewrites)
+#  - AMD ROCm: torch version detected, transformers pinned
+#    to 4.x when torch < 2.5 (rocm6.1 wheels are torch 2.4.1)
+#  - NVIDIA/Apple/Intel/CPU: transformers 5.x as normal
+#  - verify checks torch <-> transformers linkage before launch
+#  - ROCm index chosen from detected ROCm version
+#  - Python >= 3.10 enforced
 # ============================================================
 set -Eeuo pipefail
 
@@ -60,7 +60,7 @@ done
 
 echo
 echo "============================================================"
-echo "                 CrowdGPT Installer"
+echo "                 CrowdGPT Installer  (v7)"
 echo "============================================================"
 echo
 
@@ -93,17 +93,23 @@ install_uv() {
 }
 
 find_python() {
-    if command -v python3 >/dev/null 2>&1; then
-        PYTHON_EXE="$(command -v python3)"; return
-    fi
-    if command -v python >/dev/null 2>&1; then
-        PYTHON_EXE="$(command -v python)"; return
-    fi
+    local candidates=(python3.12 python3.11 python3.10 python3 python)
+    for c in "${candidates[@]}"; do
+        if command -v "$c" >/dev/null 2>&1; then
+            local ver
+            ver="$("$c" -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || echo "0.0")"
+            local major="${ver%%.*}" minor="${ver##*.}"
+            if [[ "$major" -eq 3 && "$minor" -ge 10 ]]; then
+                PYTHON_EXE="$(command -v "$c")"
+                return
+            fi
+        fi
+    done
     install_uv
-    log "Downloading Python via uv..."
-    uv python install --default
+    log "No suitable Python 3.10+ found — installing via uv..."
+    uv python install 3.11 --default
     export PATH="$HOME/.local/bin:$PATH"
-    PYTHON_EXE="$(uv python find)"
+    PYTHON_EXE="$(uv python find 3.11)"
 }
 
 copy_tree() {
@@ -132,7 +138,7 @@ copy_tree() {
 }
 
 # ============================================================
-# 1. Python
+# 1. Python (>= 3.10)
 # ============================================================
 PYTHON_EXE=""
 find_python
@@ -163,7 +169,7 @@ fi
 ok "Git: $(git --version)"
 
 # ============================================================
-# 3. Clone / update repo (build dir)
+# 3. Clone / update repo
 # ============================================================
 if [[ -f "client.py" && -d ".git" ]]; then
     REPO_DIR="."
@@ -177,10 +183,13 @@ else
 fi
 cd "$REPO_DIR"
 [[ -f client.py ]] || die "client.py not found after checkout."
+SRC_DIR="$PWD"
 
 # ============================================================
 # 4. Hardware detection
 # ============================================================
+# NOTE: for AMD ROCm we also compute TORCH_ROCM_INDEX from the
+# detected ROCm version so we pick a modern wheel when possible.
 detect_backend() {
     BACKEND=""
     TORCH_INDEX=""
@@ -209,10 +218,13 @@ detect_backend() {
         DRIVER="$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -n1 | tr -d '[:space:]' || true)"
 
         if [[ "$ARCH" == "aarch64" ]]; then
-            BACKEND="nvidia"
-            TORCH_INDEX="https://download.pytorch.org/whl/cu124"
-            WHEEL_NOTE="Jetson (aarch64) — you may need NVIDIA's Jetson-specific wheels"
-            warn "$WHEEL_NOTE"
+            # Jetson — generic wheels will NOT work.
+            BACKEND="cpu"
+            TORCH_INDEX="https://download.pytorch.org/whl/cpu"
+            WHEEL_NOTE="Jetson (aarch64) — generic CUDA wheels are incompatible. Using CPU for now."
+            warn "Jetson detected. For GPU support, install NVIDIA's Jetson wheels manually:"
+            warn "  https://developer.download.nvidia.com/compute/redist/jp/"
+            warn "Continuing with CPU PyTorch."
             return
         fi
 
@@ -245,15 +257,29 @@ detect_backend() {
     fi
     if [[ -n "$ROCM_VER" ]] || [[ -d /opt/rocm ]] || command -v rocm-smi >/dev/null 2>&1; then
         BACKEND="amd"
+        # Pick the newest torch ROCm index we're reasonably sure works
+        # with the installed driver. ROCm 6.1 → torch 2.4.1; 6.2 → 2.5.x; 6.3 → 2.6.x
         case "$ROCM_VER" in
-            6.*)   TORCH_INDEX="https://download.pytorch.org/whl/rocm6.1" ;;
-            5.*)   TORCH_INDEX="https://download.pytorch.org/whl/rocm5.7" ;;
-            *)     TORCH_INDEX="https://download.pytorch.org/whl/rocm6.1" ;;
+            6.3*|6.4*) TORCH_INDEX="https://download.pytorch.org/whl/rocm6.3" ;;
+            6.2*)      TORCH_INDEX="https://download.pytorch.org/whl/rocm6.2" ;;
+            6.1*)      TORCH_INDEX="https://download.pytorch.org/whl/rocm6.1" ;;
+            6.*)       TORCH_INDEX="https://download.pytorch.org/whl/rocm6.1" ;;
+            5.*)       TORCH_INDEX="https://download.pytorch.org/whl/rocm5.7" ;;
+            *)         TORCH_INDEX="https://download.pytorch.org/whl/rocm6.1" ;;
         esac
         WHEEL_NOTE="AMD ROCm ${ROCM_VER:-unknown} → ${TORCH_INDEX##*/}"
-        warn "Consumer Radeon (RX 6000/7000) often needs:"
-        warn "    export HSA_OVERRIDE_GFX_VERSION=10.3.0"
-        warn "  Add that to your shell profile if torch doesn't see the GPU."
+        # Correct HSA override hint for the two big consumer families
+        if command -v rocminfo >/dev/null 2>&1; then
+            local GFX
+            GFX="$(rocminfo 2>/dev/null | grep -oE 'gfx[0-9a-f]+' | sort -u | head -n1 || true)"
+            case "$GFX" in
+                gfx103*) warn "RX 6000 (Navi 2x) — you may need: export HSA_OVERRIDE_GFX_VERSION=10.3.0" ;;
+                gfx110*) warn "RX 7000 (Navi 3x) — you may need: export HSA_OVERRIDE_GFX_VERSION=11.0.0" ;;
+                gfx120*) : ;;  # RX 9000 series is native-supported
+                "")      warn "Could not read GPU arch. If torch can't see the GPU, try HSA_OVERRIDE_GFX_VERSION matching your arch." ;;
+                *)       warn "GPU arch: $GFX — check AMD's ROCm compatibility matrix." ;;
+            esac
+        fi
         return
     fi
 
@@ -266,7 +292,7 @@ detect_backend() {
         return
     fi
 
-    # CPU fallback
+    # CPU
     BACKEND="cpu"
     TORCH_INDEX="https://download.pytorch.org/whl/cpu"
     WHEEL_NOTE="No GPU detected — CPU wheel (training will be very slow)"
@@ -277,8 +303,8 @@ if [[ -n "$BACKEND_OVERRIDE" ]]; then
         nvidia) BACKEND="nvidia"; TORCH_INDEX="https://download.pytorch.org/whl/cu124"; WHEEL_NOTE="forced: nvidia/cu124" ;;
         amd)    BACKEND="amd";    TORCH_INDEX="https://download.pytorch.org/whl/rocm6.1"; WHEEL_NOTE="forced: amd/rocm6.1" ;;
         intel)  BACKEND="intel";  TORCH_INDEX="https://download.pytorch.org/whl/xpu";    WHEEL_NOTE="forced: intel/xpu" ;;
-        apple)  BACKEND="apple";  TORCH_INDEX="https://pypi.org/simple";                 WHEEL_NOTE="forced: apple/mps" ;;
-        cpu)    BACKEND="cpu";    TORCH_INDEX="https://download.pytorch.org/whl/cpu";    WHEEL_NOTE="forced: cpu" ;;
+        apple)  BACKEND="apple";  TORCH_INDEX="https://pypi.org/simple";                WHEEL_NOTE="forced: apple/mps" ;;
+        cpu)    BACKEND="cpu";    TORCH_INDEX="https://download.pytorch.org/whl/cpu";   WHEEL_NOTE="forced: cpu" ;;
         *) die "--backend must be one of: nvidia | amd | intel | apple | cpu" ;;
     esac
 else
@@ -305,33 +331,37 @@ else
     ICON_DIR="$HOME/.local/share/icons/hicolor/256x256/apps"
 fi
 
-# ============================================================
-# 6. Build venv in the source dir
-# ============================================================
-# We use --system-site-packages so that PyGObject (gi) from the
-# system Python is visible inside the venv. If the user has GTK
-# installed, we use it; otherwise we fall back to PyQt6 below.
-BUILD_VENV="$PWD/.venv"
+# Where will the venv live? Decide BEFORE creating it.
+if [[ "$INTEGRATE" -eq 1 ]]; then
+    VENV_DIR="$APP_DIR/.venv"
+    mkdir -p "$APP_DIR"
+else
+    VENV_DIR="$SRC_DIR/.venv"
+fi
+APP_PY="$VENV_DIR/bin/python"
 
-log "Creating build venv (with system site-packages for GTK access)..."
-rm -rf "$BUILD_VENV"
-if ! "$PYTHON_EXE" -m venv "$BUILD_VENV" --system-site-packages 2>/dev/null; then
+# ============================================================
+# 6. Create venv AT ITS FINAL LOCATION
+# ============================================================
+# --system-site-packages so system PyGObject (gi) is visible if present.
+log "Creating venv (with system site-packages for GTK access) at $VENV_DIR..."
+rm -rf "$VENV_DIR"
+if ! "$PYTHON_EXE" -m venv "$VENV_DIR" --system-site-packages 2>/dev/null; then
     install_uv
-    uv venv --system-site-packages "$BUILD_VENV"
+    uv venv --system-site-packages --python 3.11 "$VENV_DIR"
 fi
 
-BUILD_PY="$BUILD_VENV/bin/python"
-[[ -x "$BUILD_PY" ]] || die "Build venv Python missing."
+[[ -x "$APP_PY" ]] || die "venv Python missing at $APP_PY"
 
 log "Upgrading pip..."
-"$BUILD_PY" -m pip install --upgrade pip >/dev/null
+"$APP_PY" -m pip install --upgrade pip >/dev/null
 
 # ============================================================
-# 7. Install PyTorch from the correct index
+# 7. Install PyTorch
 # ============================================================
 hdr "Installing PyTorch"
 
-"$BUILD_PY" -m pip uninstall -y torch torchvision torchaudio >/dev/null 2>&1 || true
+"$APP_PY" -m pip uninstall -y torch torchvision torchaudio >/dev/null 2>&1 || true
 
 PIP_TORCH_ARGS=(
     install
@@ -343,9 +373,14 @@ if [[ -n "$TORCH_EXTRA" ]]; then
 fi
 
 log "pip ${PIP_TORCH_ARGS[*]}"
-if ! "$BUILD_PY" -m pip "${PIP_TORCH_ARGS[@]}"; then
+if ! "$APP_PY" -m pip "${PIP_TORCH_ARGS[@]}"; then
     die "PyTorch install failed from $TORCH_INDEX"
 fi
+
+# Detect installed torch version (needed for transformers pin)
+TORCH_VER="$("$APP_PY" -c 'import torch; print(torch.__version__)' 2>/dev/null || echo "0")"
+TORCH_MAJOR_MINOR="$(printf '%s' "$TORCH_VER" | grep -oE '^[0-9]+\.[0-9]+' || echo "0.0")"
+log "Installed torch version: $TORCH_VER"
 
 # ============================================================
 # 8. Install project requirements (torch lines stripped)
@@ -356,7 +391,7 @@ if [[ -f requirements.txt ]]; then
     grep -viE '^[[:space:]]*(torch|torchvision|torchaudio)([[:space:]]*[<>=!~].*)?$' \
         requirements.txt > "$TMP_REQ" || true
     if [[ -s "$TMP_REQ" ]]; then
-        "$BUILD_PY" -m pip install -r "$TMP_REQ"
+        "$APP_PY" -m pip install -r "$TMP_REQ"
     else
         warn "requirements.txt contained only torch packages; nothing to install."
     fi
@@ -366,48 +401,49 @@ else
 fi
 
 # ============================================================
-# 9. Ensure pywebview has a working GUI backend
+# 8b. Pin transformers when torch < 2.5
+#     (transformers 5.x refuses torch 2.4.x — this is what
+#     bites ROCm 6.1 wheels and Apple wheels on older macOS)
+# ============================================================
+NEED_OLD_TRANSFORMERS=0
+case "$TORCH_MAJOR_MINOR" in
+    2.0|2.1|2.2|2.3|2.4) NEED_OLD_TRANSFORMERS=1 ;;
+esac
+# Apple MPS: default PyPI torch is 2.6+, so no pin needed. But defensive.
+
+if [[ "$NEED_OLD_TRANSFORMERS" -eq 1 ]]; then
+    log "torch $TORCH_VER < 2.5 — pinning transformers to 4.x..."
+    if ! "$APP_PY" -m pip install --upgrade "transformers>=4.45,<5.0"; then
+        die "Failed to pin transformers to 4.x for torch $TORCH_VER."
+    fi
+    ok "transformers pinned to 4.x"
+fi
+
+# ============================================================
+# 9. GUI backend for pywebview
 # ============================================================
 hdr "GUI backend for pywebview"
 
-# --- 9a. Try to expose system GTK inside the venv ---
+# Try GTK first (available via --system-site-packages if installed)
 GTK_WORKS=0
-
-if python3 -c "import gi" 2>/dev/null; then
-    SYS_SITE="$(python3 -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])' 2>/dev/null || true)"
-    VENV_SITE="$("$BUILD_PY" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])' 2>/dev/null || true)"
-
-    if [[ -n "$SYS_SITE" && -n "$VENV_SITE" ]]; then
-        for pkg in gi gi_cairo pygobject; do
-            if [[ -e "$SYS_SITE/$pkg" ]]; then
-                ln -sfn "$SYS_SITE/$pkg" "$VENV_SITE/$pkg" 2>/dev/null || true
-            fi
-        done
-        for so in "$SYS_SITE"/_gi*.so; do
-            [[ -e "$so" ]] && ln -sfn "$so" "$VENV_SITE/$(basename "$so")" 2>/dev/null || true
-        done
-    fi
-
-    if "$BUILD_PY" -c "import gi" 2>/dev/null; then
-        GTK_WORKS=1
-        ok "GTK bindings available (system PyGObject)"
-    fi
+if "$APP_PY" -c "import gi" 2>/dev/null; then
+    GTK_WORKS=1
+    ok "GTK bindings available (system PyGObject)"
 fi
 
-# --- 9b. If not, install PyQt6 from pip (works everywhere, no sudo) ---
+# Fall back to Qt (pip-installable, no sudo, works everywhere)
 if [[ "$GTK_WORKS" -eq 0 ]]; then
     log "GTK not available inside venv — installing PyQt6 fallback..."
-    if ! "$BUILD_PY" -m pip install PyQt6 PyQt6-WebEngine; then
+    if ! "$APP_PY" -m pip install PyQt6 PyQt6-WebEngine; then
         warn "PyQt6 install failed. Trying PyQt5 as last resort..."
-        if ! "$BUILD_PY" -m pip install PyQt5 PyQtWebEngine; then
+        if ! "$APP_PY" -m pip install PyQt5 PyQtWebEngine; then
             die "Could not install any Qt backend. pywebview needs GTK or Qt."
         fi
     fi
     ok "Qt backend installed"
 fi
 
-# --- 9c. Quick sanity check: pywebview can find its dependencies ---
-"$BUILD_PY" - <<'PYEOF' || warn "pywebview preflight failed — the client may not open a window"
+"$APP_PY" - <<'PYEOF' || warn "pywebview preflight failed — the client may not open a window"
 try:
     import webview  # noqa
     print("  pywebview: OK")
@@ -417,10 +453,10 @@ except Exception as e:
 PYEOF
 
 # ============================================================
-# 10. Verify the venv
+# 10. Verify — torch, transformers linkage, backend device
 # ============================================================
 hdr "Verifying install"
-"$BUILD_PY" - <<'PYEOF'
+"$APP_PY" - <<'PYEOF'
 import sys, torch
 print("  Python:", sys.version.split()[0])
 print("  Torch:  ", torch.__version__)
@@ -429,7 +465,11 @@ if torch.cuda.is_available():
     print(f"  ({torch.cuda.get_device_name(0)})")
 else:
     print()
-print("  MPS:    ", getattr(torch.backends, "mps", None) and torch.backends.mps.is_available())
+try:
+    if hasattr(torch.backends, "mps"):
+        print("  MPS:    ", torch.backends.mps.is_available())
+except Exception:
+    pass
 try:
     import torch.version
     if torch.version.hip:
@@ -438,59 +478,38 @@ except Exception:
     pass
 PYEOF
 
+# THE important check: can transformers actually see torch?
+"$APP_PY" - <<'PYEOF'
+import transformers, torch
+assert transformers.utils.is_torch_available(), (
+    "transformers refuses to use installed torch — version mismatch "
+    f"(transformers {transformers.__version__} vs torch {torch.__version__})"
+)
+print(f"  transformers: {transformers.__version__} -> torch {torch.__version__} linked OK")
+PYEOF
+if [[ $? -ne 0 ]]; then
+    die "transformers cannot use the installed torch. Model loading WILL fail at runtime.
+    Fix: pip install 'transformers>=4.45,<5.0'  (or upgrade torch to >=2.5)
+    Then rerun this installer."
+fi
+
 # ============================================================
-# 11. Desktop + command integration
+# 11. Desktop + command integration (venv already in place)
 # ============================================================
 if [[ "$INTEGRATE" -eq 1 ]]; then
     hdr "Installing desktop integration"
     log "Install location: $APP_DIR"
 
-    mkdir -p "$APP_DIR"
     if [[ "$OS" == "Darwin" ]]; then
         mkdir -p "$APPS_DIR"
     else
         mkdir -p "$BIN_DIR" "$DESKTOP_DIR" "$ICON_DIR"
     fi
 
-    log "Copying app files..."
-    copy_tree "$PWD" "$APP_DIR"
+    log "Copying app files (venv excluded; already in place)..."
+    copy_tree "$SRC_DIR" "$APP_DIR"
 
-    # Move the build venv into the app dir
-    if [[ -d "$APP_DIR/.venv" ]]; then
-        rm -rf "$APP_DIR/.venv"
-    fi
-    mv "$BUILD_VENV" "$APP_DIR/.venv"
-
-    APP_PY="$APP_DIR/.venv/bin/python"
     [[ -x "$APP_PY" ]] || die "Installed venv Python missing at $APP_PY"
-
-    # Rewrite shebangs that still point at the old path
-    log "Rewriting venv paths..."
-    python3 - <<EOF
-import pathlib
-old = "$PWD/.venv"
-new = "$APP_DIR/.venv"
-root = pathlib.Path(new)
-if not root.exists():
-    raise SystemExit(0)
-for p in root.rglob("*"):
-    if not p.is_file():
-        continue
-    try:
-        if p.stat().st_size > 200_000:
-            continue
-    except Exception:
-        continue
-    try:
-        text = p.read_text(encoding="utf-8")
-    except Exception:
-        continue
-    if old in text:
-        try:
-            p.write_text(text.replace(old, new), encoding="utf-8")
-        except Exception:
-            pass
-EOF
 
     # ---------- Linux: command + .desktop ----------
     if [[ "$OS" != "Darwin" ]]; then
@@ -500,7 +519,6 @@ exec "$APP_PY" "$APP_DIR/client.py" "\$@"
 EOF
         chmod +x "$BIN_DIR/crowdgpt"
 
-        # Icon (best-effort PNG; some systems handle SVG fine)
         ICON_SRC=""
         for c in "$APP_DIR/docs/logo-app.svg" "$APP_DIR/docs/logo-black.svg" "$APP_DIR/docs/logo-white.svg"; do
             [[ -f "$c" ]] && ICON_SRC="$c" && break
@@ -518,6 +536,7 @@ EOF
             fi
         fi
 
+        # Quote Exec= to survive spaces in $HOME
         cat > "$DESKTOP_DIR/crowdgpt.desktop" <<EOF
 [Desktop Entry]
 Version=1.0
@@ -525,7 +544,7 @@ Type=Application
 Name=CrowdGPT
 GenericName=Decentralized AI Training Client
 Comment=Contribute GPU cycles to the CrowdGPT network
-Exec=$BIN_DIR/crowdgpt
+Exec="$BIN_DIR/crowdgpt"
 Icon=$ICON_NAME
 Terminal=false
 Categories=Science;Network;Utility;
@@ -592,8 +611,8 @@ EOF
     <key>CFBundleName</key><string>CrowdGPT</string>
     <key>CFBundleDisplayName</key><string>CrowdGPT</string>
     <key>CFBundleIdentifier</key><string>net.crowdgpt.client</string>
-    <key>CFBundleVersion</key><string>0.5.0</string>
-    <key>CFBundleShortVersionString</key><string>0.5</string>
+    <key>CFBundleVersion</key><string>0.7.0</string>
+    <key>CFBundleShortVersionString</key><string>0.7</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleExecutable</key><string>launcher</string>
     <key>CFBundleIconFile</key><string>icon.icns</string>
@@ -660,9 +679,10 @@ EOF
 
     echo
     echo "============================================================"
-    echo "             Installation complete  ✓"
+    echo "             Installation complete"
     echo "============================================================"
     echo "  Backend: $BACKEND"
+    echo "  Torch:   $TORCH_VER"
     echo
     echo "  Launch from terminal:  crowdgpt"
     if [[ "$OS" == "Darwin" ]]; then
@@ -674,7 +694,7 @@ EOF
     echo
 else
     hdr "Skipping desktop integration (--no-integrate)"
-    echo "  Build venv: $BUILD_VENV"
+    echo "  Build venv: $VENV_DIR"
 fi
 
 # ============================================================
@@ -686,12 +706,12 @@ if [[ "$LAUNCH" -eq 1 ]]; then
     if [[ "$INTEGRATE" -eq 1 ]]; then
         exec "$APP_PY" "$APP_DIR/client.py"
     else
-        exec "$BUILD_PY" "$PWD/client.py"
+        exec "$APP_PY" "$SRC_DIR/client.py"
     fi
 else
     if [[ "$INTEGRATE" -eq 1 ]]; then
         echo "To launch later:  crowdgpt"
     else
-        echo "To launch later:  $BUILD_PY $PWD/client.py"
+        echo "To launch later:  $APP_PY $SRC_DIR/client.py"
     fi
 fi

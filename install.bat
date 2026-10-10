@@ -331,19 +331,19 @@ if exist "requirements.txt" (
     echo ============================================================
     echo               Installing project dependencies
     echo ============================================================
-    set "TMP_REQ=%TEMP%\crowdgpt-req-%RANDOM%-%RANDOM%.txt"
+    set "TMP_REQ=%TEMP%\crowdgpt-req-!RANDOM!.txt"
     powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-        "Get-Content -LiteralPath 'requirements.txt' | Where-Object { $_ -notmatch '^\s*(torch|torchvision|torchaudio|torch-directml)(\s|[<>=!~]|$)' } | Set-Content -LiteralPath '%TMP_REQ%'"
+        "Get-Content -LiteralPath 'requirements.txt' | Where-Object { $_ -notmatch '^\s*(torch|torchvision|torchaudio|torch-directml)(\s|[<>=!~]|$)' } | Set-Content -LiteralPath '!TMP_REQ!'"
     if errorlevel 1 goto :fatal
 
-    for %%A in ("%TMP_REQ%") do set "TMP_SIZE=%%~zA"
+    for %%A in ("!TMP_REQ!") do set "TMP_SIZE=%%~zA"
     if "!TMP_SIZE!"=="0" (
         echo [WARN] requirements.txt contained only torch packages; nothing else to install.
     ) else (
-        "%BUILD_PY%" -m pip install -r "%TMP_REQ%"
+        "%BUILD_PY%" -m pip install -r "!TMP_REQ!"
         if errorlevel 1 goto :fatal
     )
-    del /q "%TMP_REQ%" >nul 2>nul
+    del /q "!TMP_REQ!" >nul 2>nul
 ) else (
     echo [WARN] requirements.txt not found; skipping project deps.
 )

@@ -3,7 +3,7 @@ setlocal EnableExtensions EnableDelayedExpansion
 
 REM ============================================================
 REM CrowdGPT Universal Installer for Windows
-REM v8
+REM v9
 REM  - venv created at FINAL path (no relocation)
 REM  - AMD DirectML: transformers pinned to 4.x (torch 2.4.1 ceiling)
 REM  - CUDA/ROCm/Intel/CPU: transformers 5.x as normal
@@ -11,6 +11,8 @@ REM  - torch <-> transformers compatibility verified BEFORE launch
 REM  - uninstaller self-deletes via delayed cmd
 REM  - ROCm GPU allow-list matches AMD's real Windows matrix
 REM  - v8: fixed unescaped parens in echo inside if() block
+REM  - v9: AMD GPU name captured via temp file (v5 approach);
+REM        the for/f+inline-PowerShell variant was broken
 REM ============================================================
 
 set "REPO_URL=https://github.com/Vxtzq/CrowdGPT.git"
@@ -69,7 +71,7 @@ exit /b 0
 
 echo.
 echo ============================================================
-echo                 CrowdGPT Installer  (v8)
+echo                 CrowdGPT Installer  (v9)
 echo ============================================================
 echo.
 
@@ -203,13 +205,7 @@ echo   Note:        !WHEEL_NOTE!
 echo ============================================================
 echo.
 
-if /I "!BACKEND!"=="amd" (
-    echo [NOTE] AMD DirectML backend selected.
-    echo        torch-directml is pinned by upstream to torch 2.4.1, so
-    echo        transformers will be pinned to 4.x for this install.
-    echo        Some model operations may not be implemented on DirectML.
-    echo.
-)
+if /I "!BACKEND!"=="amd" call :note_amd
 
 REM ------------------------------------------------------------
 REM 5. Create venv AT ITS FINAL LOCATION
@@ -357,7 +353,6 @@ REM     transformers 5.x refuses torch < 2.5.
 REM ------------------------------------------------------------
 if /I "!BACKEND!"=="amd" (
     echo.
-    REM >>> FIX v8: parens escaped with ^ so cmd block parser is happy
     echo [INFO] AMD DirectML: pinning transformers to 4.x ^(torch 2.4.1 ceiling^)...
     "!APP_PY!" -m pip install --upgrade "transformers>=4.45,<5.0"
     if errorlevel 1 (
@@ -418,13 +413,7 @@ if errorlevel 1 (
     goto :fatal
 )
 
-if /I "!BACKEND!"=="amd" (
-    "!APP_PY!" -c "import torch_directml as d; assert d.is_available(), 'no DirectML device'; print('  DirectML:', d.device_name(0))"
-    if errorlevel 1 (
-        echo [WARN] torch-directml imported but no DirectML device is available.
-        echo        Check your GPU driver; the client may fall back to CPU.
-    )
-)
+if /I "!BACKEND!"=="amd" call :verify_directml_devices
 
 "!APP_PY!" -c "import webview; print('  pywebview: OK')" 2>nul
 if errorlevel 1 echo [WARN] pywebview import failed.
@@ -460,6 +449,36 @@ if "!LAUNCH!"=="1" (
     )
     exit /b 0
 )
+
+REM ============================================================
+REM Subroutine: note_amd
+REM ============================================================
+:note_amd
+echo [NOTE] AMD DirectML backend selected.
+echo        torch-directml is pinned by upstream to torch 2.4.1,
+echo        so transformers will be pinned to 4.x for this install.
+echo        Some model operations may not be implemented on DirectML.
+echo.
+echo [NOTE] If your system has both an iGPU and a dGPU, the client
+echo        may pick the wrong DirectML device. To list devices:
+echo          .venv\Scripts\python.exe -c "import torch_directml as d; print([d.device_name(i) for i in range(8)])"
+echo        Then set CROWDGPT_DML_DEVICE to the desired index before
+echo        launching, e.g.:  set CROWDGPT_DML_DEVICE=1
+echo.
+exit /b 0
+
+REM ============================================================
+REM Subroutine: verify_directml_devices
+REM ============================================================
+:verify_directml_devices
+"!APP_PY!" -c "import torch_directml as d; names = [d.device_name(i) for i in range(8) if d.device_name(i)]; [print('  DirectML[%d]: %s' % (i, n)) for i, n in enumerate(names)]" 2>nul
+if errorlevel 1 (
+    echo [WARN] Could not enumerate DirectML devices.
+    exit /b 0
+)
+"!APP_PY!" -c "import torch_directml as d; assert d.is_available(), 'no DirectML device'; print('  DirectML default: [0]', d.device_name(0))" 2>nul
+if errorlevel 1 echo [WARN] torch-directml imported but no DirectML device is available.
+exit /b 0
 
 REM ============================================================
 REM Subroutine: do_integration
@@ -528,7 +547,7 @@ set "REG_PS=%TEMP%\crowdgpt-reg-%RANDOM%.ps1"
 > "!REG_PS!"  echo $k = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\CrowdGPT'
 >> "!REG_PS!" echo New-Item -Path $k -Force ^| Out-Null
 >> "!REG_PS!" echo Set-ItemProperty -Path $k -Name 'DisplayName'     -Value 'CrowdGPT'
->> "!REG_PS!" echo Set-ItemProperty -Path $k -Name 'DisplayVersion'  -Value '0.8'
+>> "!REG_PS!" echo Set-ItemProperty -Path $k -Name 'DisplayVersion'  -Value '0.9'
 >> "!REG_PS!" echo Set-ItemProperty -Path $k -Name 'Publisher'       -Value 'CrowdGPT Project'
 >> "!REG_PS!" echo Set-ItemProperty -Path $k -Name 'InstallLocation' -Value '!APP_DIR!'
 >> "!REG_PS!" echo Set-ItemProperty -Path $k -Name 'UninstallString' -Value ('"' + '!APP_DIR!\uninstall.bat' + '"')
@@ -656,8 +675,15 @@ if not errorlevel 1 (
     exit /b 0
 )
 
+REM --- AMD: capture GPU name via temp file (v5 approach) ---
+REM     Do NOT use for/f with inline PowerShell here: CMD eats the
+REM     ^| escapes and the inner cmd.exe sees the pipes, so nothing
+REM     is captured. A temp file sidesteps the whole problem.
 set "AMD_GPU_NAME="
-for /f "usebackq delims=" %%G in (`powershell -NoProfile -Command "$g = Get-CimInstance Win32_VideoController ^| Select-Object -ExpandProperty Name; $a = $g ^| Where-Object { $_ -match 'AMD^|Radeon' }; if ($a) { $a -join ' / ' }"`) do set "AMD_GPU_NAME=%%G"
+set "AMD_GPU_TMP=%TEMP%\crowdgpt-amd-%RANDOM%.txt"
+powershell -NoProfile -Command "(Get-CimInstance Win32_VideoController | Where-Object { $_.Name -match 'AMD|Radeon' } | Select-Object -ExpandProperty Name) -join ' / '" > "%AMD_GPU_TMP%" 2>nul
+if exist "%AMD_GPU_TMP%" set /p AMD_GPU_NAME=<"%AMD_GPU_TMP%"
+if exist "%AMD_GPU_TMP%" del "%AMD_GPU_TMP%" >nul 2>nul
 
 if not defined AMD_GPU_NAME (
     set "BACKEND=cpu"
@@ -666,6 +692,10 @@ if not defined AMD_GPU_NAME (
     exit /b 0
 )
 
+REM AMD's real Windows ROCm support matrix (ROCm 6.4):
+REM   Radeon RX 7900 XTX / XT / GRE
+REM   Radeon RX 9070 XT / 9070
+REM   Ryzen AI Max / Max+  (Strix Halo)
 echo !AMD_GPU_NAME! | findstr /I /C:"RX 7900" /C:"RX 9070" /C:"Ryzen AI Max" >nul
 if not errorlevel 1 (
     set "BACKEND=amd-rocm"

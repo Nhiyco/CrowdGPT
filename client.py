@@ -2633,27 +2633,33 @@ class Api:
             auto_detect_vram_budget()
             self.emit('log',f"VRAM: {memory_config['ram_gb']:.1f} GB")
         except Exception as e:
-            self.emit('log',f"Error: {e}"); self.emit('status','idle'); return
-            
+            self.emit('log', f"Error: {e}")
+            self.emit('status','idle')
+            return
+
         round_count = 0
         while not self.stop_event.is_set():
             round_count += 1
             self.emit('log', f"{'='*40}")
             self.emit('log', f"Starting Round Cycle #{round_count}")
-            self.emit('log', f"{'='*40}")
-            
-            try: 
+         self.emit('log', f"{'='*40}")
+
+            try:
                 run_single_round_wrapper(self.server_url, self.auth_token, self.stop_event, self.emit)
             except KeyboardInterrupt:
                 self.stop_event.set()
                 break
-            except Exception as e: 
-                self.emit('log',f"Round failed: {e}")
+            except Exception as e:
+                import traceback
+                tb = traceback.format_exc()
+                print(f"\n[ROUND-FAIL-TRACEBACK]\n{tb}\n", flush=True)
+                for ln in tb.splitlines()[-14:]:
+                    self.emit('log', ln)
+                self.emit('log', f"Round failed: {e}")
 
-            if self.stop_event.is_set(): 
+            if self.stop_event.is_set():
                 break
 
-            # Between rounds: safe place to apply an update and restart
             if UPDATE_CHECK_BETWEEN_ROUNDS:
                 self._check_updates_between_rounds()
 
@@ -2662,7 +2668,7 @@ class Api:
             for _ in range(10):
                 if self.stop_event.is_set(): break
                 time.sleep(1)
-                
+    
         self.emit('status','idle')
         self.emit('log', "👋 Training stopped by user.")
 

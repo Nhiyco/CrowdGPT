@@ -3,20 +3,15 @@ setlocal EnableExtensions EnableDelayedExpansion
 
 REM ============================================================
 REM CrowdGPT Universal Installer for Windows
-REM v9.2
-REM  - venv created at FINAL path (no relocation)
+REM v9.3
+REM  - fresh install: previous app dir is wiped (caches preserved)
+REM  - HIP SDK detection for AMD ROCm backend
 REM  - AMD DirectML: transformers pinned to 4.x (torch 2.4.1 ceiling)
 REM  - CUDA/ROCm/Intel/CPU: transformers 5.x as normal
 REM  - torch <-> transformers compatibility verified BEFORE launch
+REM  - venv created at FINAL path (no relocation)
 REM  - uninstaller self-deletes via delayed cmd
 REM  - ROCm GPU allow-list matches AMD's REAL Windows matrix
-REM    (v9.2: RX 7800/7700/7600/7650 + Ryzen AI 9 added)
-REM  - v8: fixed unescaped parens in echo inside if() block
-REM  - v9: AMD GPU name captured via temp file (v5 approach);
-REM        the for/f+inline-PowerShell variant was broken
-REM  - v9.1: collapse whitespace in AMD GPU name; drop redundant
-REM          "AMD " prefix in WHEEL_NOTE (was showing "AMD AMD")
-REM  - v9.2: broaden ROCm allow-list to all RDNA3 consumer GPUs
 REM ============================================================
 
 set "REPO_URL=https://github.com/Vxtzq/CrowdGPT.git"
@@ -28,6 +23,8 @@ set "LAUNCH=1"
 set "INTEGRATE=1"
 set "BACKEND_OVERRIDE="
 set "AMD_GPU_NAME="
+set "FRESH=1"
+set "HIP_SDK_FOUND=0"
 
 REM ---------- arg parsing ----------
 :parse_args
@@ -52,6 +49,11 @@ if /I "%~1"=="--no-integrate" (
     shift
     goto parse_args
 )
+if /I "%~1"=="--no-fresh" (
+    set "FRESH=0"
+    shift
+    goto parse_args
+)
 if /I "%~1"=="--help" goto show_help
 if /I "%~1"=="-h" goto show_help
 echo [ERROR] Unknown argument: %~1
@@ -67,6 +69,7 @@ echo   --backend ^<name^>   Force backend: nvidia ^| amd ^| amd-rocm ^| intel ^|
 echo   --dir ^<path^>       Directory to clone into. Default: .\CrowdGPT
 echo   --no-launch        Install only, don't launch client.py
 echo   --no-integrate     Skip Start Menu and PATH integration
+echo   --no-fresh         Keep existing install (default: wipe and reinstall)
 echo   --help             Show this message
 echo.
 exit /b 0
@@ -75,7 +78,7 @@ exit /b 0
 
 echo.
 echo ============================================================
-echo                 CrowdGPT Installer  (v9.2)
+echo                 CrowdGPT Installer  (v9.3)
 echo ============================================================
 echo.
 
@@ -92,6 +95,41 @@ if "!INTEGRATE!"=="1" (
     set "VENV_DIR=%CD%\.venv"
 )
 set "APP_PY=!VENV_DIR!\Scripts\python.exe"
+
+REM ------------------------------------------------------------
+REM 0b. Wipe previous install (preserve caches)
+REM ------------------------------------------------------------
+if "!INTEGRATE!"=="1" if "!FRESH!"=="1" if exist "!APP_DIR!" (
+    echo [INFO] Removing previous installation at !APP_DIR!...
+    echo        ^(caches in checkpoints\ and pending_uploads\ are preserved^)
+
+    set "KEEP_DIR=%TEMP%\crowdgpt-keep-%RANDOM%"
+    if not exist "!KEEP_DIR!" mkdir "!KEEP_DIR!" >nul 2>nul
+
+    if exist "!APP_DIR!\checkpoints" (
+        robocopy "!APP_DIR!\checkpoints" "!KEEP_DIR!\checkpoints" /E /NFL /NDL /NJH /NJS /NC /NS /NP >nul
+    )
+    if exist "!APP_DIR!\pending_uploads" (
+        robocopy "!APP_DIR!\pending_uploads" "!KEEP_DIR!\pending_uploads" /E /NFL /NDL /NJH /NJS /NC /NS /NP >nul
+    )
+
+    rmdir /s /q "!APP_DIR!" >nul 2>nul
+    if exist "!APP_DIR!" (
+        echo [WARN] Could not fully remove !APP_DIR! ^(files may be locked^).
+        echo        Close any running CrowdGPT windows and rerun for a clean install.
+    )
+
+    mkdir "!APP_DIR!" >nul 2>nul
+    if exist "!KEEP_DIR!\checkpoints" (
+        robocopy "!KEEP_DIR!\checkpoints" "!APP_DIR!\checkpoints" /E /NFL /NDL /NJH /NJS /NC /NS /NP >nul
+    )
+    if exist "!KEEP_DIR!\pending_uploads" (
+        robocopy "!KEEP_DIR!\pending_uploads" "!APP_DIR!\pending_uploads" /E /NFL /NDL /NJH /NJS /NC /NS /NP >nul
+    )
+    rmdir /s /q "!KEEP_DIR!" >nul 2>nul
+    echo [OK] Previous install cleared.
+    echo.
+)
 
 REM ------------------------------------------------------------
 REM 1. Install uv
@@ -285,7 +323,37 @@ goto :pytorch_cpu
 echo [INFO] Trying official AMD ROCm PyTorch for Windows...
 echo        Requires Radeon RX 9000 series, RX 7000 series,
 echo        or Ryzen AI Max/Max+ Strix Halo.
-echo        Also requires AMD HIP SDK for Windows to be installed.
+echo.
+
+REM ---- HIP SDK preflight ----
+call :check_hip_sdk
+if "!HIP_SDK_FOUND!"=="1" (
+    echo [OK] AMD HIP SDK detected.
+) else (
+    echo [WARN] AMD HIP SDK for Windows was not detected.
+    echo        The ROCm PyTorch wheel will install, but
+    echo        torch.cuda.is_available^(^) will return False until the
+    echo        HIP SDK is present. GPU acceleration will not work.
+    echo.
+    echo        HIP SDK download page:
+    echo          https://www.amd.com/en/developer/resources/rocm-hub/hip-sdk.html
+    echo.
+    echo        Do you want to open the download page in your browser?
+    echo          [Y] Yes  [N] No, continue anyway
+    choice /C YN /N /M "  Choose: "
+    if errorlevel 2 (
+        echo [INFO] Continuing without HIP SDK. ROCm will likely fall back to CPU.
+    ) else (
+        start "" "https://www.amd.com/en/developer/resources/rocm-hub/hip-sdk.html"
+        echo.
+        echo [INFO] Browser opened. Install HIP SDK, reboot, then rerun this installer.
+        echo        Press any key to continue the install now, or Ctrl+C to abort.
+        pause >nul
+    )
+    echo.
+)
+echo.
+
 "!APP_PY!" -m pip install torch torchvision torchaudio --index-url https://repo.radeon.com/rocm/windows/rocm-rel-6.4.4/
 if not errorlevel 1 goto :pytorch_done
 echo.
@@ -354,9 +422,6 @@ del "!TMP_REQ!" >nul 2>nul
 
 REM ------------------------------------------------------------
 REM 7b. AMD DirectML: pin transformers to 4.x
-REM     torch-directml is upstream-stuck on torch 2.4.1;
-REM     transformers 5.x refuses torch < 2.5.
-REM     ROCm torch is 2.6+, so no pin needed there.
 REM ------------------------------------------------------------
 if /I "!BACKEND!"=="amd" (
     echo.
@@ -428,8 +493,15 @@ if /I "!BACKEND!"=="amd-rocm" (
     if errorlevel 1 (
         echo.
         echo [ERROR] ROCm PyTorch is installed but cannot see the GPU.
-        echo         This usually means the AMD HIP SDK for Windows is missing.
-        echo         Install it from AMD, reboot, and rerun with --backend amd-rocm.
+        if "!HIP_SDK_FOUND!"=="1" (
+            echo         HIP SDK is present but torch still cannot reach the GPU.
+            echo         Check driver version - ROCm 6.4 needs a recent Adrenalin driver.
+            echo         Update your GPU driver and rerun with --backend amd-rocm.
+        ) else (
+            echo         The AMD HIP SDK for Windows is missing.
+            echo         Download: https://www.amd.com/en/developer/resources/rocm-hub/hip-sdk.html
+            echo         Install it, reboot, then rerun with --backend amd-rocm.
+        )
         goto :fatal
     )
 )
@@ -470,6 +542,18 @@ if "!LAUNCH!"=="1" (
 )
 
 REM ============================================================
+REM Subroutine: check_hip_sdk
+REM ============================================================
+:check_hip_sdk
+set "HIP_SDK_FOUND=0"
+if defined HIP_PATH if exist "%HIP_PATH%" set "HIP_SDK_FOUND=1"
+if "!HIP_SDK_FOUND!"=="0" if exist "%ProgramFiles%\AMD\ROCm" set "HIP_SDK_FOUND=1"
+if "!HIP_SDK_FOUND!"=="0" if exist "%ProgramFiles%\AMD\ROCm\6.4" set "HIP_SDK_FOUND=1"
+if "!HIP_SDK_FOUND!"=="0" if exist "%ProgramFiles%\AMD\ROCm\6.3" set "HIP_SDK_FOUND=1"
+if "!HIP_SDK_FOUND!"=="0" if exist "%ProgramFiles%\AMD\ROCm\6.2" set "HIP_SDK_FOUND=1"
+exit /b 0
+
+REM ============================================================
 REM Subroutine: note_amd
 REM ============================================================
 :note_amd
@@ -492,7 +576,7 @@ REM ============================================================
 :note_amd_rocm
 echo [NOTE] AMD ROCm backend selected.
 echo        This requires the AMD HIP SDK for Windows to be installed.
-echo        If torch.cuda.is_available() returns False after this
+echo        If torch.cuda.is_available^(^) returns False after this
 echo        install, install the HIP SDK from AMD and rerun.
 echo.
 exit /b 0
@@ -577,7 +661,7 @@ set "REG_PS=%TEMP%\crowdgpt-reg-%RANDOM%.ps1"
 > "!REG_PS!"  echo $k = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\CrowdGPT'
 >> "!REG_PS!" echo New-Item -Path $k -Force ^| Out-Null
 >> "!REG_PS!" echo Set-ItemProperty -Path $k -Name 'DisplayName'     -Value 'CrowdGPT'
->> "!REG_PS!" echo Set-ItemProperty -Path $k -Name 'DisplayVersion'  -Value '0.9.2'
+>> "!REG_PS!" echo Set-ItemProperty -Path $k -Name 'DisplayVersion'  -Value '0.9.3'
 >> "!REG_PS!" echo Set-ItemProperty -Path $k -Name 'Publisher'       -Value 'CrowdGPT Project'
 >> "!REG_PS!" echo Set-ItemProperty -Path $k -Name 'InstallLocation' -Value '!APP_DIR!'
 >> "!REG_PS!" echo Set-ItemProperty -Path $k -Name 'UninstallString' -Value ('"' + '!APP_DIR!\uninstall.bat' + '"')
@@ -705,7 +789,7 @@ if not errorlevel 1 (
     exit /b 0
 )
 
-REM --- AMD: capture GPU name via temp file (v5 approach) ---
+REM --- AMD: capture GPU name via temp file ---
 set "AMD_GPU_NAME="
 set "AMD_GPU_TMP=%TEMP%\crowdgpt-amd-%RANDOM%.txt"
 powershell -NoProfile -Command "((Get-CimInstance Win32_VideoController | Where-Object { $_.Name -match 'AMD|Radeon' } | Select-Object -ExpandProperty Name) -replace '\s+', ' ') -join ' / '" > "%AMD_GPU_TMP%" 2>nul
@@ -728,7 +812,6 @@ REM   RDNA 4: RX 9070 XT / 9070 / 9060 XT / 9060 / 9050
 REM   RDNA 3: RX 7900 XTX / XT / GRE, RX 7800 XT, RX 7700 XT / 7700,
 REM           RX 7650 GRE / 7600 XT / 7600
 REM   APUs:   Ryzen AI Max / Max+ (Strix Halo), Ryzen AI 9
-REM v9.2: broadened to cover ALL RDNA3 consumer GPUs.
 echo !AMD_GPU_NAME! | findstr /I /C:"RX 7900" /C:"RX 7800" /C:"RX 7700" /C:"RX 7650" /C:"RX 7600" /C:"RX 9070" /C:"RX 9060" /C:"RX 9050" /C:"Ryzen AI Max" /C:"Ryzen AI 9" >nul
 if not errorlevel 1 (
     set "BACKEND=amd-rocm"

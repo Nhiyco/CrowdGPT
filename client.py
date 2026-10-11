@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-CrowdGPT GUI Client v0.8 — DirectML op coverage fixes.
+CrowdGPT GUI Client v0.9 — Engram stays on CPU.
 """
 import os, sys, io, json, time, struct, math, gc, threading, base64, logging, tempfile, atexit, subprocess, hashlib, shutil
 from pathlib import Path
@@ -22,8 +22,7 @@ sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='repla
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s', datefmt='%H:%M:%S')
 log = logging.getLogger(__name__)
 
-# ============ AUTO-UPDATE ============
-CLIENT_VERSION = "0.8"
+CLIENT_VERSION = "0.9"
 VERSION_URL = "https://raw.githubusercontent.com/Vxtzq/CrowdGPT/main/docs/version.txt"
 CLIENT_URL  = "https://raw.githubusercontent.com/Vxtzq/CrowdGPT/main/client.py"
 
@@ -112,7 +111,6 @@ def _restart_self():
     else:
         os.execv(python, args)
 
-# ============ CONFIG ============
 CHECKPOINT_DIR = Path("checkpoints")
 CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -189,7 +187,6 @@ def sanitize_for_json(obj):
         pass
     return str(obj)
 
-# ============ TOKENIZER ============
 TOKENIZER = None
 _tokenizer_started = False
 PREVIEW_EVERY = 10
@@ -240,7 +237,6 @@ def decode_one(tok_id):
     s = decode_ids([tok_id], max_chars=32)
     return s if s.strip() else "␠"
 
-# ============ LOGOS ============
 LOGO_URI_LIGHT = ""
 LOGO_URI_DARK = ""
 _lp_light = Path(__file__).parent / "docs/logo-black.svg"
@@ -282,7 +278,6 @@ if _lp_light.exists():
     except Exception:
         ICON_PATH = os.path.abspath(str(_lp_app))
 
-# ============ HARDWARE ============
 def get_available_backends():
     backends = {}
     backends['cuda'] = torch.cuda.is_available() and not (hasattr(torch.version, 'hip') and torch.version.hip)
@@ -403,7 +398,6 @@ def recommend_batch_size(sl=2048):
             break
     return best
 
-# ============ MODEL ============
 def precompute_freqs(dim, sl, dev):
     inv = 1.0 / (10000.0 ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
     f = torch.einsum("i,j->ij", torch.arange(sl, dtype=torch.float32), inv)
@@ -480,27 +474,18 @@ class EngramMemory(nn.Module):
         self.device = device
         self.table = nn.Embedding(ENG_NUM_BUCKETS, DIM, sparse=True).to('cpu')
         nn.init.normal_(self.table.weight, mean=0.0, std=0.02)
-        self.use_async = device.type in ('cuda',) and torch.cuda.is_available()
-        self.ts = torch.cuda.Stream(device=device) if self.use_async else None
 
     def forward(self, idx):
         px = torch.cat([torch.zeros_like(idx[:, :1]), idx[:, :-1]], dim=1)
         hi = (px * 1000003 + idx) % ENG_NUM_BUCKETS
-        # DirectML does not implement torch.unique(return_inverse=True).
-        # The input is a tiny int tensor (B*T elements), so do the unique
-        # on CPU and move results back — negligible cost.
-        hi_cpu = hi.flatten().cpu()
+        # DirectML cannot dispatch F.embedding with a CPU index tensor, and
+        # unique(return_inverse) is not implemented at all. So run the whole
+        # lookup on CPU and move only the result back to the training device.
+        hi_cpu = hi.reshape(-1).cpu()
         uq, inv = torch.unique(hi_cpu, return_inverse=True)
-        cr = self.table(uq)                     # table is already on CPU
-        if self.use_async:
-            with torch.cuda.stream(self.ts):
-                cg = cr.to(self.device, non_blocking=True)
-                inv_dev = inv.to(self.device, non_blocking=True)
-            torch.cuda.current_stream(self.device).wait_stream(self.ts)
-        else:
-            cg = cr.to(self.device)
-            inv_dev = inv.to(self.device)
-        return cg[inv_dev].view(idx.shape[0], idx.shape[1], DIM)
+        cr = self.table(uq)                                # table stays on CPU
+        out = cr[inv].view(idx.shape[0], idx.shape[1], DIM)
+        return out.to(self.device)
 
 class SotaGPT(nn.Module):
     def __init__(self, bn, device):
@@ -527,15 +512,12 @@ class SotaGPT(nn.Module):
         o = 0
         for n, p in self.named_parameters():
             if not n.startswith('engram.'):
-                # Compute numel from shape — DirectML's .numel() returns 0
-                # on privateuseone:0 tensors after .to() on some builds.
                 s = 1
                 for d in p.shape:
                     s *= int(d)
                 p.data.copy_(ft[o:o + s].view(p.shape).to(p.device))
                 o += s
 
-# ============ DATASET ============
 def _fetch_with_retry(url, headers=None, timeout=60, retries=5):
     for a in range(retries):
         try:
@@ -686,7 +668,6 @@ def decompress_weights(raw, fmt="bf16"):
         return np.frombuffer(raw, dtype=np.uint16).view(np.float16).astype(np.float32)
     return torch.from_numpy(np.frombuffer(raw, dtype=np.uint16).copy()).view(torch.bfloat16).to(torch.float32).numpy()
 
-# ============ AUTH ============
 def do_login(srv, u, p):
     try:
         r = requests.post(f"{srv}/auth/login", json={"username": u, "password": p}, timeout=30)
@@ -728,7 +709,6 @@ def do_register(srv, u, email, p):
     except Exception:
         return None, "network"
 
-# ============ HEARTBEAT ============
 class HeartbeatManager:
     def __init__(self, srv, h, cr, se, emit):
         self.srv = srv
@@ -813,7 +793,6 @@ def wait_for_round(srv, h, se, emit):
     hide()
     return None
 
-# ============ TASK / HF ============
 def fetch_task_metadata(srv, h, se, emit):
     while not se.is_set():
         try:
@@ -1044,7 +1023,6 @@ def fetch_task(srv, h, prec, se, emit):
             emit('log', f"Task fetch failed: {e}")
             time.sleep(15)
 
-# ============ FORWARD / LOSS ============
 def _chunk_ce(m, xs, ys):
     return F.cross_entropy(m.lm_head(xs).reshape(-1, VOCAB_SIZE), ys.reshape(-1))
 
@@ -1114,7 +1092,6 @@ def _fwl(m, x, y, sl, ua, ad, ls=1.0, preview=False):
             cards = []
     return lo * ls, cards
 
-# ============ UPLOAD ============
 def _sha256_hex(data):
     return hashlib.sha256(data).hexdigest()
 
@@ -1216,7 +1193,6 @@ def stream_with_progress(data, emit_cb, total_size, stop_evt):
         yield chunk
     emit_cb("overlay_progress", {"done": total_size, "total": total_size})
 
-# ============ TRAIN ROUND ============
 def run_single_round_wrapper(srv, at, se, emit):
     global train_device, train_backend
     h = {"Authorization": f"Bearer {at}"} if at else {}
@@ -1300,8 +1276,6 @@ def run_single_round_wrapper(srv, at, se, emit):
                         pass
                 gc.collect()
 
-                # Build on CPU, load weights on CPU, THEN move to target.
-                # DirectML's .to() corrupts param.numel() on some builds.
                 model = SotaGPT(train_backend, train_device)
                 model.engram.table.to('cpu')
 
@@ -1320,6 +1294,9 @@ def run_single_round_wrapper(srv, at, se, emit):
                 model.engram.table.weight.data.copy_(torch.from_numpy(ie).view(model.engram.table.weight.shape))
 
                 model = model.to(train_device)
+                # Keep the engram table on CPU — DirectML cannot dispatch
+                # F.embedding when the index tensor is on CPU.
+                model.engram.table.to('cpu')
                 model.train()
                 break
             except RuntimeError as e:
@@ -1588,7 +1565,6 @@ def run_single_round_wrapper(srv, at, se, emit):
             except Exception:
                 pass
 
-# ============ HTML ============
 HTML = """<!DOCTYPE html>
 <html><head><meta charset="UTF-8">
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
@@ -1843,7 +1819,6 @@ applyT();
 document.getElementById('motd-close').addEventListener('click',()=>document.getElementById('motd-overlay').classList.remove('show'));
 </script></body></html>"""
 
-# ============ API ============
 class Api:
     def __init__(self):
         self.window = None

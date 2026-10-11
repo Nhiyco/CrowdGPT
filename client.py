@@ -2632,13 +2632,8 @@ class Api:
             self.emit('log',f"Backend: {train_backend} ({train_device})")
             auto_detect_vram_budget()
             self.emit('log',f"VRAM: {memory_config['ram_gb']:.1f} GB")
-        except Exception as e: 
-            import traceback
-            tb = traceback.format_exc()
-            print(f"\n[ROUND-FAIL-TRACEBACK]\n{tb}\n", flush=True)
-            for ln in tb.splitlines()[-12:]:
-                self.emit('log', ln)
-            self.emit('log', f"Round failed: {e}")
+        except Exception as e:
+            self.emit('log',f"Error: {e}"); self.emit('status','idle'); return
             
         round_count = 0
         while not self.stop_event.is_set():

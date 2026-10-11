@@ -163,7 +163,7 @@ CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
 DEFAULT_SERVER = "https://server.crowdgpt.net"
 
 DATASET_REPO_ID = "Vxtzq/CrowdGPT"
-TOKENIZER_REPO = "Qwen/Qwen2.5-1.5B"
+TOKENIZER_REPO = "Qwen/Qwen3-0.6B"
 HF_MODEL_REPO_ID = "Vxtzq/Crowd-v1"
 
 USE_HF_WEIGHTS = True

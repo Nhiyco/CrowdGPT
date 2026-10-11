@@ -2,7 +2,13 @@
 setlocal EnableExtensions EnableDelayedExpansion
 
 REM ============================================================
-REM CrowdGPT Universal Installer for Windows  (v9.6)
+REM CrowdGPT Universal Installer for Windows  (v9.7)
+REM ------------------------------------------------------------
+REM v9.7:
+REM   - Fixed delayed-expansion bug in requirements filter
+REM     (literal `!` inside regex was eaten by batch, breaking
+REM      PowerShell parsing -> "Missing closing '}'")
+REM   - Replaced regex class [<>=!~] with \W
 REM ------------------------------------------------------------
 REM v9.6:
 REM   - AMD prioritization: ROCm 6.4.4 for RX 7000/9000 & Ryzen AI,
@@ -76,7 +82,7 @@ exit /b 0
 
 echo.
 echo ============================================================
-echo                CrowdGPT Installer  (v9.6)
+echo                CrowdGPT Installer  (v9.7)
 echo ============================================================
 echo.
 
@@ -325,7 +331,7 @@ echo [INFO] Trying PyTorch DirectML ^(torch 2.4.1^)...
 "!APP_PY!" -m pip install torch-directml torch==2.4.1 torchvision==0.19.1 torchaudio==2.4.1
 if not errorlevel 1 (
     echo [OK] torch-directml + torch 2.4.1 installed.
-    echo [INFO] Pinning transformers to <4.49 ^(compatible with torch 2.4.x^)...
+    echo [INFO] Pinning transformers to ^<4.49 ^(compatible with torch 2.4.x^)...
     set "TRANSFORMERS_PIN=transformers>=4.40,<4.49"
     set "USE_TORCH=1"
     setx USE_TORCH 1 >nul 2>nul
@@ -417,7 +423,7 @@ if exist "requirements.txt" (
     echo ============================================================
     set "TMP_REQ=%TEMP%\crowdgpt-req-!RANDOM!-!RANDOM!.txt"
     powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-        "Get-Content -LiteralPath 'requirements.txt' | Where-Object { $_ -notmatch '^\s*(torch|torchvision|torchaudio|torch-directml)(\s|[<>=!~]|$)' } | Set-Content -LiteralPath '!TMP_REQ!'"
+        "Get-Content -LiteralPath 'requirements.txt' | Where-Object { $_ -notmatch '^\s*(torch|torchvision|torchaudio|torch-directml)(\W|$)' } | Set-Content -LiteralPath '!TMP_REQ!'"
     if errorlevel 1 goto :fatal
 
     for %%A in ("!TMP_REQ!") do set "TMP_SIZE=%%~zA"

@@ -3,17 +3,21 @@ setlocal EnableExtensions EnableDelayedExpansion
 
 REM ============================================================
 REM CrowdGPT Universal Installer for Windows
-REM v9.5
-REM  - v9.5: AMD ROCm path uses Python 3.12 (AMD's Windows torch
-REM          wheels are built for cp312 only; Python 3.11 finds
-REM          no matching wheel at repo.radeon.com)
-REM  - v9.5: BACKEND is reset to cpu when ROCm install fails and
-REM          we fall back to CPU torch, so the verify step does
-REM          not run a GPU-only test against CPU torch
-REM  - v9.5: fixed %-format in the ROCm matmul inline Python
-REM          (CMD was eating the % char, producing a SyntaxError)
-REM  - v9.4: HSA_OVERRIDE_GFX_VERSION baked into launchers;
-REM          real ROCm matmul in verify
+REM v9.6
+REM  - v9.6: pin pip < 25 before installing from AMD's ROCm repo
+REM          (pip 25+ asserts on hashless direct URLs, which is
+REM          what repo.radeon.com serves — install crashes with
+REM          "assert link.hash" in direct_url_helpers.py)
+REM  - v9.6: HIP_GFX_OVERRIDE is cleared when falling back to CPU,
+REM          so a CPU install doesn't bake a bogus
+REM          HSA_OVERRIDE_GFX_VERSION into the launcher
+REM  - v9.6: fixed compound `if A if B (...)` in :do_integration
+REM          that crashed CMD's parser on `!HIP_GFX_OVERRIDE!`
+REM          (CMD parses the block eagerly regardless of A)
+REM  - v9.5: AMD ROCm path uses Python 3.12 (AMD publishes cp312
+REM          Windows wheels only)
+REM  - v9.4: HSA_OVERRIDE_GFX_VERSION baked into launchers; real
+REM          ROCm matmul in verify
 REM  - v9.3: fresh install; HIP SDK detection
 REM  - v9.2: broaden ROCm allow-list to all RDNA3 consumer GPUs
 REM ============================================================
@@ -104,7 +108,7 @@ exit /b 0
 
 echo.
 echo ============================================================
-echo                 CrowdGPT Installer  (v9.5)
+echo                 CrowdGPT Installer  (v9.6)
 echo ============================================================
 echo.
 
@@ -267,7 +271,7 @@ REM Compute HSA_OVERRIDE_GFX_VERSION for AMD ROCm
 if /I "!BACKEND!"=="amd-rocm" call :compute_hip_override
 
 REM Compute Python version based on backend.
-REM AMD's Windows ROCm torch wheels are only published for cp312.
+REM AMD's Windows ROCm torch wheels are published for cp312 only.
 if /I "!BACKEND!"=="amd-rocm" (
     set "PY_VER=3.12"
 ) else (
@@ -398,12 +402,23 @@ if "!HIP_SDK_FOUND!"=="1" (
 )
 echo.
 
+REM pip 25+ asserts on hashless direct URLs. repo.radeon.com serves
+REM index pages without #sha256 fragments, so we pin pip below 25
+REM for this install. Scoped to the ROCm path only — PyPI wheels
+REM install fine on pip 26.
+echo [INFO] Pinning pip below 25 (AMD repo wheels lack hash fragments)...
+"!APP_PY!" -m pip install --quiet --disable-pip-version-check "pip<25"
+if errorlevel 1 (
+    echo [WARN] Could not downgrade pip. ROCm install may fail with an assert.
+)
+echo.
+
 "!APP_PY!" -m pip install torch torchvision torchaudio --index-url https://repo.radeon.com/rocm/windows/rocm-rel-6.4.4/
 if not errorlevel 1 goto :pytorch_done
 echo.
 echo [WARN] ROCm PyTorch install failed. Falling back to CPU PyTorch.
-echo        This usually means the AMD Windows wheel does not exist for
-echo        Python !PY_VER!. AMD publishes cp312 wheels only.
+echo        If the error mentioned 'assert link.hash', pip was still
+echo        >= 25. Try:  .venv\Scripts\pip install "pip<25"
 echo        For GPU acceleration, install the AMD HIP SDK for Windows
 echo        and rerun. For DirectML instead, try:  install.bat --backend amd
 goto :pytorch_cpu
@@ -418,6 +433,7 @@ goto :pytorch_cpu
 set "BACKEND=cpu"
 set "TORCH_INDEX=https://download.pytorch.org/whl/cpu"
 set "WHEEL_NOTE=CPU-only fallback"
+set "HIP_GFX_OVERRIDE="
 echo.
 echo [WARN] Installing CPU-only PyTorch. Training will be very slow.
 "!APP_PY!" -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
@@ -547,19 +563,24 @@ if /I "!BACKEND!"=="amd-rocm" (
     if errorlevel 1 (
         echo.
         echo [ERROR] ROCm PyTorch is installed but cannot execute a kernel.
-        echo         This means the wheel does not have kernels for your GPU
-        echo         architecture, even though the GPU was detected.
-        echo.
-        if defined HIP_GFX_OVERRIDE (
-            echo         Current override: HSA_OVERRIDE_GFX_VERSION=!HIP_GFX_OVERRIDE!
-            echo         Try a different value, e.g.:
-            echo           install.bat --backend amd-rocm --hip-override 11.0.1
-            echo         or
-            echo           install.bat --backend amd-rocm --hip-override 11.0.2
+        if "!HIP_SDK_FOUND!"=="0" (
+            echo         The AMD HIP SDK for Windows is missing.
+            echo         Install it from AMD, reboot, then rerun:
+            echo           https://www.amd.com/en/developer/resources/rocm-hub/hip-sdk.html
         ) else (
-            echo         HSA_OVERRIDE_GFX_VERSION is not set.
-            echo         Try forcing a value:
-            echo           install.bat --backend amd-rocm --hip-override 11.0.0
+            echo         HIP SDK is present but the wheel has no kernels for
+            echo         your GPU architecture.
+            if defined HIP_GFX_OVERRIDE (
+                echo         Current override: HSA_OVERRIDE_GFX_VERSION=!HIP_GFX_OVERRIDE!
+                echo         Try a different value, e.g.:
+                echo           install.bat --backend amd-rocm --hip-override 11.0.1
+                echo         or
+                echo           install.bat --backend amd-rocm --hip-override 11.0.2
+            ) else (
+                echo         HSA_OVERRIDE_GFX_VERSION is not set.
+                echo         Try forcing a value:
+                echo           install.bat --backend amd-rocm --hip-override 11.0.0
+            )
         )
         goto :fatal
     )
@@ -713,21 +734,28 @@ if not exist "!APP_PY!" (
 )
 
 REM ---- CMD shim ----
+REM NOTE: the outer if must be wrapped in parens. CMD parses the
+REM block eagerly, so `if A if B ( ... !VAR! ... )` trips the
+REM delayed-expansion parser even when A is false.
 > "!BIN_DIR!\crowdgpt.cmd" echo @echo off
-if /I "!BACKEND!"=="amd-rocm" if defined HIP_GFX_OVERRIDE (
-    >>"!BIN_DIR!\crowdgpt.cmd" echo set "HSA_OVERRIDE_GFX_VERSION=!HIP_GFX_OVERRIDE!"
+if /I "!BACKEND!"=="amd-rocm" (
+    if defined HIP_GFX_OVERRIDE (
+        >>"!BIN_DIR!\crowdgpt.cmd" echo set "HSA_OVERRIDE_GFX_VERSION=!HIP_GFX_OVERRIDE!"
+    )
 )
 if "!HIP_LAUNCH_BLOCKING!"=="1" (
     >>"!BIN_DIR!\crowdgpt.cmd" echo set "HIP_LAUNCH_BLOCKING=1"
 )
 >>"!BIN_DIR!\crowdgpt.cmd" echo "!APP_PY!" "!APP_DIR!\client.py" %%*
 
-REM ---- GUI launcher ----
+REM ---- GUI launcher (no console window) ----
 set "GUI_VBS=!BIN_DIR!\crowdgpt-gui.vbs"
 > "!GUI_VBS!"  echo Set WshShell = CreateObject("WScript.Shell")
 >> "!GUI_VBS!" echo Set WshEnv = WshShell.Environment("Process")
-if /I "!BACKEND!"=="amd-rocm" if defined HIP_GFX_OVERRIDE (
-    >>"!GUI_VBS!" echo WshEnv("HSA_OVERRIDE_GFX_VERSION") = "!HIP_GFX_OVERRIDE!"
+if /I "!BACKEND!"=="amd-rocm" (
+    if defined HIP_GFX_OVERRIDE (
+        >>"!GUI_VBS!" echo WshEnv("HSA_OVERRIDE_GFX_VERSION") = "!HIP_GFX_OVERRIDE!"
+    )
 )
 if "!HIP_LAUNCH_BLOCKING!"=="1" (
     >>"!GUI_VBS!" echo WshEnv("HIP_LAUNCH_BLOCKING") = "1"
@@ -768,7 +796,7 @@ set "REG_PS=%TEMP%\crowdgpt-reg-%RANDOM%.ps1"
 > "!REG_PS!"  echo $k = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\CrowdGPT'
 >> "!REG_PS!" echo New-Item -Path $k -Force ^| Out-Null
 >> "!REG_PS!" echo Set-ItemProperty -Path $k -Name 'DisplayName'     -Value 'CrowdGPT'
->> "!REG_PS!" echo Set-ItemProperty -Path $k -Name 'DisplayVersion'  -Value '0.9.5'
+>> "!REG_PS!" echo Set-ItemProperty -Path $k -Name 'DisplayVersion'  -Value '0.9.6'
 >> "!REG_PS!" echo Set-ItemProperty -Path $k -Name 'Publisher'       -Value 'CrowdGPT Project'
 >> "!REG_PS!" echo Set-ItemProperty -Path $k -Name 'InstallLocation' -Value '!APP_DIR!'
 >> "!REG_PS!" echo Set-ItemProperty -Path $k -Name 'UninstallString' -Value ('"' + '!APP_DIR!\uninstall.bat' + '"')
@@ -797,8 +825,10 @@ echo.
 if /I "!BACKEND!"=="amd" (
     echo [NOTE] transformers pinned to 4.x for DirectML compatibility.
 )
-if /I "!BACKEND!"=="amd-rocm" if defined HIP_GFX_OVERRIDE (
-    echo [NOTE] HSA_OVERRIDE_GFX_VERSION=!HIP_GFX_OVERRIDE! baked into launcher.
+if /I "!BACKEND!"=="amd-rocm" (
+    if defined HIP_GFX_OVERRIDE (
+        echo [NOTE] HSA_OVERRIDE_GFX_VERSION=!HIP_GFX_OVERRIDE! baked into launcher.
+    )
 )
 if /I "!BACKEND!"=="cpu" (
     echo [NOTE] CPU-only install. Install the AMD HIP SDK and rerun with

@@ -2556,16 +2556,20 @@ class Api:
 
     def emit(self, ev, data):
         if not self.window: return
+        if ev in ('log', 'status'):
+            try:
+                print(f"[EMIT {ev}] {data}", flush=True)
+            except Exception:
+                pass
         if ev=='preview_loss':
             n=time.time()
             if n-self._lp<0.4: return
             self._lp=n
-        try: 
+        try:
             clean_data = sanitize_for_json(data)
             self.window.evaluate_js(f"window.handleEvent({json.dumps(ev)}, {json.dumps(clean_data)});")
         except Exception as e:
             log.warning(f"Emit failed for {ev}: {e}")
-
     def get_backends(self):
         available = get_available_backends()
         self.emit('backends', {'available': available, 'current': self.selected_backend})

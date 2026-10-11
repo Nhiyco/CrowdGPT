@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-CrowdGPT GUI Client v0.10 — DirectML chunked attention on CPU.
+CrowdGPT GUI Client v0.11 — AMD→CPU default, backend persistence, DirectML slice fix.
 """
 import os, sys, io, json, time, struct, math, gc, threading, base64, logging, tempfile, atexit, subprocess, hashlib, shutil
 from pathlib import Path
@@ -22,7 +22,7 @@ sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='repla
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s', datefmt='%H:%M:%S')
 log = logging.getLogger(__name__)
 
-CLIENT_VERSION = "0.10"
+CLIENT_VERSION = "0.11"
 VERSION_URL = "https://raw.githubusercontent.com/Vxtzq/CrowdGPT/main/docs/version.txt"
 CLIENT_URL  = "https://raw.githubusercontent.com/Vxtzq/CrowdGPT/main/client.py"
 
@@ -297,8 +297,12 @@ def get_available_backends():
     return backends
 
 def get_best_default_backend():
+    # DirectML works for model load but torch-directml has spotty op coverage
+    # on the chunked-attention / engram / loss-chunk paths used by this model.
+    # Until it matures, we prefer CPU on AMD systems so training actually
+    # runs. Users who want DirectML can still pick it from the dropdown.
     avail = get_available_backends()
-    for bk in ['cuda', 'rocm', 'mps', 'xpu', 'directml', 'cpu']:
+    for bk in ['cuda', 'rocm', 'mps', 'xpu', 'cpu']:
         if avail.get(bk):
             return bk
     return 'cpu'
@@ -444,12 +448,10 @@ class GroupedQueryAttention(nn.Module):
     def _chunked(self, q, k, v, B, T, C, cs=64):
         # torch-directml cannot do the strided 4D batched matmul used here.
         # On DirectML, run the whole chunked attention on CPU and move only
-        # the final result back. CUDA / MPS / CPU keep the native fast path.
+        # the final result back.
         use_cpu = _is_directml(q)
         if use_cpu:
-            q_ = q.cpu()
-            k_ = k.cpu()
-            v_ = v.cpu()
+            q_ = q.cpu(); k_ = k.cpu(); v_ = v.cpu()
         else:
             q_, k_, v_ = q, k, v
         chunks = []
@@ -497,9 +499,6 @@ class EngramMemory(nn.Module):
     def forward(self, idx):
         px = torch.cat([torch.zeros_like(idx[:, :1]), idx[:, :-1]], dim=1)
         hi = (px * 1000003 + idx) % ENG_NUM_BUCKETS
-        # DirectML cannot dispatch F.embedding with a CPU index tensor, and
-        # unique(return_inverse) is not implemented at all. So run the whole
-        # lookup on CPU and move only the result back to the training device.
         hi_cpu = hi.reshape(-1).cpu()
         uq, inv = torch.unique(hi_cpu, return_inverse=True)
         cr = self.table(uq)
@@ -1068,10 +1067,17 @@ def _fwl(m, x, y, sl, ua, ad, ls=1.0, preview=False):
             ) / nc
     else:
         xe = fwd()
-        lo = sum(
-            checkpoint(_chunk_ce, m, xe[:, i:i + LOSS_CHUNK, :], y[:, i:i + LOSS_CHUNK], use_reentrant=False)
-            for i in range(0, sl, LOSS_CHUNK)
-        ) / nc
+        # DirectML cannot handle strided slices of a bf16 activation inside
+        # checkpoint(). Force each chunk to a contiguous copy first.
+        on_dml = _is_directml(xe)
+        def chunk_loss(i):
+            xs = xe[:, i:i + LOSS_CHUNK, :]
+            ys = y[:, i:i + LOSS_CHUNK]
+            if on_dml:
+                xs = xs.contiguous()
+                ys = ys.contiguous()
+            return checkpoint(_chunk_ce, m, xs, ys, use_reentrant=False)
+        lo = sum(chunk_loss(i) for i in range(0, sl, LOSS_CHUNK)) / nc
 
     cards = []
     if preview:
@@ -1313,8 +1319,6 @@ def run_single_round_wrapper(srv, at, se, emit):
                 model.engram.table.weight.data.copy_(torch.from_numpy(ie).view(model.engram.table.weight.shape))
 
                 model = model.to(train_device)
-                # Keep the engram table on CPU — DirectML cannot dispatch
-                # F.embedding when the index tensor is on CPU.
                 model.engram.table.to('cpu')
                 model.train()
                 break
@@ -1847,7 +1851,15 @@ class Api:
         self.username = None
         self.server_url = DEFAULT_SERVER
         self._lp = 0.0
-        self.selected_backend = get_best_default_backend()
+        self._backend_file = CHECKPOINT_DIR / "selected_backend.json"
+        saved = None
+        try:
+            if self._backend_file.exists():
+                saved = json.loads(self._backend_file.read_text()).get("backend")
+        except Exception:
+            saved = None
+        self.selected_backend = saved or get_best_default_backend()
+        log.info(f"[CLIENT] Selected backend: {self.selected_backend}")
 
     def emit(self, ev, data):
         if not self.window:
@@ -1873,7 +1885,13 @@ class Api:
         self.emit('backends', {'available': available, 'current': self.selected_backend})
 
     def set_backend(self, backend_name):
+        log.info(f"[CLIENT] set_backend called with: {backend_name} (was {self.selected_backend})")
         self.selected_backend = backend_name
+        try:
+            self._backend_file.write_text(json.dumps({"backend": backend_name}))
+        except Exception as e:
+            log.warning(f"Failed to save backend choice: {e}")
+        self.get_backends()
         if self.thread and self.thread.is_alive():
             self.stop_event.set()
 

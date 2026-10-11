@@ -2,12 +2,15 @@
 setlocal EnableExtensions EnableDelayedExpansion
 
 REM ============================================================
-REM CrowdGPT Universal Installer for Windows  (v9.4)
+REM CrowdGPT Universal Installer for Windows  (v9.6)
 REM ------------------------------------------------------------
-REM - Python 3.11 default, 3.12 for ROCm backend
-REM - ROCm via --find-links to AMD's repo directory
-REM - DirectML gets USE_TORCH=1 to survive transformers >= 5
-REM - ROCm CUDA check warns instead of failing
+REM v9.6:
+REM   - AMD prioritization: ROCm 6.4.4 for RX 7000/9000 & Ryzen AI,
+REM     DirectML (torch 2.4.1) for older AMD GPUs
+REM   - Hardcoded PyTorch versions per backend
+REM   - transformers pinned <4.49 for DirectML
+REM   - Fixed !TMP_REQ! delayed expansion bug
+REM   - ROCm wheels installed via direct URLs (not --find-links)
 REM ============================================================
 
 set "REPO_URL=https://github.com/Vxtzq/CrowdGPT.git"
@@ -22,10 +25,12 @@ set "BACKEND_OVERRIDE="
 set "AMD_GPU_NAME="
 set "HIP_SDK_FOUND=0"
 set "PY_VERSION=3.11"
+set "TRANSFORMERS_PIN="
+set "ROCM_BASE=https://repo.radeon.com/rocm/windows/rocm-rel-6.4.4"
 
-REM ------------------------------------------------------------
+REM ============================================================
 REM Arg parsing
-REM ------------------------------------------------------------
+REM ============================================================
 :parse_args
 if "%~1"=="" goto args_done
 if /I "%~1"=="--backend" (
@@ -59,7 +64,7 @@ echo.
 echo CrowdGPT installer - Windows
 echo.
 echo Options:
-echo   --backend ^<name^>   Force backend: nvidia ^| amd ^| amd-rocm ^| intel ^| cpu
+echo   --backend ^<name^>   Force: nvidia ^| amd ^| amd-rocm ^| intel ^| cpu
 echo   --dir ^<path^>       Directory to clone into. Default: .\CrowdGPT
 echo   --no-launch        Install only, don't launch client.py
 echo   --no-integrate     Skip Start Menu and PATH integration
@@ -71,13 +76,13 @@ exit /b 0
 
 echo.
 echo ============================================================
-echo                CrowdGPT Installer  (v9.4)
+echo                CrowdGPT Installer  (v9.6)
 echo ============================================================
 echo.
 
-REM ------------------------------------------------------------
+REM ============================================================
 REM 1. uv
-REM ------------------------------------------------------------
+REM ============================================================
 where uv >nul 2>nul
 if errorlevel 1 (
     echo [INFO] Installing uv...
@@ -100,9 +105,9 @@ if errorlevel 1 (
 )
 echo [OK] uv is ready.
 
-REM ------------------------------------------------------------
+REM ============================================================
 REM 2. Git
-REM ------------------------------------------------------------
+REM ============================================================
 where git >nul 2>nul
 if errorlevel 1 (
     echo [INFO] Git not found. Installing Git for Windows...
@@ -136,9 +141,9 @@ if errorlevel 1 goto :fatal
 :git_found
 echo [OK] Git found.
 
-REM ------------------------------------------------------------
+REM ============================================================
 REM 3. Clone / update repo
-REM ------------------------------------------------------------
+REM ============================================================
 if exist ".git" if exist "client.py" (
     set "REPO_DIR=."
     goto :repo_ready
@@ -168,18 +173,18 @@ if not exist "client.py" (
     goto :fatal
 )
 
-REM ------------------------------------------------------------
-REM 4. Install paths (defined early, used by detection)
-REM ------------------------------------------------------------
+REM ============================================================
+REM 4. Install paths
+REM ============================================================
 set "APP_DIR=%LOCALAPPDATA%\CrowdGPT"
 set "BIN_DIR=%APP_DIR%"
 set "VENV_DIR=%APP_DIR%\.venv"
 set "APP_PY=%VENV_DIR%\Scripts\python.exe"
 set "START_MENU=%APPDATA%\Microsoft\Windows\Start Menu\Programs"
 
-REM ------------------------------------------------------------
+REM ============================================================
 REM 5. Hardware detection
-REM ------------------------------------------------------------
+REM ============================================================
 echo.
 echo [INFO] Detecting hardware backend...
 call :detect_backend
@@ -228,18 +233,18 @@ echo   Note:        !WHEEL_NOTE!
 echo ============================================================
 echo.
 
-REM ------------------------------------------------------------
-REM 6. Clean previous install (preserve user data)
-REM ------------------------------------------------------------
+REM ============================================================
+REM 6. Clean previous venv, ensure app dir
+REM ============================================================
 if exist "!VENV_DIR!" (
     echo [INFO] Removing previous venv at !VENV_DIR!...
     rmdir /s /q "!VENV_DIR!" >nul 2>nul
 )
 if not exist "!APP_DIR!" mkdir "!APP_DIR!"
 
-REM ------------------------------------------------------------
-REM 7. Copy repo into app dir (skip caches / venv)
-REM ------------------------------------------------------------
+REM ============================================================
+REM 7. Sync app files
+REM ============================================================
 echo [INFO] Syncing app files to !APP_DIR!...
 robocopy "%CD%" "!APP_DIR!" /E /XD .git .venv __pycache__ checkpoints pending_uploads /NFL /NDL /NJH /NJS /NC /NS >nul
 if errorlevel 8 (
@@ -247,9 +252,9 @@ if errorlevel 8 (
     goto :fatal
 )
 
-REM ------------------------------------------------------------
-REM 8. Create venv at final location
-REM ------------------------------------------------------------
+REM ============================================================
+REM 8. Create venv
+REM ============================================================
 if /I "!BACKEND!"=="amd-rocm" (
     set "PY_VERSION=3.12"
     echo [INFO] Creating venv with Python 3.12 ^(ROCm wheels are cp312^)...
@@ -283,9 +288,9 @@ if errorlevel 1 (
 echo [INFO] Upgrading pip...
 "!APP_PY!" -m pip install --upgrade pip >nul 2>nul
 
-REM ------------------------------------------------------------
-REM 9. Install PyTorch
-REM ------------------------------------------------------------
+REM ============================================================
+REM 9. Install PyTorch  (per-backend hardcoded versions)
+REM ============================================================
 echo.
 echo ============================================================
 echo                   Installing PyTorch
@@ -299,6 +304,9 @@ if /I "!BACKEND!"=="amd-rocm" goto :pytorch_amd_rocm
 if /I "!BACKEND!"=="intel" goto :pytorch_intel
 goto :pytorch_cpu
 
+REM ------------------------------------------------------------
+REM NVIDIA: latest CUDA 12.1, fallback to CUDA 11.8
+REM ------------------------------------------------------------
 :pytorch_nvidia
 echo [INFO] Trying PyTorch CUDA 12.1 cu121...
 "!APP_PY!" -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
@@ -309,12 +317,16 @@ echo [WARN] cu121 failed. Trying CUDA 11.8 cu118...
 if not errorlevel 1 goto :pytorch_done
 goto :pytorch_cpu
 
+REM ------------------------------------------------------------
+REM AMD DirectML: hardcoded torch 2.4.1 + transformers <4.49
+REM ------------------------------------------------------------
 :pytorch_amd
-echo [INFO] Trying PyTorch DirectML...
-"!APP_PY!" -m pip install torch-directml
+echo [INFO] Trying PyTorch DirectML ^(torch 2.4.1^)...
+"!APP_PY!" -m pip install torch-directml torch==2.4.1 torchvision==0.19.1 torchaudio==2.4.1
 if not errorlevel 1 (
-    echo [OK] torch-directml installed.
-    echo [INFO] Setting USE_TORCH=1 so transformers uses PyTorch ^(2.4.x^).
+    echo [OK] torch-directml + torch 2.4.1 installed.
+    echo [INFO] Pinning transformers to <4.49 ^(compatible with torch 2.4.x^)...
+    set "TRANSFORMERS_PIN=transformers>=4.40,<4.49"
     set "USE_TORCH=1"
     setx USE_TORCH 1 >nul 2>nul
     goto :pytorch_done
@@ -323,6 +335,9 @@ echo.
 echo [WARN] torch-directml install failed. Falling back to CPU.
 goto :pytorch_cpu
 
+REM ------------------------------------------------------------
+REM AMD ROCm: official ROCm 6.4.4 wheels (cp312 only)
+REM ------------------------------------------------------------
 :pytorch_amd_rocm
 echo [INFO] Installing official AMD ROCm PyTorch for Windows...
 echo        Requires Radeon RX 9000 series, RX 7000 series,
@@ -335,8 +350,8 @@ if "!HIP_SDK_FOUND!"=="1" (
 ) else (
     echo [WARN] AMD HIP SDK for Windows was not detected.
     echo        The ROCm PyTorch wheel will install, but
-    echo        torch.cuda.is_available^(^) will return False until the
-    echo        HIP SDK is present. GPU acceleration will not work.
+    echo        torch.cuda.is_available^(^) will return False until
+    echo        the HIP SDK is present. GPU acceleration will not work.
     echo.
     echo        HIP SDK download page:
     echo          https://www.amd.com/en/developer/resources/rocm-hub/hip-sdk.html
@@ -345,32 +360,45 @@ if "!HIP_SDK_FOUND!"=="1" (
     echo          [Y] Yes  [N] No, continue anyway
     choice /C YN /N /M " Choose: "
     if errorlevel 2 (
-        echo [INFO] Continuing without HIP SDK. ROCm will likely fall back to CPU.
+        echo [INFO] Continuing without HIP SDK.
     ) else (
         start "" "https://www.amd.com/en/developer/resources/rocm-hub/hip-sdk.html"
-        echo [INFO] Browser opened. Install HIP SDK, reboot, then rerun this installer.
+        echo [INFO] Browser opened. Install HIP SDK, reboot, then rerun.
     )
     echo.
 )
 
 echo [INFO] Installing torch, torchvision, torchaudio from ROCm 6.4.4...
-"!APP_PY!" -m pip install --no-cache-dir --find-links https://repo.radeon.com/rocm/windows/rocm-rel-6.4.4/ torch torchvision torchaudio
+"!APP_PY!" -m pip install --no-cache-dir "!ROCM_BASE!/torch-2.8.0a0+gitfc14c65-cp312-cp312-win_amd64.whl" "!ROCM_BASE!/torchvision-0.24.0a0+c85f008-cp312-cp312-win_amd64.whl" "!ROCM_BASE!/torchaudio-2.6.0a0+1a8f621-cp312-cp312-win_amd64.whl"
 if not errorlevel 1 (
     echo [OK] ROCm PyTorch installed.
     goto :pytorch_done
 )
 
 echo.
-echo [WARN] ROCm PyTorch install failed.
-echo        Ensure AMD HIP SDK for Windows is installed, then rerun.
+echo [WARN] ROCm wheel install failed. Falling back to DirectML...
+"!APP_PY!" -m pip install torch-directml torch==2.4.1 torchvision==0.19.1 torchaudio==2.4.1
+if not errorlevel 1 (
+    echo [OK] DirectML fallback installed.
+    set "TRANSFORMERS_PIN=transformers>=4.40,<4.49"
+    set "USE_TORCH=1"
+    setx USE_TORCH 1 >nul 2>nul
+    goto :pytorch_done
+)
 goto :pytorch_cpu
 
+REM ------------------------------------------------------------
+REM Intel XPU: latest XPU wheel
+REM ------------------------------------------------------------
 :pytorch_intel
 echo [INFO] Trying PyTorch XPU...
 "!APP_PY!" -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/xpu --extra-index-url https://pypi.org/simple
 if not errorlevel 1 goto :pytorch_done
 goto :pytorch_cpu
 
+REM ------------------------------------------------------------
+REM CPU fallback: latest CPU wheel
+REM ------------------------------------------------------------
 :pytorch_cpu
 echo.
 echo [WARN] Installing CPU-only PyTorch. Training will be very slow.
@@ -379,34 +407,46 @@ if errorlevel 1 goto :fatal
 
 :pytorch_done
 
-REM ------------------------------------------------------------
-REM 10. Project requirements (torch lines stripped)
-REM ------------------------------------------------------------
+REM ============================================================
+REM 10. Project requirements  (delayed expansion used)
+REM ============================================================
 if exist "requirements.txt" (
     echo.
     echo ============================================================
     echo               Installing project dependencies
     echo ============================================================
-    set "TMP_REQ=%TEMP%\crowdgpt-req-%RANDOM%-%RANDOM%.txt"
+    set "TMP_REQ=%TEMP%\crowdgpt-req-!RANDOM!-!RANDOM!.txt"
     powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-        "Get-Content -LiteralPath 'requirements.txt' | Where-Object { $_ -notmatch '^\s*(torch|torchvision|torchaudio|torch-directml)(\s|[<>=!~]|$)' } | Set-Content -LiteralPath '%TMP_REQ%'"
+        "Get-Content -LiteralPath 'requirements.txt' | Where-Object { $_ -notmatch '^\s*(torch|torchvision|torchaudio|torch-directml)(\s|[<>=!~]|$)' } | Set-Content -LiteralPath '!TMP_REQ!'"
     if errorlevel 1 goto :fatal
 
-    for %%A in ("%TMP_REQ%") do set "TMP_SIZE=%%~zA"
+    for %%A in ("!TMP_REQ!") do set "TMP_SIZE=%%~zA"
     if "!TMP_SIZE!"=="0" (
         echo [WARN] requirements.txt contained only torch packages.
     ) else (
-        "!APP_PY!" -m pip install -r "%TMP_REQ%"
+        "!APP_PY!" -m pip install -r "!TMP_REQ!"
         if errorlevel 1 goto :fatal
     )
-    del /q "%TMP_REQ%" >nul 2>nul
+    del /q "!TMP_REQ!" >nul 2>nul
 ) else (
     echo [WARN] requirements.txt not found; skipping project deps.
 )
 
-REM ------------------------------------------------------------
+REM ---- Pin transformers for DirectML (torch 2.4.x) ----
+if defined TRANSFORMERS_PIN (
+    echo.
+    echo [INFO] Pinning transformers for DirectML: !TRANSFORMERS_PIN!
+    "!APP_PY!" -m pip install "!TRANSFORMERS_PIN!"
+    if errorlevel 1 (
+        echo [WARN] Failed to pin transformers. USE_TORCH=1 is the fallback.
+    ) else (
+        echo [OK] transformers pinned to a DirectML-compatible version.
+    )
+)
+
+REM ============================================================
 REM 11. WebView2 runtime check
-REM ------------------------------------------------------------
+REM ============================================================
 echo.
 echo ============================================================
 echo           GUI backend for pywebview - WebView2
@@ -417,16 +457,15 @@ if errorlevel 1 (
 )
 if errorlevel 1 (
     echo [WARN] Microsoft Edge WebView2 Runtime not detected.
-    echo        pywebview needs it to display the GUI window.
     echo        Install from:
     echo          https://developer.microsoft.com/microsoft-edge/webview2/
 ) else (
     echo [OK] WebView2 Runtime present.
 )
 
-REM ------------------------------------------------------------
+REM ============================================================
 REM 12. Verify install
-REM ------------------------------------------------------------
+REM ============================================================
 echo.
 echo ============================================================
 echo                    Verifying install
@@ -438,10 +477,9 @@ if /I "!BACKEND!"=="amd-rocm" (
     "!APP_PY!" -c "import torch,sys; sys.exit(0 if torch.cuda.is_available() else 1)" >nul 2>nul
     if errorlevel 1 (
         echo [WARN] ROCm wheel installed but torch.cuda.is_available^(^) is False.
-        echo        The AMD HIP SDK for Windows is missing.
+        echo        The AMD HIP SDK for Windows is likely missing.
         echo        Download: https://www.amd.com/en/developer/resources/rocm-hub/hip-sdk.html
         echo        Install it, reboot, then rerun with --backend amd-rocm.
-        echo        Continuing with CPU fallback...
     ) else (
         echo [OK] ROCm GPU detected.
     )
@@ -450,17 +488,17 @@ if /I "!BACKEND!"=="amd-rocm" (
 "!APP_PY!" -c "import webview; print('  pywebview: OK')" 2>nul
 if errorlevel 1 echo [WARN] pywebview import failed.
 
-REM ------------------------------------------------------------
+REM ============================================================
 REM 13. Desktop integration
-REM ------------------------------------------------------------
+REM ============================================================
 if "!INTEGRATE!"=="1" (
     call :do_integration
     if errorlevel 1 goto :fatal
 )
 
-REM ------------------------------------------------------------
+REM ============================================================
 REM 14. Launch
-REM ------------------------------------------------------------
+REM ============================================================
 if "!LAUNCH!"=="1" (
     echo Launching client.py...
     echo.
@@ -493,15 +531,12 @@ if not exist "!APP_PY!" (
     exit /b 1
 )
 
-REM ---- CMD shim ----
 > "!BIN_DIR!\crowdgpt.cmd" echo @echo off
 >>"!BIN_DIR!\crowdgpt.cmd" echo "!APP_PY!" "!APP_DIR!\client.py" %%*
 
-REM ---- GUI launcher ----
 > "!BIN_DIR!\crowdgpt-gui.vbs" echo Set WshShell = CreateObject("WScript.Shell")
 >>"!BIN_DIR!\crowdgpt-gui.vbs" echo WshShell.Run """!APP_PY!"" ""!APP_DIR!\client.py""", 0, False
 
-REM ---- Add to user PATH ----
 > "%TEMP%\crowdgpt_env.ps1" echo $p = [Environment]::GetEnvironmentVariable('Path', 'User')
 >> "%TEMP%\crowdgpt_env.ps1" echo if ($null -eq $p) { $p = '' }
 >> "%TEMP%\crowdgpt_env.ps1" echo if ($p -notlike '*!BIN_DIR!*') {
@@ -512,18 +547,15 @@ REM ---- Add to user PATH ----
 powershell -NoProfile -ExecutionPolicy Bypass -File "%TEMP%\crowdgpt_env.ps1"
 del "%TEMP%\crowdgpt_env.ps1" >nul 2>nul
 
-REM ---- Persistent env vars for AMD DirectML ----
 if /I "!BACKEND!"=="amd" (
     setx USE_TORCH 1 >nul 2>nul
-    echo [OK] USE_TORCH=1 set persistently for torch-directml.
+    echo [OK] USE_TORCH=1 set persistently.
 )
 
-REM ---- Icon path ----
 set "APP_ICON="
 if exist "!APP_DIR!\docs\logo-app.ico" set "APP_ICON=!APP_DIR!\docs\logo-app.ico"
 if not defined APP_ICON if exist "!APP_DIR!\docs\logo-app.svg" set "APP_ICON=!APP_DIR!\docs\logo-app.svg"
 
-REM ---- Start Menu shortcut ----
 > "%TEMP%\crowdgpt_shortcut.ps1" echo $ws = New-Object -ComObject WScript.Shell
 >> "%TEMP%\crowdgpt_shortcut.ps1" echo $sc = $ws.CreateShortcut('!START_MENU!\CrowdGPT.lnk')
 >> "%TEMP%\crowdgpt_shortcut.ps1" echo $sc.TargetPath = '!APP_DIR!\crowdgpt-gui.vbs'
@@ -534,11 +566,10 @@ REM ---- Start Menu shortcut ----
 powershell -NoProfile -ExecutionPolicy Bypass -File "%TEMP%\crowdgpt_shortcut.ps1"
 del "%TEMP%\crowdgpt_shortcut.ps1" >nul 2>nul
 
-REM ---- Add/Remove Programs registry entry ----
 > "%TEMP%\crowdgpt_reg.ps1" echo $k = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\CrowdGPT'
 >> "%TEMP%\crowdgpt_reg.ps1" echo New-Item -Path $k -Force ^| Out-Null
 >> "%TEMP%\crowdgpt_reg.ps1" echo Set-ItemProperty -Path $k -Name 'DisplayName' -Value 'CrowdGPT'
->> "%TEMP%\crowdgpt_reg.ps1" echo Set-ItemProperty -Path $k -Name 'DisplayVersion' -Value '0.6'
+>> "%TEMP%\crowdgpt_reg.ps1" echo Set-ItemProperty -Path $k -Name 'DisplayVersion' -Value '0.7'
 >> "%TEMP%\crowdgpt_reg.ps1" echo Set-ItemProperty -Path $k -Name 'Publisher' -Value 'CrowdGPT Project'
 >> "%TEMP%\crowdgpt_reg.ps1" echo Set-ItemProperty -Path $k -Name 'InstallLocation' -Value '!APP_DIR!'
 >> "%TEMP%\crowdgpt_reg.ps1" echo Set-ItemProperty -Path $k -Name 'UninstallString' -Value ('\"' + '!APP_DIR!\uninstall.bat' + '\"')
@@ -547,7 +578,6 @@ REM ---- Add/Remove Programs registry entry ----
 powershell -NoProfile -ExecutionPolicy Bypass -File "%TEMP%\crowdgpt_reg.ps1"
 del "%TEMP%\crowdgpt_reg.ps1" >nul 2>nul
 
-REM ---- Uninstaller ----
 > "!APP_DIR!\uninstall.bat" echo @echo off
 >>"!APP_DIR!\uninstall.bat" echo setlocal
 >>"!APP_DIR!\uninstall.bat" echo echo Uninstalling CrowdGPT...
@@ -570,7 +600,6 @@ exit /b 0
 
 REM ============================================================
 REM Subroutine: check_hip_sdk
-REM Sets HIP_SDK_FOUND=1 if AMD HIP SDK is present.
 REM ============================================================
 :check_hip_sdk
 set "HIP_SDK_FOUND=0"
@@ -589,7 +618,6 @@ REM Subroutine: detect_backend
 REM ============================================================
 :detect_backend
 
-REM --- NVIDIA ---
 where nvidia-smi >nul 2>nul
 if not errorlevel 1 (
     set "NVIDIA_DRIVER="
@@ -602,71 +630,61 @@ if not errorlevel 1 (
     if not defined NVIDIA_DRIVER (
         set "BACKEND=nvidia"
         set "TORCH_INDEX=https://download.pytorch.org/whl/cu121"
-        set "WHEEL_NOTE=NVIDIA GPU - could not read driver, defaulting to cu121"
+        set "WHEEL_NOTE=NVIDIA GPU - defaulting to cu121"
         exit /b 0
     )
     set "DRIVER_MAJOR="
     for /f "tokens=1 delims=." %%M in ("!NVIDIA_DRIVER!") do set "DRIVER_MAJOR=%%M"
-    if not defined DRIVER_MAJOR (
-        set "BACKEND=nvidia"
-        set "TORCH_INDEX=https://download.pytorch.org/whl/cu121"
-        set "WHEEL_NOTE=NVIDIA driver !NVIDIA_DRIVER! - defaulting to cu121"
-        exit /b 0
-    )
     if !DRIVER_MAJOR! GEQ 525 (
         set "BACKEND=nvidia"
         set "TORCH_INDEX=https://download.pytorch.org/whl/cu121"
-        set "WHEEL_NOTE=NVIDIA driver !NVIDIA_DRIVER! -^> CUDA 12.1 wheel"
+        set "WHEEL_NOTE=NVIDIA driver !NVIDIA_DRIVER! -^> CUDA 12.1"
     ) else if !DRIVER_MAJOR! GEQ 470 (
         set "BACKEND=nvidia"
         set "TORCH_INDEX=https://download.pytorch.org/whl/cu118"
-        set "WHEEL_NOTE=NVIDIA driver !NVIDIA_DRIVER! -^> CUDA 11.8 wheel ^(older driver^)"
+        set "WHEEL_NOTE=NVIDIA driver !NVIDIA_DRIVER! -^> CUDA 11.8"
     ) else (
-        echo [ERROR] NVIDIA driver !NVIDIA_DRIVER! is too old for any PyTorch wheel.
-        echo         Update your GPU driver and rerun.
+        echo [ERROR] NVIDIA driver too old.
         exit /b 1
     )
     exit /b 0
 )
 
-REM --- Intel Arc ---
 powershell -NoProfile -Command "try { $g = Get-CimInstance Win32_VideoController | Select-Object -ExpandProperty Name; if ($g -match 'Intel.*Arc') { exit 0 } else { exit 1 } } catch { exit 1 }"
 if not errorlevel 1 (
     set "BACKEND=intel"
     set "TORCH_INDEX=https://download.pytorch.org/whl/xpu"
     set "TORCH_EXTRA=https://pypi.org/simple"
-    set "WHEEL_NOTE=Intel Arc detected -^> XPU wheel"
+    set "WHEEL_NOTE=Intel Arc detected -^> XPU"
     exit /b 0
 )
 
-REM --- AMD ---
 powershell -NoProfile -Command "try { $g = Get-CimInstance Win32_VideoController | Select-Object -ExpandProperty Name; if ($g -match 'AMD|Radeon') { Write-Output ($g -join ' / ') } else { exit 1 } } catch { exit 1 }" > "%TEMP%\amd_gpu.txt" 2>nul
 set /p AMD_GPU_NAME=<"%TEMP%\amd_gpu.txt"
 del "%TEMP%\amd_gpu.txt" >nul 2>nul
 
 if defined AMD_GPU_NAME (
-    REM --- Check if this is a ROCm-eligible Radeon RX 7000/9000 series or Ryzen AI ---
+    REM Prioritize ROCm for Radeon RX 7000/9000 series and Ryzen AI
     echo !AMD_GPU_NAME! | findstr /I "RX 9 9070 9060 7900 7800 7700 7600 Ryzen AI" >nul
     if not errorlevel 1 (
         set "BACKEND=amd-rocm"
-        set "TORCH_INDEX=https://repo.radeon.com/rocm/windows/rocm-rel-6.4.4/"
+        set "TORCH_INDEX=!ROCM_BASE!/"
         set "TORCH_EXTRA="
-        set "WHEEL_NOTE=AMD !AMD_GPU_NAME! -^> ROCm 6.4.4 wheel ^(Windows^)"
+        set "WHEEL_NOTE=AMD !AMD_GPU_NAME! -^> ROCm 6.4.4 ^(Windows^)"
         exit /b 0
     )
-    REM --- Older AMD (RDNA1/2, Vega, Polaris, APUs) -> DirectML ---
+    REM Older AMD GPUs -> DirectML
     set "BACKEND=amd"
     set "TORCH_INDEX="
     set "TORCH_EXTRA="
-    set "WHEEL_NOTE=AMD !AMD_GPU_NAME! detected -^> DirectML ^(torch-directml^). Not in ROCm Windows support list."
+    set "WHEEL_NOTE=AMD !AMD_GPU_NAME! -^> DirectML ^(torch 2.4.1^)"
     exit /b 0
 )
 
-REM --- CPU ---
 set "BACKEND=cpu"
 set "TORCH_INDEX=https://download.pytorch.org/whl/cpu"
 set "TORCH_EXTRA="
-set "WHEEL_NOTE=No usable GPU detected -^> CPU wheel ^(training will be very slow^)"
+set "WHEEL_NOTE=No GPU -^> CPU"
 exit /b 0
 
 :fatal

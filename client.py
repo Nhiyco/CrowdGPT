@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-CrowdGPT GUI Client v0.11 — AMD→CPU default, backend persistence, DirectML slice fix.
+CrowdGPT GUI Client v0.12 — AMD→CPU default, persistence, DirectML fixes, backend selector.
 """
 import os, sys, io, json, time, struct, math, gc, threading, base64, logging, tempfile, atexit, subprocess, hashlib, shutil
 from pathlib import Path
@@ -22,7 +22,7 @@ sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='repla
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s', datefmt='%H:%M:%S')
 log = logging.getLogger(__name__)
 
-CLIENT_VERSION = "0.11"
+CLIENT_VERSION = "0.12"
 VERSION_URL = "https://raw.githubusercontent.com/Vxtzq/CrowdGPT/main/docs/version.txt"
 CLIENT_URL  = "https://raw.githubusercontent.com/Vxtzq/CrowdGPT/main/client.py"
 
@@ -297,10 +297,6 @@ def get_available_backends():
     return backends
 
 def get_best_default_backend():
-    # DirectML works for model load but torch-directml has spotty op coverage
-    # on the chunked-attention / engram / loss-chunk paths used by this model.
-    # Until it matures, we prefer CPU on AMD systems so training actually
-    # runs. Users who want DirectML can still pick it from the dropdown.
     avail = get_available_backends()
     for bk in ['cuda', 'rocm', 'mps', 'xpu', 'cpu']:
         if avail.get(bk):
@@ -446,9 +442,6 @@ class GroupedQueryAttention(nn.Module):
         return self.wo((a @ v).transpose(1, 2).contiguous().view(B, T, C))
 
     def _chunked(self, q, k, v, B, T, C, cs=64):
-        # torch-directml cannot do the strided 4D batched matmul used here.
-        # On DirectML, run the whole chunked attention on CPU and move only
-        # the final result back.
         use_cpu = _is_directml(q)
         if use_cpu:
             q_ = q.cpu(); k_ = k.cpu(); v_ = v.cpu()
@@ -1067,8 +1060,6 @@ def _fwl(m, x, y, sl, ua, ad, ls=1.0, preview=False):
             ) / nc
     else:
         xe = fwd()
-        # DirectML cannot handle strided slices of a bf16 activation inside
-        # checkpoint(). Force each chunk to a contiguous copy first.
         on_dml = _is_directml(xe)
         def chunk_loss(i):
             xs = xe[:, i:i + LOSS_CHUNK, :]
@@ -1300,24 +1291,15 @@ def run_single_round_wrapper(srv, at, se, emit):
                     except Exception:
                         pass
                 gc.collect()
-
                 model = SotaGPT(train_backend, train_device)
                 model.engram.table.to('cpu')
-
                 try:
-                    print(f"[IW-PROBE] iw: type={type(iw).__name__} "
-                          f"shape={getattr(iw, 'shape', None)} "
-                          f"size={getattr(iw, 'size', None)} "
-                          f"nbytes={getattr(iw, 'nbytes', None)}", flush=True)
-                    print(f"[IW-PROBE] ie: type={type(ie).__name__} "
-                          f"shape={getattr(ie, 'shape', None)} "
-                          f"size={getattr(ie, 'size', None)}", flush=True)
+                    print(f"[IW-PROBE] iw: type={type(iw).__name__} shape={getattr(iw, 'shape', None)} size={getattr(iw, 'size', None)}", flush=True)
+                    print(f"[IW-PROBE] ie: type={type(ie).__name__} shape={getattr(ie, 'shape', None)} size={getattr(ie, 'size', None)}", flush=True)
                 except Exception as _pe:
                     print(f"[IW-PROBE] probe failed: {_pe}", flush=True)
-
                 model.load_base_weights(iw)
                 model.engram.table.weight.data.copy_(torch.from_numpy(ie).view(model.engram.table.weight.shape))
-
                 model = model.to(train_device)
                 model.engram.table.to('cpu')
                 model.train()
@@ -1810,6 +1792,7 @@ document.getElementById('go-to-register').addEventListener('click',e=>{e.prevent
 document.getElementById('go-to-login').addEventListener('click',e=>{e.preventDefault();showAuthScreen('login')});
 function callApi(n,...a){if(window.pywebview&&window.pywebview.api&&window.pywebview.api[n]){window.pywebview.api[n](...a);return true}return false}
 window.addEventListener('pywebviewready',()=>callApi('get_backends'));
+document.getElementById('backend-select').addEventListener('change',e=>{const nb=e.target.value;if(nb===window._currentBackend)return;callApi('set_backend',nb);});
 document.getElementById('btn-login').addEventListener('click',()=>{const srv=document.getElementById('login-server').value.trim();const u=document.getElementById('login-user').value.trim();const p=document.getElementById('login-pass').value;if(!u||!p){showLoginError('err_invalid_credentials');return}document.getElementById('btn-login').disabled=true;callApi('login',srv,u,p)});
 document.getElementById('btn-register').addEventListener('click',()=>{const srv=document.getElementById('reg-server').value.trim();const u=document.getElementById('reg-user').value.trim();const email=document.getElementById('reg-email').value.trim();const p=document.getElementById('reg-pass').value;if(!u||!email||!p){showRegError('err_invalid_input');return}document.getElementById('btn-register').disabled=true;callApi('register',srv,u,email,p)});
 document.getElementById('btn-anon').addEventListener('click',e=>{e.preventDefault();callApi('login_anon')});

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-CrowdGPT GUI Client v0.9 — Engram stays on CPU.
+CrowdGPT GUI Client v0.10 — DirectML chunked attention on CPU.
 """
 import os, sys, io, json, time, struct, math, gc, threading, base64, logging, tempfile, atexit, subprocess, hashlib, shutil
 from pathlib import Path
@@ -22,7 +22,7 @@ sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='repla
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s', datefmt='%H:%M:%S')
 log = logging.getLogger(__name__)
 
-CLIENT_VERSION = "0.9"
+CLIENT_VERSION = "0.10"
 VERSION_URL = "https://raw.githubusercontent.com/Vxtzq/CrowdGPT/main/docs/version.txt"
 CLIENT_URL  = "https://raw.githubusercontent.com/Vxtzq/CrowdGPT/main/client.py"
 
@@ -407,6 +407,12 @@ def precompute_freqs(dim, sl, dev):
 def rotate_half(x):
     return torch.cat((-x[..., x.shape[-1] // 2:], x[..., :x.shape[-1] // 2]), -1)
 
+def _is_directml(t):
+    try:
+        return t.device.type == 'privateuseone'
+    except Exception:
+        return False
+
 class GroupedQueryAttention(nn.Module):
     def __init__(self):
         super().__init__()
@@ -436,15 +442,28 @@ class GroupedQueryAttention(nn.Module):
         return self.wo((a @ v).transpose(1, 2).contiguous().view(B, T, C))
 
     def _chunked(self, q, k, v, B, T, C, cs=64):
+        # torch-directml cannot do the strided 4D batched matmul used here.
+        # On DirectML, run the whole chunked attention on CPU and move only
+        # the final result back. CUDA / MPS / CPU keep the native fast path.
+        use_cpu = _is_directml(q)
+        if use_cpu:
+            q_ = q.cpu()
+            k_ = k.cpu()
+            v_ = v.cpu()
+        else:
+            q_, k_, v_ = q, k, v
         chunks = []
         for i in range(0, T, cs):
             e = min(i + cs, T)
-            aw = (q[:, :, i:e, :] @ k[:, :, :e, :].transpose(-2, -1)) * (1.0 / math.sqrt(HEAD_DIM))
-            ri = torch.arange(i, e, device=q.device).unsqueeze(1)
-            ci = torch.arange(e, device=q.device).unsqueeze(0)
+            aw = (q_[:, :, i:e, :] @ k_[:, :, :e, :].transpose(-2, -1)) * (1.0 / math.sqrt(HEAD_DIM))
+            ri = torch.arange(i, e, device=q_.device).unsqueeze(1)
+            ci = torch.arange(e, device=q_.device).unsqueeze(0)
             aw = aw.masked_fill(~(ci <= ri).unsqueeze(0).unsqueeze(0), float('-inf'))
-            chunks.append(F.softmax(aw, dim=-1, dtype=torch.float32).to(q.dtype) @ v[:, :, :e, :])
-        return self.wo(torch.cat(chunks, dim=2).transpose(1, 2).contiguous().view(B, T, C))
+            chunks.append(F.softmax(aw, dim=-1, dtype=torch.float32).to(q_.dtype) @ v_[:, :, :e, :])
+        out = torch.cat(chunks, dim=2).transpose(1, 2).contiguous().view(B, T, C)
+        if use_cpu:
+            out = out.to(q.device)
+        return self.wo(out)
 
 class SwiGLU(nn.Module):
     def __init__(self):
@@ -483,7 +502,7 @@ class EngramMemory(nn.Module):
         # lookup on CPU and move only the result back to the training device.
         hi_cpu = hi.reshape(-1).cpu()
         uq, inv = torch.unique(hi_cpu, return_inverse=True)
-        cr = self.table(uq)                                # table stays on CPU
+        cr = self.table(uq)
         out = cr[inv].view(idx.shape[0], idx.shape[1], DIM)
         return out.to(self.device)
 

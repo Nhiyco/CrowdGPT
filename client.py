@@ -2642,7 +2642,7 @@ class Api:
             round_count += 1
             self.emit('log', f"{'='*40}")
             self.emit('log', f"Starting Round Cycle #{round_count}")
-         self.emit('log', f"{'='*40}")
+            self.emit('log', f"{'='*40}")
 
             try:
                 run_single_round_wrapper(self.server_url, self.auth_token, self.stop_event, self.emit)

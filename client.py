@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-CrowdGPT GUI Client v0.7 — DirectML numel fix.
+CrowdGPT GUI Client v0.8 — DirectML op coverage fixes.
 """
 import os, sys, io, json, time, struct, math, gc, threading, base64, logging, tempfile, atexit, subprocess, hashlib, shutil
 from pathlib import Path
@@ -23,7 +23,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger(__name__)
 
 # ============ AUTO-UPDATE ============
-CLIENT_VERSION = "0.7"
+CLIENT_VERSION = "0.8"
 VERSION_URL = "https://raw.githubusercontent.com/Vxtzq/CrowdGPT/main/docs/version.txt"
 CLIENT_URL  = "https://raw.githubusercontent.com/Vxtzq/CrowdGPT/main/client.py"
 
@@ -486,15 +486,21 @@ class EngramMemory(nn.Module):
     def forward(self, idx):
         px = torch.cat([torch.zeros_like(idx[:, :1]), idx[:, :-1]], dim=1)
         hi = (px * 1000003 + idx) % ENG_NUM_BUCKETS
-        uq, inv = torch.unique(hi.flatten(), return_inverse=True)
-        cr = self.table(uq.cpu())
+        # DirectML does not implement torch.unique(return_inverse=True).
+        # The input is a tiny int tensor (B*T elements), so do the unique
+        # on CPU and move results back — negligible cost.
+        hi_cpu = hi.flatten().cpu()
+        uq, inv = torch.unique(hi_cpu, return_inverse=True)
+        cr = self.table(uq)                     # table is already on CPU
         if self.use_async:
             with torch.cuda.stream(self.ts):
                 cg = cr.to(self.device, non_blocking=True)
+                inv_dev = inv.to(self.device, non_blocking=True)
             torch.cuda.current_stream(self.device).wait_stream(self.ts)
         else:
             cg = cr.to(self.device)
-        return cg[inv].view(idx.shape[0], idx.shape[1], DIM)
+            inv_dev = inv.to(self.device)
+        return cg[inv_dev].view(idx.shape[0], idx.shape[1], DIM)
 
 class SotaGPT(nn.Module):
     def __init__(self, bn, device):
@@ -1294,11 +1300,8 @@ def run_single_round_wrapper(srv, at, se, emit):
                         pass
                 gc.collect()
 
-                # Build on CPU, load weights on CPU, THEN move to target
-                # device. DirectML's .to() corrupts the .numel() metadata of
-                # parameters on privateuseone:0 tensors on some builds, which
-                # makes load_base_weights produce empty slices and crash with
-                # "shape '[151669, 1536]' is invalid for input of size 0".
+                # Build on CPU, load weights on CPU, THEN move to target.
+                # DirectML's .to() corrupts param.numel() on some builds.
                 model = SotaGPT(train_backend, train_device)
                 model.engram.table.to('cpu')
 
@@ -1316,7 +1319,6 @@ def run_single_round_wrapper(srv, at, se, emit):
                 model.load_base_weights(iw)
                 model.engram.table.weight.data.copy_(torch.from_numpy(ie).view(model.engram.table.weight.shape))
 
-                # Now move everything to the target device.
                 model = model.to(train_device)
                 model.train()
                 break

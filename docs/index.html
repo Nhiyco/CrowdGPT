@@ -195,7 +195,6 @@ header {
   gap: var(--header-gap);
   width: 100%;
   box-sizing: border-box;
-  overflow: hidden;
 }
 
 .logo {
@@ -312,6 +311,106 @@ nav a.active {
   flex-shrink: 0;
 }
 
+/* ===== LANGUAGE SELECTOR ===== */
+.lang-select {
+  position: relative;
+  margin-left: clamp(8px, 0.8vw, 12px);
+  flex-shrink: 0;
+}
+
+.lang-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  min-height: clamp(36px, 2.5vw, 42px);
+  padding: 0 clamp(10px, 0.9vw, 13px);
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-dim);
+  font-family: inherit;
+  font-size: clamp(14px, 1vw, 16px);
+  cursor: pointer;
+  border-radius: 0;
+  transition: color 0.15s, border-color 0.15s;
+}
+
+.lang-btn:hover {
+  color: var(--text);
+  border-color: var(--border-strong);
+}
+
+.lang-flag {
+  font-size: 1.15em;
+  line-height: 1;
+  font-family: "Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji", sans-serif;
+  display: block;
+}
+
+.lang-chevron {
+  opacity: 0.55;
+  transition: transform 0.18s ease;
+  flex-shrink: 0;
+}
+
+.lang-select.open .lang-chevron {
+  transform: rotate(180deg);
+}
+
+.lang-menu {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  min-width: 176px;
+  background: var(--bg-soft);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  padding: 5px;
+  box-shadow: 0 14px 36px rgba(0, 0, 0, 0.35);
+  z-index: 300;
+  display: none;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.lang-select.open .lang-menu {
+  display: flex;
+}
+
+.lang-item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 12px;
+  background: transparent;
+  border: none;
+  color: var(--text-dim);
+  font-family: inherit;
+  font-size: clamp(14px, 1vw, 15px);
+  text-align: left;
+  cursor: pointer;
+  border-radius: var(--radius-sm);
+  transition: background 0.12s, color 0.12s;
+  width: 100%;
+}
+
+.lang-item:hover {
+  background: var(--bg-softer);
+  color: var(--text);
+}
+
+.lang-item.active {
+  color: var(--accent);
+}
+
+.lang-item.active::after {
+  content: '✓';
+  margin-left: auto;
+  font-family: var(--mono);
+  font-weight: 700;
+  font-size: 0.95em;
+}
+
 .mobile-menu-btn {
   display: none;
   background: none;
@@ -320,7 +419,7 @@ nav a.active {
   min-height: 44px;
   padding: 10px;
   cursor: pointer;
-  margin-left: auto;
+  margin-left: clamp(4px, 0.4vw, 8px);
   color: var(--text);
   border-radius: 0;
   transition: background 0.15s;
@@ -347,6 +446,10 @@ nav a.active {
   display: inline-flex;
 }
 
+.header-compact .lang-select {
+  margin-left: auto;
+}
+
 .header-measure {
   position: absolute;
   top: 0;
@@ -369,7 +472,8 @@ nav a.active {
 }
 
 .header-measure nav,
-.header-measure .gh-btn {
+.header-measure .gh-btn,
+.header-measure .lang-select {
   display: flex !important;
 }
 
@@ -561,10 +665,6 @@ nav a.active {
   flex-wrap: wrap;
   align-items: center;
   max-width: 100%;
-  padding: 0;
-  background: transparent;
-  border: none;
-  border-radius: 0;
 }
 
 .btn {
@@ -682,7 +782,6 @@ nav a.active {
   color: var(--text-muted);
 }
 
-/* ===== NOTE ===== */
 .note {
   background: var(--note-bg);
   border: 1px solid var(--note-border);
@@ -795,7 +894,6 @@ nav a.active {
   align-items: start;
 }
 
-/* ===== SVG feature icon ===== */
 .feature-icon {
   width: 22px;
   height: 22px;
@@ -1301,41 +1399,6 @@ nav a.active {
   border-radius: var(--radius-sm);
 }
 
-pre {
-  background: var(--bg-softer);
-  border: 1px solid var(--border);
-  padding: clamp(16px, 1.8vw, 19px) clamp(18px, 2.1vw, 24px);
-  overflow-x: auto;
-  margin-bottom: 24px;
-  font-size: clamp(14px, 1.1vw, 16px);
-  line-height: 1.6;
-  color: var(--text-dim);
-  border-radius: var(--radius);
-  max-width: 100%;
-  box-sizing: border-box;
-  -webkit-overflow-scrolling: touch;
-}
-
-.info {
-  background: var(--bg-soft);
-  border-left: 3px solid var(--info);
-  padding: 17px 22px;
-  margin-bottom: 29px;
-  font-size: clamp(15px, 1.2vw, 17px);
-  color: var(--text-dim);
-  display: flex;
-  gap: 13px;
-  align-items: flex-start;
-  border-radius: var(--radius);
-}
-
-.info-icon {
-  font-family: var(--mono);
-  font-weight: 600;
-  color: var(--info);
-  flex-shrink: 0;
-}
-
 .stats-grid {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -1738,6 +1801,10 @@ footer {
     display: inline-flex;
   }
 
+  .lang-select {
+    margin-left: auto;
+  }
+
   .header-inner {
     gap: 14px;
   }
@@ -1842,11 +1909,6 @@ footer {
     font-size: 12px;
     padding: 16px;
     line-height: 1.7;
-  }
-
-  pre {
-    padding: 16px;
-    font-size: 14px;
   }
 
   .cap-item {
@@ -1965,11 +2027,6 @@ footer {
     padding: 14px;
     font-size: 12px;
   }
-
-  pre {
-    padding: 14px;
-    font-size: 12px;
-  }
 }
 
 ::-webkit-scrollbar {
@@ -1995,19 +2052,31 @@ footer {
       <img src="logo-white.svg" alt="CrowdGPT" class="logo-img" id="logo-img" onerror="this.parentElement.classList.add('logo-img-failed')">
       <div class="logo-fallback">C</div>
       <span class="logo-text">CrowdGPT</span>
-      <span class="logo-ver">v0.5</span>
     </div>
     <nav>
-      <a href="#home" data-view="home" class="active">home</a>
-      <a href="#install" data-view="install">install</a>
-      <a href="#protocol" data-view="protocol">about</a>
-      <a href="#status" data-view="status">status</a>
-      <a href="#contributors" data-view="contributors">leaderboard</a>
-      <a href="#contact" data-view="contact">contact</a>
+      <a href="#home" data-view="home" class="active" data-i18n="nav.home">home</a>
+      <a href="#install" data-view="install" data-i18n="nav.install">install</a>
+      <a href="#about" data-view="about" data-i18n="nav.about">about</a>
+      <a href="#status" data-view="status" data-i18n="nav.status">status</a>
+      <a href="#contributors" data-view="contributors" data-i18n="nav.leaderboard">leaderboard</a>
+      <a href="#contact" data-view="contact" data-i18n="nav.contact">contact</a>
     </nav>
+    <div class="lang-select" id="lang-select">
+      <button class="lang-btn" id="lang-btn" type="button" aria-haspopup="listbox" aria-expanded="false" aria-label="Change language">
+        <span class="lang-flag" id="lang-flag">🇬🇧</span>
+        <svg class="lang-chevron" viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="6 9 12 15 18 9"/></svg>
+      </button>
+      <div class="lang-menu" id="lang-menu" role="listbox">
+        <button class="lang-item active" data-lang="en" type="button" role="option" aria-selected="true"><span class="lang-flag">🇬🇧</span><span>English</span></button>
+        <button class="lang-item" data-lang="fr" type="button" role="option" aria-selected="false"><span class="lang-flag">🇫🇷</span><span>Français</span></button>
+        <button class="lang-item" data-lang="de" type="button" role="option" aria-selected="false"><span class="lang-flag">🇩🇪</span><span>Deutsch</span></button>
+        <button class="lang-item" data-lang="es" type="button" role="option" aria-selected="false"><span class="lang-flag">🇪🇸</span><span>Español</span></button>
+        <button class="lang-item" data-lang="tr" type="button" role="option" aria-selected="false"><span class="lang-flag">🇹🇷</span><span>Türkçe</span></button>
+      </div>
+    </div>
     <a href="https://github.com/Vxtzq/CrowdGPT" target="_blank" class="gh-btn" rel="noopener noreferrer">
       <svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.3 3.44 9.8 8.21 11.39.6.11.79-.26.79-.58v-2.23c-3.34.73-4.03-1.42-4.03-1.42-.55-1.39-1.33-1.76-1.33-1.76-1.09-.74.08-.73.08-.73 1.2.08 1.84 1.24 1.84 1.24 1.07 1.83 2.81 1.3 3.49.99.11-.78.42-1.3.76-1.6-2.67-.31-5.47-1.34-5.47-5.93 0-1.31.47-2.38 1.24-3.22-.13-.3-.54-1.52.11-3.18 0 0 1.01-.32 3.3 1.23.96-.27 1.98-.4 3-.4s2.05.13 3.01.4c2.29-1.55 3.3-1.23 3.3-1.23.65 1.66.24 2.88.12 3.18.77.84 1.23 1.91 1.23 3.22 0 4.61-2.8 5.62-5.48 5.92.43.37.82 1.1.82 2.22v3.29c0 .32.19.69.8.58C20.57 21.8 24 17.3 24 12c0-6.63-5.37-12-12-12z"/></svg>
-      source
+      <span data-i18n="brand.source">source</span>
     </a>
     <button class="mobile-menu-btn" aria-label="Open menu">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
@@ -2035,16 +2104,16 @@ footer {
     </button>
   </div>
   <div class="mobile-menu-links">
-    <a href="#home" data-view="home" class="active">home</a>
-    <a href="#install" data-view="install">install</a>
-    <a href="#protocol" data-view="protocol">about</a>
-    <a href="#status" data-view="status">status</a>
-    <a href="#contributors" data-view="contributors">leaderboard</a>
-    <a href="#contact" data-view="contact">contact</a>
+    <a href="#home" data-view="home" class="active" data-i18n="nav.home">home</a>
+    <a href="#install" data-view="install" data-i18n="nav.install">install</a>
+    <a href="#about" data-view="about" data-i18n="nav.about">about</a>
+    <a href="#status" data-view="status" data-i18n="nav.status">status</a>
+    <a href="#contributors" data-view="contributors" data-i18n="nav.leaderboard">leaderboard</a>
+    <a href="#contact" data-view="contact" data-i18n="nav.contact">contact</a>
   </div>
   <a href="https://github.com/Vxtzq/CrowdGPT" target="_blank" class="mobile-menu-gh" rel="noopener noreferrer">
     <svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.3 3.44 9.8 8.21 11.39.6.11.79-.26.79-.58v-2.23c-3.34.73-4.03-1.42-4.03-1.42-.55-1.39-1.33-1.76-1.33-1.76-1.09-.74.08-.73.08-.73 1.2.08 1.84 1.24 1.84 1.24 1.07 1.83 2.81 1.3 3.49.99.11-.78.42-1.3.76-1.6-2.67-.31-5.47-1.34-5.47-5.93 0-1.31.47-2.38 1.24-3.22-.13-.3-.54-1.52.11-3.18 0 0 1.01-.32 3.3 1.23.96-.27 1.98-.4 3-.4s2.05.13 3.01.4c2.29-1.55 3.3-1.23 3.3-1.23.65 1.66.24 2.88.12 3.18.77.84 1.23 1.91 1.23 3.22 0 4.61-2.8 5.62-5.48 5.92.43.37.82 1.1.82 2.22v3.29c0 .32.19.69.8.58C20.57 21.8 24 17.3 24 12c0-6.63-5.37-12-12-12z"/></svg>
-    Source on GitHub
+    <span data-i18n="brand.source_full">Source on GitHub</span>
   </a>
 </div>
 
@@ -2054,18 +2123,18 @@ footer {
     <div class="container">
       <div class="hero-grid">
         <div class="hero-copy">
-          <h1>AI owned by<span class="em"> everyone</span>.</h1>
-          <p class="hero-sub">
+          <h1 data-i18n-html="home.hero.title">AI owned by<span class="em"> everyone</span>.</h1>
+          <p class="hero-sub" data-i18n="home.hero.sub">
             CrowdGPT is focusing on creating the world's first 0$, datacenterless and 100% open AI. Run the app on your computer, and the AI gets better.
           </p>
           <div class="hero-btns">
             <a class="btn btn-primary" href="#install" data-view="install">
-              Install now
+              <span data-i18n="home.hero.install">Install now</span>
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M5 12h14M12 5l7 7-7 7"/></svg>
             </a>
             <a class="btn btn-hf" href="https://huggingface.co/Vxtzq/Crowd-v1" target="_blank" rel="noopener noreferrer">
               <span class="hf-emoji" aria-hidden="true">🤗</span>
-              View on HuggingFace
+              <span data-i18n="home.hero.hf">View on HuggingFace</span>
             </a>
           </div>
         </div>
@@ -2077,19 +2146,19 @@ footer {
       <div class="stats-strip">
         <div class="stat-item">
           <div class="stat-val" id="home-stat-contributions">—</div>
-          <div class="stat-lbl">Contributions</div>
+          <div class="stat-lbl" data-i18n="home.stat.contributions">Contributions</div>
         </div>
         <div class="stat-item">
           <div class="stat-val" id="home-stat-gpus">—</div>
-          <div class="stat-lbl">GPUs currently active</div>
+          <div class="stat-lbl" data-i18n="home.stat.gpus">GPUs currently active</div>
         </div>
         <div class="stat-item">
           <div class="stat-val" id="home-stat-tokens">—</div>
-          <div class="stat-lbl">Tokens processed</div>
+          <div class="stat-lbl" data-i18n="home.stat.tokens">Tokens processed</div>
         </div>
         <div class="stat-item">
           <div class="stat-val" id="home-stat-loss">—</div>
-          <div class="stat-lbl">Current loss</div>
+          <div class="stat-lbl" data-i18n="home.stat.loss">Current loss</div>
         </div>
       </div>
     </div>
@@ -2100,8 +2169,8 @@ footer {
       <div class="product-grid">
         <div>
           <div class="product-head">
-            <h2>A new paradigm for training AI.</h2>
-            <p>A single company training a frontier model uses thousands of A100s in a datacenter. Most people don't have that hardware. But millions of people have gaming PCs with RTX cards sitting idle. CrowdGPT uses that compute, and the model that gets trained belongs to everyone who helped build it.</p>
+            <h2 data-i18n="home.paradigm.title">A new paradigm for training AI.</h2>
+            <p data-i18n="home.paradigm.body">A single company training a frontier model uses thousands of A100s in a datacenter. Most people don't have that hardware. But millions of people have gaming PCs with RTX cards sitting idle. CrowdGPT uses that compute, and the model that gets trained belongs to everyone who helped build it.</p>
           </div>
           <div class="feature-list">
             <div class="feature-item">
@@ -2113,8 +2182,8 @@ footer {
                 </svg>
               </div>
               <div>
-                <h3>Privacy first.</h3>
-                <p>Your GPU trains on 10MB data chunks streamed from the public CrowdGPT dataset on HuggingFace; a dataset anyone can inspect or contribute to. No personal files, browser history, or local data are ever accessed or transmitted.</p>
+                <h3 data-i18n="home.feature.privacy.title">Privacy first.</h3>
+                <p data-i18n="home.feature.privacy.body">Your GPU trains on 10MB data chunks streamed from the public CrowdGPT dataset on HuggingFace; a dataset anyone can inspect or contribute to. No personal files, browser history, or local data are ever accessed or transmitted.</p>
               </div>
             </div>
             <div class="feature-item">
@@ -2125,8 +2194,8 @@ footer {
                 </svg>
               </div>
               <div>
-                <h3>More ecological.</h3>
-                <p>Trains on consumer GPUs that are already powered on. CrowdGPT requires no new datacenters, no additional hardware manufacturing, which is a huge tradeoff of traditional AI.</p>
+                <h3 data-i18n="home.feature.eco.title">More ecological.</h3>
+                <p data-i18n="home.feature.eco.body">Trains on consumer GPUs that are already powered on. CrowdGPT requires no new datacenters, no additional hardware manufacturing, which is a huge tradeoff of traditional AI.</p>
               </div>
             </div>
             <div class="feature-item">
@@ -2137,25 +2206,25 @@ footer {
                 </svg>
               </div>
               <div>
-                <h3>Transparent.</h3>
-                <p>The client is a single, human-readable Python file that anyone can audit and modify. Model weights are downloadable, 100% free and open on HuggingFace.</p>
+                <h3 data-i18n="home.feature.transparent.title">Transparent.</h3>
+                <p data-i18n="home.feature.transparent.body">The client is a single, human-readable Python file that anyone can audit and modify. Model weights are downloadable, 100% free and open on HuggingFace.</p>
               </div>
             </div>
           </div>
         </div>
         <div class="product-side">
           <div class="note">
-            <div class="note-title">A note on trust</div>
-            <p>The client is a single open-source Python file which is human-readable. It downloads public training data online, trains locally and uploads only the model update. It cannot access your files or compromise your machine.</p>
-            <p>The server is protected too. Every update is validated for size, NaN values and norm bounds before it is cross-validated by peers, and repeat offenders are banned from the project.</p>
-            <p><a href="https://github.com/Vxtzq/CrowdGPT" target="_blank" rel="noopener noreferrer">Read the source</a> before you run it.</p>
+            <div class="note-title" data-i18n="home.trust.title">A note on trust</div>
+            <p data-i18n="home.trust.p1">The client is a single open-source Python file which is human-readable. It downloads public training data online, trains locally and uploads only the model update. It cannot access your files or compromise your machine.</p>
+            <p data-i18n="home.trust.p2">The server is protected too. Every update is validated for size, NaN values and norm bounds before it is cross-validated by peers, and repeat offenders are banned from the project.</p>
+            <p data-i18n-html="home.trust.link_line"><a href="https://github.com/Vxtzq/CrowdGPT" target="_blank" rel="noopener noreferrer">Read the source</a> before you run it.</p>
           </div>
           <div class="cta-card">
-            <h3>Help the project grow.</h3>
-            <p>Every contribution, even the smallest, makes the model better. Run a client, star the repo, or open an issue.</p>
+            <h3 data-i18n="home.cta.title">Help the project grow.</h3>
+            <p data-i18n="home.cta.body">Every contribution, even the smallest, makes the model better. Run a client, star the repo, or open an issue.</p>
             <div class="cta-btns">
-              <a class="btn btn-primary" href="#install" data-view="install">Installation guide <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M5 12h14M12 5l7 7-7 7"/></svg></a>
-              <a class="btn btn-ghost" href="https://github.com/Vxtzq/CrowdGPT" target="_blank" rel="noopener noreferrer"><svg viewBox="0 0 24 24" fill="currentColor" width="17" height="17"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.3 3.44 9.8 8.21 11.39.6.11.79-.26.79-.58v-2.23c-3.34.73-4.03-1.42-4.03-1.42-.55-1.39-1.33-1.76-1.33-1.76-1.09-.74.08-.73.08-.73 1.2.08 1.84 1.24 1.84 1.24 1.07 1.83 2.81 1.3 3.49.99.11-.78.42-1.3.76-1.6-2.67-.31-5.47-1.34-5.47-5.93 0-1.31.47-2.38 1.24-3.22-.13-.3-.54-1.52.11-3.18 0 0 1.01-.32 3.3 1.23.96-.27 1.98-.4 3-.4s2.05.13 3.01.4c2.29-1.55 3.3-1.23 3.3-1.23.65 1.66.24 2.88.12 3.18.77.84 1.23 1.91 1.23 3.22 0 4.61-2.8 5.62-5.48 5.92.43.37.82 1.1.82 2.22v3.29c0 .32.19.69.8.58C20.57 21.8 24 17.3 24 12c0-6.63-5.37-12-12-12z"/></svg> Star on GitHub</a>
+              <a class="btn btn-primary" href="#install" data-view="install"><span data-i18n="home.cta.install">Installation guide</span> <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M5 12h14M12 5l7 7-7 7"/></svg></a>
+              <a class="btn btn-ghost" href="https://github.com/Vxtzq/CrowdGPT" target="_blank" rel="noopener noreferrer"><svg viewBox="0 0 24 24" fill="currentColor" width="17" height="17"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.3 3.44 9.8 8.21 11.39.6.11.79-.26.79-.58v-2.23c-3.34.73-4.03-1.42-4.03-1.42-.55-1.39-1.33-1.76-1.33-1.76-1.09-.74.08-.73.08-.73 1.2.08 1.84 1.24 1.84 1.24 1.07 1.83 2.81 1.3 3.49.99.11-.78.42-1.3.76-1.6-2.67-.31-5.47-1.34-5.47-5.93 0-1.31.47-2.38 1.24-3.22-.13-.3-.54-1.52.11-3.18 0 0 1.01-.32 3.3 1.23.96-.27 1.98-.4 3-.4s2.05.13 3.01.4c2.29-1.55 3.3-1.23 3.3-1.23.65 1.66.24 2.88.12 3.18.77.84 1.23 1.91 1.23 3.22 0 4.61-2.8 5.62-5.48 5.92.43.37.82 1.1.82 2.22v3.29c0 .32.19.69.8.58C20.57 21.8 24 17.3 24 12c0-6.63-5.37-12-12-12z"/></svg> <span data-i18n="home.cta.star">Star on GitHub</span></a>
             </div>
           </div>
         </div>
@@ -2168,25 +2237,25 @@ footer {
 <div id="view-install" class="view">
   <div class="container page-pad">
     <div class="page-head">
-      <div class="crumb">home / install</div>
-      <h1>Install the client</h1>
-      <p>Install everything with one command. Even if you don't have python/git installed.</p>
+      <div class="crumb" data-i18n="install.crumb">home / install</div>
+      <h1 data-i18n="install.h1">Install the client</h1>
+      <p data-i18n="install.sub">Install everything with one command. Even if you don't have python/git installed.</p>
     </div>
 
     <div class="note">
-      <div class="note-title">App requirements</div>
+      <div class="note-title" data-i18n="install.req.title">App requirements</div>
       <ul>
-        <li>~6 GB of free disk space. PyTorch alone is around 2.5 GB.</li>
-        <li>A discrete GPU is strongly recommended. NVIDIA (CUDA), AMD (ROCm / DirectML), Apple Silicon (MPS) and Intel Arc (XPU) are all supported.</li>
-        <li>A stable internet connection for streaming model weights and dataset chunks.</li>
-        <li>CPU-only mode works, but is extremely slow.</li>
+        <li data-i18n="install.req.li1">~6 GB of free disk space. PyTorch alone is around 2.5 GB.</li>
+        <li data-i18n="install.req.li2">A discrete GPU is strongly recommended. NVIDIA (CUDA), AMD (ROCm / DirectML), Apple Silicon (MPS) and Intel Arc (XPU) are all supported.</li>
+        <li data-i18n="install.req.li3">A stable internet connection for streaming model weights and dataset chunks.</li>
+        <li data-i18n="install.req.li4">CPU-only mode works, but is extremely slow.</li>
       </ul>
-      <p>The installer handles everything else: GPU detection, the correct PyTorch wheel, Python and Git if missing, and an isolated virtual environment.</p>
+      <p data-i18n="install.req.foot">The installer handles everything else: GPU detection, the correct PyTorch wheel, Python and Git if missing, and an isolated virtual environment.</p>
     </div>
 
     <div class="install-hero" id="quick-install">
-      <h3>One-line install <span class="badge">Recommended</span></h3>
-      <p>Copy this into your terminal. It downloads the installer, auto-detects your hardware, and starts the client.</p>
+      <h3><span data-i18n="install.hero.title">One-line install</span> <span class="badge" data-i18n="install.hero.badge">Recommended</span></h3>
+      <p data-i18n="install.hero.body">Copy this into your terminal. It downloads the installer, auto-detects your hardware, and starts the client.</p>
 
       <div class="os-tabs">
         <button class="os-tab active" data-os="linux">Linux</button>
@@ -2233,13 +2302,13 @@ footer {
         </div>
       </div>
 
-      <div class="manual-note">
+      <div class="manual-note" data-i18n-html="install.manual">
         Prefer to install manually? <a href="https://github.com/Vxtzq/CrowdGPT#manual-installation" target="_blank" rel="noopener noreferrer">See GitHub →</a>
       </div>
     </div>
 
     <div class="content install-explainer">
-      <h2>How the installer works</h2>
+      <h2 data-i18n="install.how.title">How the installer works</h2>
       <ol>
         <li>
           <span class="step-icon" aria-hidden="true">
@@ -2249,7 +2318,7 @@ footer {
               <path d="M9 1v3M15 1v3M9 20v3M15 20v3M1 9h3M1 15h3M20 9h3M20 15h3"/>
             </svg>
           </span>
-          <div><strong>Detect hardware.</strong> Installs the right dependencies for your Graphics Card.</div>
+          <div><strong data-i18n="install.step1.title">Detect hardware.</strong> <span data-i18n="install.step1.body">Installs the right dependencies for your Graphics Card.</span></div>
         </li>
         <li>
           <span class="step-icon" aria-hidden="true">
@@ -2259,7 +2328,7 @@ footer {
               <path d="M12 15h6"/>
             </svg>
           </span>
-          <div><strong>Install dependencies.</strong> Python and Git are installed if missing, then PyTorch from the correct index and the project's requirements; everything is inside an isolated virtual environment so nothing touches your system Python.</div>
+          <div><strong data-i18n="install.step2.title">Install dependencies.</strong> <span data-i18n="install.step2.body">Python and Git are installed if missing, then PyTorch from the correct index and the project's requirements; everything is inside an isolated virtual environment so nothing touches your system Python.</span></div>
         </li>
         <li>
           <span class="step-icon" aria-hidden="true">
@@ -2267,61 +2336,61 @@ footer {
               <path d="M7 3 L17 3 L22 12 L17 21 L7 21 L2 12 Z"/>
             </svg>
           </span>
-          <div><strong>Launch.</strong> Downloads the model weights from HuggingFace, streams a dataset chunk, and starts training. You can stop at any time.</div>
+          <div><strong data-i18n="install.step3.title">Launch.</strong> <span data-i18n="install.step3.body">Downloads the model weights from HuggingFace, streams a dataset chunk, and starts training. You can stop at any time.</span></div>
         </li>
       </ol>
     </div>
   </div>
 </div>
 
-<!-- ===== PROTOCOL ===== -->
-<div id="view-protocol" class="view">
+<!-- ===== ABOUT ===== -->
+<div id="view-about" class="view">
   <div class="container page-pad">
     <div class="page-head">
-      <div class="crumb">home / about</div>
-      <h1>About - How it works</h1>
-      <p>How CrowdGPT coordinates thousands of independent GPUs to train a single, cohesive language model without insane infrastructure.</p>
+      <div class="crumb" data-i18n="about.crumb">home / about</div>
+      <h1 data-i18n="about.h1">About - How it works</h1>
+      <p data-i18n="about.sub">How CrowdGPT coordinates thousands of independent GPUs to train a single, cohesive language model without insane infrastructure.</p>
     </div>
 
     <div class="content">
-      <h2>1. Task Assignment</h2>
-      <p>When a device connects, the server assigns it a specific data shard (a 10MB chunk of tokenized text from the <a href="https://huggingface.co/datasets/Vxtzq/CrowdGPT" target="_blank" rel="noopener noreferrer">public CrowdGPT dataset</a>) and the current global model weights. The client downloads the weights from HuggingFace and streams the data chunk locally via HTTP Range requests. The dataset is fully open and anyone can contribute to it.</p>
+      <h2 data-i18n="about.s1.title">1. Task Assignment</h2>
+      <p data-i18n="about.s1.body">When a device connects, the server assigns it a specific data shard (a 10MB chunk of tokenized text from the public CrowdGPT dataset) and the current global model weights. The client downloads the weights from HuggingFace and streams the data chunk locally via HTTP Range requests. The dataset is fully open and anyone can contribute to it.</p>
 
-      <h2>2. Local Training</h2>
-      <p>The app performs AI training on the local device. It calculates the path (the "delta") between the base model and the newly trained model. <strong>Nothing is ever accessed on your computer.</strong></p>
+      <h2 data-i18n="about.s2.title">2. Local Training</h2>
+      <p data-i18n="about.s2.body">The app performs AI training on the local device. It calculates the path (the "delta") between the base model and the newly trained model. Nothing is ever accessed on your computer.</p>
 
-      <h2>3. Secure Submission</h2>
-      <p>The app then compresses the update, and sends it back to server for validation:</p>
+      <h2 data-i18n="about.s3.title">3. Secure Submission</h2>
+      <p data-i18n="about.s3.body">The app then compresses the update, and sends it back to server for validation:</p>
       <div class="cap-list">
-        <div class="cap-item"><span class="cap-marker">✓</span><span class="cap-text">Checks for NaN or Inf values in the delta.</span></div>
-        <div class="cap-item"><span class="cap-marker">✓</span><span class="cap-text">Verifies the delta size matches the model architecture exactly.</span></div>
-        <div class="cap-item"><span class="cap-marker">✓</span><span class="cap-text">Ensures the delta norm is within statistically acceptable bounds to prevent poisoning.</span></div>
+        <div class="cap-item"><span class="cap-marker">✓</span><span class="cap-text" data-i18n="about.s3.li1">Checks for NaN or Inf values in the delta.</span></div>
+        <div class="cap-item"><span class="cap-marker">✓</span><span class="cap-text" data-i18n="about.s3.li2">Verifies the delta size matches the model architecture exactly.</span></div>
+        <div class="cap-item"><span class="cap-marker">✓</span><span class="cap-text" data-i18n="about.s3.li3">Ensures the delta norm is within statistically acceptable bounds to prevent poisoning.</span></div>
       </div>
 
-      <h2>4. Aggregation</h2>
-      <p>Valid updates are averaged and applied to the global AI model periodically. Model weights are automatically pushed to HuggingFace for public auditing and usage/testing.</p>
+      <h2 data-i18n="about.s4.title">4. Aggregation</h2>
+      <p data-i18n="about.s4.body">Valid updates are averaged and applied to the global AI model periodically. Model weights are automatically pushed to HuggingFace for public auditing and usage/testing.</p>
     </div>
 
     <div class="stats-grid" style="margin-top: 58px;">
       <div class="stat-cell">
         <div class="val">1B</div>
-        <div class="lbl">Parameters</div>
-        <div class="sub">Dense Transformer</div>
+        <div class="lbl" data-i18n="about.stat.parameters">Parameters</div>
+        <div class="sub" data-i18n="about.stat.parameters.sub">Dense Transformer</div>
       </div>
       <div class="stat-cell">
         <div class="val">151K</div>
-        <div class="lbl">Vocabulary</div>
-        <div class="sub">Qwen3 Tokenizer</div>
+        <div class="lbl" data-i18n="about.stat.vocab">Vocabulary</div>
+        <div class="sub" data-i18n="about.stat.vocab.sub">Qwen3 Tokenizer</div>
       </div>
       <div class="stat-cell">
         <div class="val">24</div>
-        <div class="lbl">Layers</div>
-        <div class="sub">Grouped-Query Attention</div>
+        <div class="lbl" data-i18n="about.stat.layers">Layers</div>
+        <div class="sub" data-i18n="about.stat.layers.sub">Grouped-Query Attention</div>
       </div>
       <div class="stat-cell">
         <div class="val">BF16</div>
-        <div class="lbl">Precision</div>
-        <div class="sub">Native GPU Support</div>
+        <div class="lbl" data-i18n="about.stat.precision">Precision</div>
+        <div class="sub" data-i18n="about.stat.precision.sub">Native GPU Support</div>
       </div>
     </div>
   </div>
@@ -2331,9 +2400,9 @@ footer {
 <div id="view-status" class="view">
   <div class="container page-pad">
     <div class="page-head">
-      <div class="crumb">home / status</div>
+      <div class="crumb" data-i18n="status.crumb">home / status</div>
       <div class="page-head-row">
-        <h1>Network Status</h1>
+        <h1 data-i18n="status.h1">Network Status</h1>
         <div class="health-highlight">
           <div class="health-chip" id="health-chip" data-tooltip="checking…">
             <span class="health-dot pending" id="health-dot"></span>
@@ -2341,41 +2410,41 @@ footer {
           </div>
         </div>
       </div>
-      <p>Real-time metrics of the CrowdGPT federated training network.</p>
+      <p data-i18n="status.sub">Real-time metrics of the CrowdGPT federated training network.</p>
     </div>
 
     <div class="stats-grid">
       <div class="stat-cell">
         <div class="val" id="status-step">—</div>
-        <div class="lbl">Global Step</div>
-        <div class="sub">Total optimizer updates</div>
+        <div class="lbl" data-i18n="status.stat.step">Global Step</div>
+        <div class="sub" data-i18n="status.stat.step.sub">Total optimizer updates</div>
       </div>
       <div class="stat-cell">
         <div class="val" id="status-tokens">—</div>
-        <div class="lbl">Tokens Processed</div>
-        <div class="sub">Across all clients</div>
+        <div class="lbl" data-i18n="status.stat.tokens">Tokens Processed</div>
+        <div class="sub" data-i18n="status.stat.tokens.sub">Across all clients</div>
       </div>
       <div class="stat-cell">
         <div class="val" id="status-clients">—</div>
-        <div class="lbl">Active Clients</div>
-        <div class="sub">Currently training</div>
+        <div class="lbl" data-i18n="status.stat.clients">Active Clients</div>
+        <div class="sub" data-i18n="status.stat.clients.sub">Currently training</div>
       </div>
       <div class="stat-cell">
         <div class="val" id="status-loss">—</div>
-        <div class="lbl">Model Loss</div>
-        <div class="sub">Latest aggregated</div>
+        <div class="lbl" data-i18n="status.stat.loss">Model Loss</div>
+        <div class="sub" data-i18n="status.stat.loss.sub">Latest aggregated</div>
       </div>
     </div>
 
     <div class="content">
-      <h2>What the numbers mean</h2>
+      <h2 data-i18n="status.explainer.title">What the numbers mean</h2>
       <ul>
-        <li><strong>Global Step:</strong> total aggregated optimizer updates applied to the model, across all contributors.</li>
-        <li><strong>Tokens Processed:</strong> cumulative tokens trained on by every GPU in the swarm.</li>
-        <li><strong>Active Clients:</strong> GPUs that have pinged the coordinator in the last 10 minutes.</li>
-        <li><strong>Model Loss:</strong> cross-entropy loss of the most recently aggregated update.</li>
+        <li data-i18n-html="status.explainer.li1"><strong>Global Step:</strong> total aggregated optimizer updates applied to the model, across all contributors.</li>
+        <li data-i18n-html="status.explainer.li2"><strong>Tokens Processed:</strong> cumulative tokens trained on by every GPU in the swarm.</li>
+        <li data-i18n-html="status.explainer.li3"><strong>Active Clients:</strong> GPUs that have pinged the coordinator in the last 10 minutes.</li>
+        <li data-i18n-html="status.explainer.li4"><strong>Model Loss:</strong> cross-entropy loss of the most recently aggregated update.</li>
       </ul>
-      <p>Stats refresh automatically every 15 seconds from the HuggingFace CDN. The global model weights are pushed to HuggingFace every 10 hours after aggregated updates complete.</p>
+      <p data-i18n="status.explainer.foot">Stats refresh automatically every 15 seconds from the HuggingFace CDN. The global model weights are pushed to HuggingFace every 10 hours after aggregated updates complete.</p>
     </div>
   </div>
 </div>
@@ -2384,21 +2453,21 @@ footer {
 <div id="view-contributors" class="view">
   <div class="container page-pad">
     <div class="page-head">
-      <div class="crumb">home / leaderboard</div>
-      <h1>Contributor Leaderboard</h1>
-      <p>The top contributors powering the CrowdGPT training run. Rankings are based on total tokens processed.</p>
+      <div class="crumb" data-i18n="contrib.crumb">home / leaderboard</div>
+      <h1 data-i18n="contrib.h1">Contributor Leaderboard</h1>
+      <p data-i18n="contrib.sub">The top contributors powering the CrowdGPT training run. Rankings are based on total tokens processed.</p>
     </div>
 
     <div class="table-wrap">
       <table class="lb-table">
         <thead>
           <tr>
-            <th style="width: 60px;">Rank</th>
-            <th>Username</th>
-            <th class="right">Tokens</th>
-            <th class="right">Steps</th>
-            <th class="right">Trust Score</th>
-            <th class="right">Submissions</th>
+            <th style="width: 60px;" data-i18n="contrib.th.rank">Rank</th>
+            <th data-i18n="contrib.th.user">Username</th>
+            <th class="right" data-i18n="contrib.th.tokens">Tokens</th>
+            <th class="right" data-i18n="contrib.th.steps">Steps</th>
+            <th class="right" data-i18n="contrib.th.trust">Trust Score</th>
+            <th class="right" data-i18n="contrib.th.subs">Submissions</th>
           </tr>
         </thead>
         <tbody id="lb-body">
@@ -2413,62 +2482,62 @@ footer {
 <div id="view-contact" class="view">
   <div class="container page-pad">
     <div class="page-head">
-      <div class="crumb">home / contact</div>
-      <h1>Get in Touch</h1>
-      <p>Questions, bug reports, or interested in running your own coordinator? Reach out.</p>
+      <div class="crumb" data-i18n="contact.crumb">home / contact</div>
+      <h1 data-i18n="contact.h1">Get in Touch</h1>
+      <p data-i18n="contact.sub">Questions, bug reports, or interested in running your own coordinator? Reach out.</p>
     </div>
 
     <div class="contact-grid">
       <div class="contact-card">
-        <h3>GitHub Issues</h3>
-        <p>The best place to report bugs, request features, or discuss technical details of the federated logic.</p>
+        <h3 data-i18n="contact.card1.title">GitHub Issues</h3>
+        <p data-i18n="contact.card1.body">The best place to report bugs, request features, or discuss technical details of the federated logic.</p>
         <a href="https://github.com/Vxtzq/CrowdGPT/issues" target="_blank" class="link" rel="noopener noreferrer">github.com/Vxtzq/CrowdGPT/issues</a>
       </div>
       <div class="contact-card">
-        <h3>Email</h3>
-        <p>For business inquiries, partnership opportunities, or sensitive security disclosures.</p>
+        <h3 data-i18n="contact.card2.title">Email</h3>
+        <p data-i18n="contact.card2.body">For business inquiries, partnership opportunities, or sensitive security disclosures.</p>
         <a href="mailto:vxtzqmc@gmail.com" class="link">vxtzqmc@gmail.com</a>
       </div>
       <div class="contact-card">
-        <h3>Hosting</h3>
-        <p>The primary coordinator API is proudly hosted and maintained by Xevex.</p>
+        <h3 data-i18n="contact.card3.title">Hosting</h3>
+        <p data-i18n="contact.card3.body">The primary coordinator API is proudly hosted and maintained by Xevex.</p>
         <a href="https://xevex.dev" target="_blank" class="link" rel="noopener noreferrer">xevex.dev</a>
       </div>
       <div class="contact-card">
-        <h3>Model Weights</h3>
-        <p>All trained model checkpoints and configuration files are publicly available on HuggingFace.</p>
+        <h3 data-i18n="contact.card4.title">Model Weights</h3>
+        <p data-i18n="contact.card4.body">All trained model checkpoints and configuration files are publicly available on HuggingFace.</p>
         <a href="https://huggingface.co/Vxtzq/Crowd-v1" target="_blank" class="link" rel="noopener noreferrer">huggingface.co/Vxtzq/Crowd-v1</a>
       </div>
     </div>
 
     <div class="faq">
       <div class="faq-item">
-        <div class="faq-q">Is my data safe when I run the client?</div>
-        <div class="faq-a">Yes. The client streams 10MB chunks from the public CrowdGPT dataset on HuggingFace, a dataset anyone can inspect or contribute to. Your personal files, browser history and any other local data are never accessed or transmitted. Only the mathematical weight delta leaves your machine.</div>
+        <div class="faq-q" data-i18n="contact.faq1.q">Is my data safe when I run the client?</div>
+        <div class="faq-a" data-i18n="contact.faq1.a">Yes. The client streams 10MB chunks from the public CrowdGPT dataset on HuggingFace, a dataset anyone can inspect or contribute to. Your personal files, browser history and any other local data are never accessed or transmitted. Only the mathematical weight delta leaves your machine.</div>
       </div>
       <div class="faq-item">
-        <div class="faq-q">How much disk space do I need?</div>
-        <div class="faq-a">Around 4 GB free. The model weights take about 1.3 GB in bf16, each dataset chunk is only 10 MB and streamed on demand, and local checkpoints for delta computation add about 1.3 GB. The client auto-cleans old checkpoints, so disk usage stays stable over time.</div>
+        <div class="faq-q" data-i18n="contact.faq2.q">How much disk space do I need?</div>
+        <div class="faq-a" data-i18n="contact.faq2.a">Around 4 GB free. The model weights take about 1.3 GB in bf16, each dataset chunk is only 10 MB and streamed on demand, and local checkpoints for delta computation add about 1.3 GB. The client auto-cleans old checkpoints, so disk usage stays stable over time.</div>
       </div>
       <div class="faq-item">
-        <div class="faq-q">Does it work on AMD or Apple Silicon?</div>
-        <div class="faq-a">Yes. NVIDIA GPUs via CUDA are recommended for best performance. AMD GPUs are supported through ROCm on Linux (the installer picks the right ROCm wheel automatically), and on Windows AMD users can either use DirectML or run the Linux installer inside WSL2. Apple Silicon M1, M2 and M3 Macs work via the MPS backend, which is bundled with the standard macOS PyTorch wheel. CPU-only mode is supported but very slow.</div>
+        <div class="faq-q" data-i18n="contact.faq3.q">Does it work on AMD or Apple Silicon?</div>
+        <div class="faq-a" data-i18n="contact.faq3.a">Yes. NVIDIA GPUs via CUDA are recommended for best performance. AMD GPUs are supported through ROCm on Linux (the installer picks the right ROCm wheel automatically), and on Windows AMD users can either use DirectML or run the Linux installer inside WSL2. Apple Silicon M1, M2 and M3 Macs work via the MPS backend, which is bundled with the standard macOS PyTorch wheel. CPU-only mode is supported but very slow.</div>
       </div>
       <div class="faq-item">
-        <div class="faq-q">Do I need to install Python or Git first?</div>
-        <div class="faq-a">No. The installer detects whether Python and Git are present and installs them automatically if they are missing (using your system package manager on Linux, Homebrew or the official installer on macOS, and winget or the official installers on Windows). Everything is installed into an isolated virtual environment so it doesn't affect the rest of your system.</div>
+        <div class="faq-q" data-i18n="contact.faq4.q">Do I need to install Python or Git first?</div>
+        <div class="faq-a" data-i18n="contact.faq4.a">No. The installer detects whether Python and Git are present and installs them automatically if they are missing (using your system package manager on Linux, Homebrew or the official installer on macOS, and winget or the official installers on Windows). Everything is installed into an isolated virtual environment so it doesn't affect the rest of your system.</div>
       </div>
       <div class="faq-item">
-        <div class="faq-q">Why did I used to get the CPU build of PyTorch?</div>
-        <div class="faq-a">The default PyPI wheel for <code>torch</code> is CPU-only on every platform. The previous install instructions used <code>pip install -r requirements.txt</code>, which pulled that CPU wheel even on machines with NVIDIA or AMD GPUs. The new installer explicitly picks the correct index URL (cu124, cu118, rocm6.1, xpu, or cpu) based on your detected hardware, so this can't happen anymore.</div>
+        <div class="faq-q" data-i18n="contact.faq5.q">Why did I used to get the CPU build of PyTorch?</div>
+        <div class="faq-a" data-i18n-html="contact.faq5.a">The default PyPI wheel for <code>torch</code> is CPU-only on every platform. The previous install instructions used <code>pip install -r requirements.txt</code>, which pulled that CPU wheel even on machines with NVIDIA or AMD GPUs. The new installer explicitly picks the correct index URL (cu124, cu118, rocm6.1, xpu, or cpu) based on your detected hardware, so this can't happen anymore.</div>
       </div>
       <div class="faq-item">
-        <div class="faq-q">Can I run this on a CPU?</div>
-        <div class="faq-a">Technically yes, and the installer has a CPU fallback, but it will be extremely slow. The client is optimized for CUDA-enabled NVIDIA GPUs. If no GPU is detected it will fall back to CPU, but contributing meaningful compute will take significantly longer.</div>
+        <div class="faq-q" data-i18n="contact.faq6.q">Can I run this on a CPU?</div>
+        <div class="faq-a" data-i18n="contact.faq6.a">Technically yes, and the installer has a CPU fallback, but it will be extremely slow. The client is optimized for CUDA-enabled NVIDIA GPUs. If no GPU is detected it will fall back to CPU, but contributing meaningful compute will take significantly longer.</div>
       </div>
       <div class="faq-item">
-        <div class="faq-q">How are malicious updates prevented?</div>
-        <div class="faq-a">The coordinator enforces strict validation. Every submitted delta is checked for NaN/Inf values, exact size matching and norm bounds. Updates that deviate too far from expected statistical distributions are rejected, and repeat offenders are temporarily banned by subnet.</div>
+        <div class="faq-q" data-i18n="contact.faq7.q">How are malicious updates prevented?</div>
+        <div class="faq-a" data-i18n="contact.faq7.a">The coordinator enforces strict validation. Every submitted delta is checked for NaN/Inf values, exact size matching and norm bounds. Updates that deviate too far from expected statistical distributions are rejected, and repeat offenders are temporarily banned by subnet.</div>
       </div>
     </div>
   </div>
@@ -2476,11 +2545,11 @@ footer {
 
 <footer>
   <div class="footer-inner">
-    <div>CrowdGPT · MIT License · server.crowdgpt.net proudly hosted by <a href="https://xevex.dev" target="_blank" rel="noopener noreferrer">xevex</a></div>
+    <div data-i18n-html="footer.copy">CrowdGPT · MIT License · server.crowdgpt.net proudly hosted by <a href="https://xevex.dev" target="_blank" rel="noopener noreferrer">xevex</a></div>
     <div class="footer-links">
       <a href="https://github.com/Vxtzq/CrowdGPT" target="_blank" rel="noopener noreferrer">GitHub</a>
-      <a href="https://github.com/Vxtzq/CrowdGPT/tree/main/docs" target="_blank" rel="noopener noreferrer">Docs</a>
-      <a href="mailto:vxtzqmc@gmail.com">Contact</a>
+      <a href="https://github.com/Vxtzq/CrowdGPT/tree/main/docs" target="_blank" rel="noopener noreferrer" data-i18n="footer.docs">Docs</a>
+      <a href="mailto:vxtzqmc@gmail.com" data-i18n="footer.contact">Contact</a>
     </div>
   </div>
 </footer>
@@ -2490,6 +2559,782 @@ const HF_STATUS_URL = 'https://huggingface.co/Vxtzq/Crowd-v1/resolve/main/status
 const HF_LEADERBOARD_URL = 'https://huggingface.co/Vxtzq/Crowd-v1/resolve/main/leaderboard.json';
 const API_BASE = 'https://server.crowdgpt.net';
 
+/* ============================================================
+   TRANSLATIONS
+   ============================================================ */
+const TRANSLATIONS = {
+  en: {
+    'nav.home': 'home',
+    'nav.install': 'install',
+    'nav.about': 'about',
+    'nav.status': 'status',
+    'nav.leaderboard': 'leaderboard',
+    'nav.contact': 'contact',
+    'brand.source': 'source',
+    'brand.source_full': 'Source on GitHub',
+
+    'home.hero.title': 'AI owned by<span class="em"> everyone</span>.',
+    'home.hero.sub': "CrowdGPT is focusing on creating the world's first 0$, datacenterless and 100% open AI. Run the app on your computer, and the AI gets better.",
+    'home.hero.install': 'Install now',
+    'home.hero.hf': 'View on HuggingFace',
+    'home.stat.contributions': 'Contributions',
+    'home.stat.gpus': 'GPUs currently active',
+    'home.stat.tokens': 'Tokens processed',
+    'home.stat.loss': 'Current loss',
+    'home.paradigm.title': 'A new paradigm for training AI.',
+    'home.paradigm.body': "A single company training a frontier model uses thousands of A100s in a datacenter. Most people don't have that hardware. But millions of people have gaming PCs with RTX cards sitting idle. CrowdGPT uses that compute, and the model that gets trained belongs to everyone who helped build it.",
+    'home.feature.privacy.title': 'Privacy first.',
+    'home.feature.privacy.body': 'Your GPU trains on 10MB data chunks streamed from the public CrowdGPT dataset on HuggingFace; a dataset anyone can inspect or contribute to. No personal files, browser history, or local data are ever accessed or transmitted.',
+    'home.feature.eco.title': 'More ecological.',
+    'home.feature.eco.body': 'Trains on consumer GPUs that are already powered on. CrowdGPT requires no new datacenters, no additional hardware manufacturing, which is a huge tradeoff of traditional AI.',
+    'home.feature.transparent.title': 'Transparent.',
+    'home.feature.transparent.body': 'The client is a single, human-readable Python file that anyone can audit and modify. Model weights are downloadable, 100% free and open on HuggingFace.',
+    'home.trust.title': 'A note on trust',
+    'home.trust.p1': 'The client is a single open-source Python file which is human-readable. It downloads public training data online, trains locally and uploads only the model update. It cannot access your files or compromise your machine.',
+    'home.trust.p2': 'The server is protected too. Every update is validated for size, NaN values and norm bounds before it is cross-validated by peers, and repeat offenders are banned from the project.',
+    'home.trust.link_line': '<a href="https://github.com/Vxtzq/CrowdGPT" target="_blank" rel="noopener noreferrer">Read the source</a> before you run it.',
+    'home.cta.title': 'Help the project grow.',
+    'home.cta.body': 'Every contribution, even the smallest, makes the model better. Run a client, star the repo, or open an issue.',
+    'home.cta.install': 'Installation guide',
+    'home.cta.star': 'Star on GitHub',
+
+    'install.crumb': 'home / install',
+    'install.h1': 'Install the client',
+    'install.sub': "Install everything with one command. Even if you don't have python/git installed.",
+    'install.req.title': 'App requirements',
+    'install.req.li1': '~6 GB of free disk space. PyTorch alone is around 2.5 GB.',
+    'install.req.li2': 'A discrete GPU is strongly recommended. NVIDIA (CUDA), AMD (ROCm / DirectML), Apple Silicon (MPS) and Intel Arc (XPU) are all supported.',
+    'install.req.li3': 'A stable internet connection for streaming model weights and dataset chunks.',
+    'install.req.li4': 'CPU-only mode works, but is extremely slow.',
+    'install.req.foot': 'The installer handles everything else: GPU detection, the correct PyTorch wheel, Python and Git if missing, and an isolated virtual environment.',
+    'install.hero.title': 'One-line install',
+    'install.hero.badge': 'Recommended',
+    'install.hero.body': 'Copy this into your terminal. It downloads the installer, auto-detects your hardware, and starts the client.',
+    'install.manual': 'Prefer to install manually? <a href="https://github.com/Vxtzq/CrowdGPT#manual-installation" target="_blank" rel="noopener noreferrer">See GitHub →</a>',
+    'install.how.title': 'How the installer works',
+    'install.step1.title': 'Detect hardware.',
+    'install.step1.body': 'Installs the right dependencies for your Graphics Card.',
+    'install.step2.title': 'Install dependencies.',
+    'install.step2.body': "Python and Git are installed if missing, then PyTorch from the correct index and the project's requirements; everything is inside an isolated virtual environment so nothing touches your system Python.",
+    'install.step3.title': 'Launch.',
+    'install.step3.body': 'Downloads the model weights from HuggingFace, streams a dataset chunk, and starts training. You can stop at any time.',
+
+    'about.crumb': 'home / about',
+    'about.h1': 'About - How it works',
+    'about.sub': 'How CrowdGPT coordinates thousands of independent GPUs to train a single, cohesive language model without insane infrastructure.',
+    'about.s1.title': '1. Task Assignment',
+    'about.s1.body': 'When a device connects, the server assigns it a specific data shard (a 10MB chunk of tokenized text from the public CrowdGPT dataset) and the current global model weights. The client downloads the weights from HuggingFace and streams the data chunk locally via HTTP Range requests. The dataset is fully open and anyone can contribute to it.',
+    'about.s2.title': '2. Local Training',
+    'about.s2.body': 'The app performs AI training on the local device. It calculates the path (the "delta") between the base model and the newly trained model. Nothing is ever accessed on your computer.',
+    'about.s3.title': '3. Secure Submission',
+    'about.s3.body': 'The app then compresses the update, and sends it back to server for validation:',
+    'about.s3.li1': 'Checks for NaN or Inf values in the delta.',
+    'about.s3.li2': 'Verifies the delta size matches the model architecture exactly.',
+    'about.s3.li3': 'Ensures the delta norm is within statistically acceptable bounds to prevent poisoning.',
+    'about.s4.title': '4. Aggregation',
+    'about.s4.body': 'Valid updates are averaged and applied to the global AI model periodically. Model weights are automatically pushed to HuggingFace for public auditing and usage/testing.',
+    'about.stat.parameters': 'Parameters',
+    'about.stat.parameters.sub': 'Dense Transformer',
+    'about.stat.vocab': 'Vocabulary',
+    'about.stat.vocab.sub': 'Qwen3 Tokenizer',
+    'about.stat.layers': 'Layers',
+    'about.stat.layers.sub': 'Grouped-Query Attention',
+    'about.stat.precision': 'Precision',
+    'about.stat.precision.sub': 'Native GPU Support',
+
+    'status.crumb': 'home / status',
+    'status.h1': 'Network Status',
+    'status.sub': 'Real-time metrics of the CrowdGPT federated training network.',
+    'status.stat.step': 'Global Step',
+    'status.stat.step.sub': 'Total optimizer updates',
+    'status.stat.tokens': 'Tokens Processed',
+    'status.stat.tokens.sub': 'Across all clients',
+    'status.stat.clients': 'Active Clients',
+    'status.stat.clients.sub': 'Currently training',
+    'status.stat.loss': 'Model Loss',
+    'status.stat.loss.sub': 'Latest aggregated',
+    'status.explainer.title': 'What the numbers mean',
+    'status.explainer.li1': '<strong>Global Step:</strong> total aggregated optimizer updates applied to the model, across all contributors.',
+    'status.explainer.li2': '<strong>Tokens Processed:</strong> cumulative tokens trained on by every GPU in the swarm.',
+    'status.explainer.li3': '<strong>Active Clients:</strong> GPUs that have pinged the coordinator in the last 10 minutes.',
+    'status.explainer.li4': '<strong>Model Loss:</strong> cross-entropy loss of the most recently aggregated update.',
+    'status.explainer.foot': 'Stats refresh automatically every 15 seconds from the HuggingFace CDN. The global model weights are pushed to HuggingFace every 10 hours after aggregated updates complete.',
+
+    'contrib.crumb': 'home / leaderboard',
+    'contrib.h1': 'Contributor Leaderboard',
+    'contrib.sub': 'The top contributors powering the CrowdGPT training run. Rankings are based on total tokens processed.',
+    'contrib.th.rank': 'Rank',
+    'contrib.th.user': 'Username',
+    'contrib.th.tokens': 'Tokens',
+    'contrib.th.steps': 'Steps',
+    'contrib.th.trust': 'Trust Score',
+    'contrib.th.subs': 'Submissions',
+
+    'contact.crumb': 'home / contact',
+    'contact.h1': 'Get in Touch',
+    'contact.sub': 'Questions, bug reports, or interested in running your own coordinator? Reach out.',
+    'contact.card1.title': 'GitHub Issues',
+    'contact.card1.body': 'The best place to report bugs, request features, or discuss technical details of the federated logic.',
+    'contact.card2.title': 'Email',
+    'contact.card2.body': 'For business inquiries, partnership opportunities, or sensitive security disclosures.',
+    'contact.card3.title': 'Hosting',
+    'contact.card3.body': 'The primary coordinator API is proudly hosted and maintained by Xevex.',
+    'contact.card4.title': 'Model Weights',
+    'contact.card4.body': 'All trained model checkpoints and configuration files are publicly available on HuggingFace.',
+    'contact.faq1.q': 'Is my data safe when I run the client?',
+    'contact.faq1.a': 'Yes. The client streams 10MB chunks from the public CrowdGPT dataset on HuggingFace, a dataset anyone can inspect or contribute to. Your personal files, browser history and any other local data are never accessed or transmitted. Only the mathematical weight delta leaves your machine.',
+    'contact.faq2.q': 'How much disk space do I need?',
+    'contact.faq2.a': 'Around 4 GB free. The model weights take about 1.3 GB in bf16, each dataset chunk is only 10 MB and streamed on demand, and local checkpoints for delta computation add about 1.3 GB. The client auto-cleans old checkpoints, so disk usage stays stable over time.',
+    'contact.faq3.q': 'Does it work on AMD or Apple Silicon?',
+    'contact.faq3.a': 'Yes. NVIDIA GPUs via CUDA are recommended for best performance. AMD GPUs are supported through ROCm on Linux (the installer picks the right ROCm wheel automatically), and on Windows AMD users can either use DirectML or run the Linux installer inside WSL2. Apple Silicon M1, M2 and M3 Macs work via the MPS backend, which is bundled with the standard macOS PyTorch wheel. CPU-only mode is supported but very slow.',
+    'contact.faq4.q': 'Do I need to install Python or Git first?',
+    'contact.faq4.a': "No. The installer detects whether Python and Git are present and installs them automatically if they are missing (using your system package manager on Linux, Homebrew or the official installer on macOS, and winget or the official installers on Windows). Everything is installed into an isolated virtual environment so it doesn't affect the rest of your system.",
+    'contact.faq5.q': 'Why did I used to get the CPU build of PyTorch?',
+    'contact.faq5.a': 'The default PyPI wheel for <code>torch</code> is CPU-only on every platform. The previous install instructions used <code>pip install -r requirements.txt</code>, which pulled that CPU wheel even on machines with NVIDIA or AMD GPUs. The new installer explicitly picks the correct index URL (cu124, cu118, rocm6.1, xpu, or cpu) based on your detected hardware, so this can\'t happen anymore.',
+    'contact.faq6.q': 'Can I run this on a CPU?',
+    'contact.faq6.a': 'Technically yes, and the installer has a CPU fallback, but it will be extremely slow. The client is optimized for CUDA-enabled NVIDIA GPUs. If no GPU is detected it will fall back to CPU, but contributing meaningful compute will take significantly longer.',
+    'contact.faq7.q': 'How are malicious updates prevented?',
+    'contact.faq7.a': 'The coordinator enforces strict validation. Every submitted delta is checked for NaN/Inf values, exact size matching and norm bounds. Updates that deviate too far from expected statistical distributions are rejected, and repeat offenders are temporarily banned by subnet.',
+
+    'footer.copy': 'CrowdGPT · MIT License · server.crowdgpt.net proudly hosted by <a href="https://xevex.dev" target="_blank" rel="noopener noreferrer">xevex</a>',
+    'footer.docs': 'Docs',
+    'footer.contact': 'Contact'
+  },
+
+  fr: {
+    'nav.home': 'accueil',
+    'nav.install': 'installer',
+    'nav.about': 'à propos',
+    'nav.status': 'statut',
+    'nav.leaderboard': 'classement',
+    'nav.contact': 'contact',
+    'brand.source': 'source',
+    'brand.source_full': 'Source sur GitHub',
+
+    'home.hero.title': 'IA détenue par<span class="em"> tout le monde</span>.',
+    'home.hero.sub': "CrowdGPT vise à créer la première IA au monde à 0 $, sans datacenter et 100 % ouverte. Lancez l'application sur votre ordinateur et l'IA s'améliore.",
+    'home.hero.install': 'Installer',
+    'home.hero.hf': 'Voir sur HuggingFace',
+    'home.stat.contributions': 'Contributions',
+    'home.stat.gpus': 'GPU actifs',
+    'home.stat.tokens': 'Tokens traités',
+    'home.stat.loss': 'Perte actuelle',
+    'home.paradigm.title': "Un nouveau paradigme pour entraîner l'IA.",
+    'home.paradigm.body': "Une seule entreprise entraînant un modèle de pointe utilise des milliers d'A100 dans un datacenter. La plupart des gens n'ont pas ce matériel. Mais des millions de personnes ont des PC de gaming avec des cartes RTX inutilisées. CrowdGPT utilise cette puissance, et le modèle entraîné appartient à tous ceux qui ont contribué à le construire.",
+    'home.feature.privacy.title': 'Confidentialité avant tout.',
+    'home.feature.privacy.body': "Votre GPU s'entraîne sur des blocs de 10 Mo diffusés depuis le jeu de données public CrowdGPT sur HuggingFace ; un jeu de données que chacun peut inspecter ou auquel contribuer. Aucun fichier personnel, historique de navigation ou donnée locale n'est jamais consulté ou transmis.",
+    'home.feature.eco.title': 'Plus écologique.',
+    'home.feature.eco.body': "S'entraîne sur des GPU grand public déjà allumés. CrowdGPT ne nécessite aucun nouveau datacenter ni fabrication de matériel supplémentaire, ce qui est un énorme avantage par rapport à l'IA traditionnelle.",
+    'home.feature.transparent.title': 'Transparent.',
+    'home.feature.transparent.body': 'Le client est un unique fichier Python lisible que chacun peut auditer et modifier. Les poids du modèle sont téléchargeables, 100 % gratuits et ouverts sur HuggingFace.',
+    'home.trust.title': 'Une note sur la confiance',
+    'home.trust.p1': "Le client est un unique fichier Python open-source lisible par l'humain. Il télécharge des données d'entraînement publiques, s'entraîne localement et n'envoie que la mise à jour du modèle. Il ne peut pas accéder à vos fichiers ni compromettre votre machine.",
+    'home.trust.p2': "Le serveur est protégé aussi. Chaque mise à jour est validée pour sa taille, ses valeurs NaN et ses bornes de norme avant d'être recoupée par les pairs, et les récidivistes sont bannis du projet.",
+    'home.trust.link_line': '<a href="https://github.com/Vxtzq/CrowdGPT" target="_blank" rel="noopener noreferrer">Lisez le code source</a> avant de le lancer.',
+    'home.cta.title': 'Aidez le projet à grandir.',
+    'home.cta.body': "Chaque contribution, même la plus petite, rend le modèle meilleur. Lancez un client, mettez une étoile au dépôt, ou ouvrez une issue.",
+    'home.cta.install': "Guide d'installation",
+    'home.cta.star': 'Star sur GitHub',
+
+    'install.crumb': 'accueil / installer',
+    'install.h1': 'Installer le client',
+    'install.sub': "Tout s'installe avec une seule commande. Même si vous n'avez pas python/git d'installé.",
+    'install.req.title': "Prérequis de l'application",
+    'install.req.li1': "~6 Go d'espace disque libre. PyTorch seul fait environ 2,5 Go.",
+    'install.req.li2': 'Un GPU dédié est fortement recommandé. NVIDIA (CUDA), AMD (ROCm / DirectML), Apple Silicon (MPS) et Intel Arc (XPU) sont tous pris en charge.',
+    'install.req.li3': 'Une connexion internet stable pour diffuser les poids du modèle et les blocs de données.',
+    'install.req.li4': 'Le mode CPU fonctionne, mais est extrêmement lent.',
+    'install.req.foot': "L'installateur gère tout le reste : détection du GPU, le bon wheel PyTorch, Python et Git s'ils manquent, et un environnement virtuel isolé.",
+    'install.hero.title': 'Installation en une ligne',
+    'install.hero.badge': 'Recommandé',
+    'install.hero.body': "Copiez ceci dans votre terminal. Cela télécharge l'installateur, détecte automatiquement votre matériel et lance le client.",
+    'install.manual': 'Vous préférez installer manuellement ? <a href="https://github.com/Vxtzq/CrowdGPT#manual-installation" target="_blank" rel="noopener noreferrer">Voir sur GitHub →</a>',
+    'install.how.title': "Comment fonctionne l'installateur",
+    'install.step1.title': 'Détecter le matériel.',
+    'install.step1.body': 'Installe les bonnes dépendances pour votre carte graphique.',
+    'install.step2.title': 'Installer les dépendances.',
+    'install.step2.body': "Python et Git sont installés s'ils manquent, puis PyTorch depuis le bon index et les dépendances du projet ; tout est dans un environnement virtuel isolé, donc rien ne touche votre Python système.",
+    'install.step3.title': 'Lancer.',
+    'install.step3.body': "Télécharge les poids du modèle depuis HuggingFace, diffuse un bloc de données et commence l'entraînement. Vous pouvez arrêter à tout moment.",
+
+    'about.crumb': 'accueil / à propos',
+    'about.h1': 'À propos - Comment ça marche',
+    'about.sub': "Comment CrowdGPT coordonne des milliers de GPU indépendants pour entraîner un seul modèle de langage cohérent sans infrastructure démesurée.",
+    'about.s1.title': '1. Attribution des tâches',
+    'about.s1.body': "Quand un appareil se connecte, le serveur lui attribue un fragment de données spécifique (un bloc de 10 Mo de texte tokenisé du jeu de données public CrowdGPT) et les poids actuels du modèle global. Le client télécharge les poids depuis HuggingFace et diffuse le bloc de données localement via des requêtes HTTP Range. Le jeu de données est entièrement ouvert et chacun peut y contribuer.",
+    'about.s2.title': '2. Entraînement local',
+    'about.s2.body': "L'application effectue l'entraînement IA sur l'appareil local. Elle calcule le chemin (le « delta ») entre le modèle de base et le modèle nouvellement entraîné. Rien n'est jamais consulté sur votre ordinateur.",
+    'about.s3.title': '3. Soumission sécurisée',
+    'about.s3.body': "L'application compresse ensuite la mise à jour et la renvoie au serveur pour validation :",
+    'about.s3.li1': 'Vérifie les valeurs NaN ou Inf dans le delta.',
+    'about.s3.li2': "Vérifie que la taille du delta correspond exactement à l'architecture du modèle.",
+    'about.s3.li3': "S'assure que la norme du delta est dans des bornes statistiquement acceptables pour empêcher l'empoisonnement.",
+    'about.s4.title': '4. Agrégation',
+    'about.s4.body': "Les mises à jour valides sont moyennées et appliquées périodiquement au modèle IA global. Les poids du modèle sont automatiquement envoyés vers HuggingFace pour audit public et utilisation/test.",
+    'about.stat.parameters': 'Paramètres',
+    'about.stat.parameters.sub': 'Transformer dense',
+    'about.stat.vocab': 'Vocabulaire',
+    'about.stat.vocab.sub': 'Tokenizer Qwen3',
+    'about.stat.layers': 'Couches',
+    'about.stat.layers.sub': 'Attention à requêtes groupées',
+    'about.stat.precision': 'Précision',
+    'about.stat.precision.sub': 'Support GPU natif',
+
+    'status.crumb': 'accueil / statut',
+    'status.h1': 'Statut du réseau',
+    'status.sub': "Métriques en temps réel du réseau d'entraînement fédéré CrowdGPT.",
+    'status.stat.step': 'Étape globale',
+    'status.stat.step.sub': "Total des mises à jour de l'optimiseur",
+    'status.stat.tokens': 'Tokens traités',
+    'status.stat.tokens.sub': 'Sur tous les clients',
+    'status.stat.clients': 'Clients actifs',
+    'status.stat.clients.sub': "En cours d'entraînement",
+    'status.stat.loss': 'Perte du modèle',
+    'status.stat.loss.sub': 'Dernière agrégation',
+    'status.explainer.title': 'Ce que les chiffres signifient',
+    'status.explainer.li1': "<strong>Étape globale :</strong> total des mises à jour de l'optimiseur appliquées au modèle, tous contributeurs confondus.",
+    'status.explainer.li2': '<strong>Tokens traités :</strong> total cumulé de tokens traités par tous les GPU du réseau.',
+    'status.explainer.li3': '<strong>Clients actifs :</strong> GPU ayant contacté le coordinateur au cours des 10 dernières minutes.',
+    'status.explainer.li4': "<strong>Perte du modèle :</strong> perte d'entropie croisée de la mise à jour agrégée la plus récente.",
+    'status.explainer.foot': "Les statistiques se rafraîchissent automatiquement toutes les 15 secondes depuis le CDN HuggingFace. Les poids du modèle global sont envoyés vers HuggingFace toutes les 10 heures après la fin des mises à jour agrégées.",
+
+    'contrib.crumb': 'accueil / classement',
+    'contrib.h1': 'Classement des contributeurs',
+    'contrib.sub': "Les meilleurs contributeurs qui alimentent l'entraînement de CrowdGPT. Le classement est basé sur le total de tokens traités.",
+    'contrib.th.rank': 'Rang',
+    'contrib.th.user': "Nom d'utilisateur",
+    'contrib.th.tokens': 'Tokens',
+    'contrib.th.steps': 'Étapes',
+    'contrib.th.trust': 'Score de confiance',
+    'contrib.th.subs': 'Soumissions',
+
+    'contact.crumb': 'accueil / contact',
+    'contact.h1': 'Nous contacter',
+    'contact.sub': 'Questions, rapports de bugs, ou envie de lancer votre propre coordinateur ? Écrivez-nous.',
+    'contact.card1.title': 'Issues GitHub',
+    'contact.card1.body': 'Le meilleur endroit pour signaler des bugs, demander des fonctionnalités, ou discuter des détails techniques de la logique fédérée.',
+    'contact.card2.title': 'Email',
+    'contact.card2.body': 'Pour les demandes commerciales, les partenariats, ou les divulgations de sécurité sensibles.',
+    'contact.card3.title': 'Hébergement',
+    'contact.card3.body': "L'API principale du coordinateur est fièrement hébergée et maintenue par Xevex.",
+    'contact.card4.title': 'Poids du modèle',
+    'contact.card4.body': 'Tous les checkpoints entraînés et les fichiers de configuration sont publics sur HuggingFace.',
+    'contact.faq1.q': 'Mes données sont-elles en sécurité quand je lance le client ?',
+    'contact.faq1.a': "Oui. Le client diffuse des blocs de 10 Mo depuis le jeu de données public CrowdGPT sur HuggingFace, un jeu que chacun peut inspecter ou auquel contribuer. Vos fichiers personnels, votre historique de navigation et toute autre donnée locale ne sont jamais consultés ni transmis. Seul le delta mathématique des poids quitte votre machine.",
+    'contact.faq2.q': "De combien d'espace disque ai-je besoin ?",
+    'contact.faq2.a': "Environ 4 Go de libre. Les poids du modèle prennent environ 1,3 Go en bf16, chaque bloc de données ne fait que 10 Mo et est diffusé à la demande, et les checkpoints locaux pour le calcul du delta ajoutent environ 1,3 Go. Le client nettoie automatiquement les anciens checkpoints, donc l'utilisation du disque reste stable.",
+    'contact.faq3.q': 'Est-ce que ça marche sur AMD ou Apple Silicon ?',
+    'contact.faq3.a': "Oui. Les GPU NVIDIA via CUDA sont recommandés pour de meilleures performances. Les GPU AMD sont pris en charge via ROCm sous Linux (l'installateur choisit automatiquement le bon wheel ROCm), et sous Windows les utilisateurs AMD peuvent soit utiliser DirectML, soit exécuter l'installateur Linux dans WSL2. Les Mac Apple Silicon M1, M2 et M3 fonctionnent via le backend MPS, inclus dans le wheel PyTorch macOS standard. Le mode CPU seul est pris en charge mais très lent.",
+    'contact.faq4.q': "Dois-je installer Python ou Git d'abord ?",
+    'contact.faq4.a': "Non. L'installateur détecte la présence de Python et Git et les installe automatiquement s'ils manquent (via le gestionnaire de paquets système sur Linux, Homebrew ou l'installateur officiel sur macOS, et winget ou les installateurs officiels sur Windows). Tout est installé dans un environnement virtuel isolé pour ne pas affecter le reste de votre système.",
+    'contact.faq5.q': 'Pourquoi je recevais la version CPU de PyTorch ?',
+    'contact.faq5.a': "Le wheel PyPI par défaut pour <code>torch</code> est CPU uniquement sur toutes les plateformes. Les précédentes instructions d'installation utilisaient <code>pip install -r requirements.txt</code>, qui récupérait ce wheel CPU même sur les machines avec GPU NVIDIA ou AMD. Le nouvel installateur choisit explicitement la bonne URL d'index (cu124, cu118, rocm6.1, xpu, ou cpu) en fonction du matériel détecté, ce qui ne peut plus se produire.",
+    'contact.faq6.q': 'Puis-je exécuter ceci sur un CPU ?',
+    'contact.faq6.a': "Techniquement oui, et l'installateur a un repli CPU, mais ce sera extrêmement lent. Le client est optimisé pour les GPU NVIDIA compatibles CUDA. Si aucun GPU n'est détecté, il basculera sur CPU, mais contribuer une puissance significative prendra beaucoup plus de temps.",
+    'contact.faq7.q': 'Comment les mises à jour malveillantes sont-elles empêchées ?',
+    'contact.faq7.a': 'Le coordinateur applique une validation stricte. Chaque delta soumis est vérifié pour les valeurs NaN/Inf, la correspondance exacte de taille et les limites de norme. Les mises à jour qui s\'écartent trop des distributions statistiques attendues sont rejetées, et les récidivistes sont temporairement bannis par sous-réseau.',
+
+    'footer.copy': 'CrowdGPT · Licence MIT · server.crowdgpt.net fièrement hébergé par <a href="https://xevex.dev" target="_blank" rel="noopener noreferrer">xevex</a>',
+    'footer.docs': 'Docs',
+    'footer.contact': 'Contact'
+  },
+
+  de: {
+    'nav.home': 'start',
+    'nav.install': 'installieren',
+    'nav.about': 'über',
+    'nav.status': 'status',
+    'nav.leaderboard': 'rangliste',
+    'nav.contact': 'kontakt',
+    'brand.source': 'quelle',
+    'brand.source_full': 'Quelle auf GitHub',
+
+    'home.hero.title': 'KI im Besitz von<span class="em"> allen</span>.',
+    'home.hero.sub': "CrowdGPT will die weltweit erste 0 $, datacenterlose und 100 % offene KI schaffen. Führen Sie die App auf Ihrem Computer aus, und die KI wird besser.",
+    'home.hero.install': 'Jetzt installieren',
+    'home.hero.hf': 'Auf HuggingFace ansehen',
+    'home.stat.contributions': 'Beiträge',
+    'home.stat.gpus': 'Aktive GPUs',
+    'home.stat.tokens': 'Verarbeitete Tokens',
+    'home.stat.loss': 'Aktueller Verlust',
+    'home.paradigm.title': 'Ein neues Paradigma für das KI-Training.',
+    'home.paradigm.body': "Ein einzelnes Unternehmen, das ein Frontier-Modell trainiert, verwendet Tausende von A100 in einem Rechenzentrum. Die meisten Menschen haben diese Hardware nicht. Aber Millionen von Menschen haben Gaming-PCs mit ungenutzten RTX-Karten. CrowdGPT nutzt diese Rechenleistung, und das trainierte Modell gehört allen, die mitgeholfen haben, es aufzubauen.",
+    'home.feature.privacy.title': 'Datenschutz zuerst.',
+    'home.feature.privacy.body': 'Ihre GPU trainiert auf 10 MB großen Datenblöcken, die aus dem öffentlichen CrowdGPT-Datensatz auf HuggingFace gestreamt werden; ein Datensatz, den jeder einsehen oder zu dem jeder beitragen kann. Es werden niemals persönliche Dateien, Browserverlauf oder lokale Daten abgerufen oder übertragen.',
+    'home.feature.eco.title': 'Ökologischer.',
+    'home.feature.eco.body': 'Trainiert auf Consumer-GPUs, die bereits eingeschaltet sind. CrowdGPT benötigt keine neuen Rechenzentren, keine zusätzliche Hardware-Fertigung, was ein enormer Vorteil gegenüber traditioneller KI ist.',
+    'home.feature.transparent.title': 'Transparent.',
+    'home.feature.transparent.body': 'Der Client ist eine einzige, lesbare Python-Datei, die jeder prüfen und ändern kann. Die Modellgewichte sind herunterladbar, 100 % kostenlos und offen auf HuggingFace.',
+    'home.trust.title': 'Ein Hinweis zum Vertrauen',
+    'home.trust.p1': 'Der Client ist eine einzige Open-Source-Python-Datei, die für Menschen lesbar ist. Er lädt öffentliche Trainingsdaten herunter, trainiert lokal und lädt nur das Modell-Update hoch. Er kann nicht auf Ihre Dateien zugreifen oder Ihren Computer kompromittieren.',
+    'home.trust.p2': 'Der Server ist ebenfalls geschützt. Jedes Update wird auf Größe, NaN-Werte und Normgrenzen geprüft, bevor es von Peers gegengeprüft wird. Wiederholungstäter werden vom Projekt ausgeschlossen.',
+    'home.trust.link_line': '<a href="https://github.com/Vxtzq/CrowdGPT" target="_blank" rel="noopener noreferrer">Lesen Sie den Quellcode</a>, bevor Sie ihn ausführen.',
+    'home.cta.title': 'Helfen Sie dem Projekt zu wachsen.',
+    'home.cta.body': 'Jeder Beitrag, auch der kleinste, macht das Modell besser. Betreiben Sie einen Client, geben Sie dem Repo einen Stern oder eröffnen Sie ein Issue.',
+    'home.cta.install': 'Installationsanleitung',
+    'home.cta.star': 'Auf GitHub sternen',
+
+    'install.crumb': 'start / installieren',
+    'install.h1': 'Client installieren',
+    'install.sub': 'Installieren Sie alles mit einem Befehl. Auch wenn Sie Python/Git nicht installiert haben.',
+    'install.req.title': 'App-Anforderungen',
+    'install.req.li1': '~6 GB freier Speicherplatz. PyTorch allein belegt etwa 2,5 GB.',
+    'install.req.li2': 'Eine diskrete GPU wird dringend empfohlen. NVIDIA (CUDA), AMD (ROCm / DirectML), Apple Silicon (MPS) und Intel Arc (XPU) werden alle unterstützt.',
+    'install.req.li3': 'Eine stabile Internetverbindung zum Streamen von Modellgewichten und Datenblöcken.',
+    'install.req.li4': 'CPU-Modus funktioniert, ist aber extrem langsam.',
+    'install.req.foot': 'Der Installer erledigt alles andere: GPU-Erkennung, das richtige PyTorch-Wheel, Python und Git falls fehlend, und eine isolierte virtuelle Umgebung.',
+    'install.hero.title': 'Ein-Zeilen-Installation',
+    'install.hero.badge': 'Empfohlen',
+    'install.hero.body': 'Kopieren Sie dies in Ihr Terminal. Es lädt den Installer herunter, erkennt Ihre Hardware automatisch und startet den Client.',
+    'install.manual': 'Möchten Sie lieber manuell installieren? <a href="https://github.com/Vxtzq/CrowdGPT#manual-installation" target="_blank" rel="noopener noreferrer">Auf GitHub ansehen →</a>',
+    'install.how.title': 'So funktioniert der Installer',
+    'install.step1.title': 'Hardware erkennen.',
+    'install.step1.body': 'Installiert die richtigen Abhängigkeiten für Ihre Grafikkarte.',
+    'install.step2.title': 'Abhängigkeiten installieren.',
+    'install.step2.body': 'Python und Git werden installiert, falls sie fehlen, dann PyTorch vom richtigen Index und die Projektanforderungen; alles befindet sich in einer isolierten virtuellen Umgebung, sodass Ihr System-Python unangetastet bleibt.',
+    'install.step3.title': 'Starten.',
+    'install.step3.body': 'Lädt die Modellgewichte von HuggingFace, streamt einen Datenblock und startet das Training. Sie können jederzeit stoppen.',
+
+    'about.crumb': 'start / über',
+    'about.h1': 'Über - Wie es funktioniert',
+    'about.sub': 'Wie CrowdGPT Tausende unabhängige GPUs koordiniert, um ein einziges, zusammenhängendes Sprachmodell ohne verrückte Infrastruktur zu trainieren.',
+    'about.s1.title': '1. Aufgabenverteilung',
+    'about.s1.body': 'Wenn sich ein Gerät verbindet, weist der Server ihm einen bestimmten Daten-Shard zu (ein 10 MB großer Block tokenisierten Texts aus dem öffentlichen CrowdGPT-Datensatz) und die aktuellen globalen Modellgewichte. Der Client lädt die Gewichte von HuggingFace herunter und streamt den Datenblock lokal über HTTP-Range-Anfragen. Der Datensatz ist vollständig offen und jeder kann dazu beitragen.',
+    'about.s2.title': '2. Lokales Training',
+    'about.s2.body': 'Die App führt das KI-Training auf dem lokalen Gerät durch. Sie berechnet den Pfad (das "Delta") zwischen dem Basismodell und dem neu trainierten Modell. Es wird niemals auf Ihren Computer zugegriffen.',
+    'about.s3.title': '3. Sichere Übermittlung',
+    'about.s3.body': 'Die App komprimiert dann das Update und sendet es zur Validierung an den Server zurück:',
+    'about.s3.li1': 'Prüft auf NaN- oder Inf-Werte im Delta.',
+    'about.s3.li2': 'Überprüft, ob die Delta-Größe genau mit der Modellarchitektur übereinstimmt.',
+    'about.s3.li3': 'Stellt sicher, dass die Delta-Norm innerhalb statistisch akzeptabler Grenzen liegt, um Vergiftung zu verhindern.',
+    'about.s4.title': '4. Aggregation',
+    'about.s4.body': 'Gültige Updates werden gemittelt und periodisch auf das globale KI-Modell angewendet. Modellgewichte werden automatisch für öffentliche Audits und Nutzung/Tests auf HuggingFace hochgeladen.',
+    'about.stat.parameters': 'Parameter',
+    'about.stat.parameters.sub': 'Dichter Transformer',
+    'about.stat.vocab': 'Vokabular',
+    'about.stat.vocab.sub': 'Qwen3-Tokenizer',
+    'about.stat.layers': 'Schichten',
+    'about.stat.layers.sub': 'Grouped-Query-Attention',
+    'about.stat.precision': 'Präzision',
+    'about.stat.precision.sub': 'Native GPU-Unterstützung',
+
+    'status.crumb': 'start / status',
+    'status.h1': 'Netzwerkstatus',
+    'status.sub': 'Echtzeit-Metriken des föderierten Trainingsnetzwerks CrowdGPT.',
+    'status.stat.step': 'Globaler Schritt',
+    'status.stat.step.sub': 'Gesamte Optimizer-Updates',
+    'status.stat.tokens': 'Verarbeitete Tokens',
+    'status.stat.tokens.sub': 'Über alle Clients',
+    'status.stat.clients': 'Aktive Clients',
+    'status.stat.clients.sub': 'Derzeit im Training',
+    'status.stat.loss': 'Modellverlust',
+    'status.stat.loss.sub': 'Letzte Aggregation',
+    'status.explainer.title': 'Was die Zahlen bedeuten',
+    'status.explainer.li1': '<strong>Globaler Schritt:</strong> gesamte aggregierte Optimizer-Updates, die auf das Modell angewendet wurden, über alle Beitragenden hinweg.',
+    'status.explainer.li2': '<strong>Verarbeitete Tokens:</strong> kumulative Tokens, auf denen jede GPU im Schwarm trainiert hat.',
+    'status.explainer.li3': '<strong>Aktive Clients:</strong> GPUs, die den Koordinator in den letzten 10 Minuten kontaktiert haben.',
+    'status.explainer.li4': '<strong>Modellverlust:</strong> Kreuzentropie-Verlust des zuletzt aggregierten Updates.',
+    'status.explainer.foot': 'Die Statistiken aktualisieren sich automatisch alle 15 Sekunden über das HuggingFace-CDN. Die globalen Modellgewichte werden alle 10 Stunden nach Abschluss aggregierter Updates zu HuggingFace hochgeladen.',
+
+    'contrib.crumb': 'start / rangliste',
+    'contrib.h1': 'Beitragsrangliste',
+    'contrib.sub': 'Die Top-Beitragenden, die den CrowdGPT-Trainingslauf antreiben. Das Ranking basiert auf den insgesamt verarbeiteten Tokens.',
+    'contrib.th.rank': 'Rang',
+    'contrib.th.user': 'Benutzername',
+    'contrib.th.tokens': 'Tokens',
+    'contrib.th.steps': 'Schritte',
+    'contrib.th.trust': 'Vertrauenswert',
+    'contrib.th.subs': 'Einreichungen',
+
+    'contact.crumb': 'start / kontakt',
+    'contact.h1': 'Kontakt aufnehmen',
+    'contact.sub': 'Fragen, Fehlerberichte oder Interesse daran, einen eigenen Koordinator zu betreiben? Melden Sie sich.',
+    'contact.card1.title': 'GitHub-Issues',
+    'contact.card1.body': 'Der beste Ort, um Fehler zu melden, Funktionen anzufragen oder technische Details der föderierten Logik zu diskutieren.',
+    'contact.card2.title': 'E-Mail',
+    'contact.card2.body': 'Für Geschäftsanfragen, Partnerschaften oder vertrauliche Sicherheitsmeldungen.',
+    'contact.card3.title': 'Hosting',
+    'contact.card3.body': 'Die primäre Koordinator-API wird stolz von Xevex gehostet und gepflegt.',
+    'contact.card4.title': 'Modellgewichte',
+    'contact.card4.body': 'Alle trainierten Modell-Checkpoints und Konfigurationsdateien sind öffentlich auf HuggingFace verfügbar.',
+    'contact.faq1.q': 'Sind meine Daten sicher, wenn ich den Client ausführe?',
+    'contact.faq1.a': 'Ja. Der Client streamt 10 MB große Blöcke aus dem öffentlichen CrowdGPT-Datensatz auf HuggingFace, einem Datensatz, den jeder einsehen oder zu dem jeder beitragen kann. Ihre persönlichen Dateien, Ihr Browserverlauf und alle anderen lokalen Daten werden niemals abgerufen oder übertragen. Nur das mathematische Gewichts-Delta verlässt Ihre Maschine.',
+    'contact.faq2.q': 'Wie viel Speicherplatz benötige ich?',
+    'contact.faq2.a': 'Etwa 4 GB frei. Die Modellgewichte belegen etwa 1,3 GB in bf16, jeder Datenblock ist nur 10 MB groß und wird bei Bedarf gestreamt, und lokale Checkpoints für die Delta-Berechnung fügen etwa 1,3 GB hinzu. Der Client löscht alte Checkpoints automatisch, sodass die Speichernutzung stabil bleibt.',
+    'contact.faq3.q': 'Funktioniert es auf AMD oder Apple Silicon?',
+    'contact.faq3.a': 'Ja. NVIDIA-GPUs über CUDA werden für die beste Leistung empfohlen. AMD-GPUs werden über ROCm unter Linux unterstützt (der Installer wählt automatisch das richtige ROCm-Wheel), und unter Windows können AMD-Nutzer entweder DirectML verwenden oder den Linux-Installer in WSL2 ausführen. Apple Silicon M1-, M2- und M3-Macs funktionieren über das MPS-Backend, das im standardmäßigen macOS-PyTorch-Wheel enthalten ist. CPU-Modus wird unterstützt, ist aber sehr langsam.',
+    'contact.faq4.q': 'Muss ich zuerst Python oder Git installieren?',
+    'contact.faq4.a': 'Nein. Der Installer erkennt, ob Python und Git vorhanden sind, und installiert sie automatisch, falls sie fehlen (über den System-Paketmanager unter Linux, Homebrew oder den offiziellen Installer unter macOS und winget oder die offiziellen Installer unter Windows). Alles wird in einer isolierten virtuellen Umgebung installiert, sodass der Rest Ihres Systems unberührt bleibt.',
+    'contact.faq5.q': 'Warum bekam ich früher die CPU-Version von PyTorch?',
+    'contact.faq5.a': 'Das Standard-PyPI-Wheel für <code>torch</code> ist auf jeder Plattform nur für CPU. Die früheren Installationsanleitungen verwendeten <code>pip install -r requirements.txt</code>, was auch auf Maschinen mit NVIDIA- oder AMD-GPUs dieses CPU-Wheel zog. Der neue Installer wählt explizit die richtige Index-URL (cu124, cu118, rocm6.1, xpu oder cpu) basierend auf Ihrer erkannten Hardware, sodass dies nicht mehr passieren kann.',
+    'contact.faq6.q': 'Kann ich das auf einer CPU ausführen?',
+    'contact.faq6.a': 'Technisch ja, und der Installer hat einen CPU-Fallback, aber es wird extrem langsam sein. Der Client ist für CUDA-fähige NVIDIA-GPUs optimiert. Wenn keine GPU erkannt wird, fällt er auf CPU zurück, aber sinnvolle Rechenleistung beizutragen dauert deutlich länger.',
+    'contact.faq7.q': 'Wie werden bösartige Updates verhindert?',
+    'contact.faq7.a': 'Der Koordinator erzwingt eine strikte Validierung. Jedes eingereichte Delta wird auf NaN/Inf-Werte, exakte Größenübereinstimmung und Normgrenzen geprüft. Updates, die zu stark von den erwarteten statistischen Verteilungen abweichen, werden abgelehnt, und Wiederholungstäter werden vorübergehend per Subnetz gesperrt.',
+
+    'footer.copy': 'CrowdGPT · MIT-Lizenz · server.crowdgpt.net stolz gehostet von <a href="https://xevex.dev" target="_blank" rel="noopener noreferrer">xevex</a>',
+    'footer.docs': 'Docs',
+    'footer.contact': 'Kontakt'
+  },
+
+  es: {
+    'nav.home': 'inicio',
+    'nav.install': 'instalar',
+    'nav.about': 'acerca de',
+    'nav.status': 'estado',
+    'nav.leaderboard': 'clasificación',
+    'nav.contact': 'contacto',
+    'brand.source': 'código',
+    'brand.source_full': 'Código en GitHub',
+
+    'home.hero.title': 'IA propiedad de<span class="em"> todos</span>.',
+    'home.hero.sub': 'CrowdGPT busca crear la primera IA del mundo a 0 $, sin centros de datos y 100 % abierta. Ejecuta la app en tu ordenador y la IA mejora.',
+    'home.hero.install': 'Instalar ahora',
+    'home.hero.hf': 'Ver en HuggingFace',
+    'home.stat.contributions': 'Contribuciones',
+    'home.stat.gpus': 'GPUs activas',
+    'home.stat.tokens': 'Tokens procesados',
+    'home.stat.loss': 'Pérdida actual',
+    'home.paradigm.title': 'Un nuevo paradigma para entrenar IA.',
+    'home.paradigm.body': 'Una sola empresa entrenando un modelo de frontera usa miles de A100 en un centro de datos. La mayoría de la gente no tiene ese hardware. Pero millones de personas tienen PCs gaming con tarjetas RTX sin usar. CrowdGPT usa esa potencia, y el modelo entrenado pertenece a todos los que ayudaron a construirlo.',
+    'home.feature.privacy.title': 'Privacidad primero.',
+    'home.feature.privacy.body': 'Tu GPU entrena con bloques de 10 MB transmitidos desde el conjunto de datos público CrowdGPT en HuggingFace; un conjunto que cualquiera puede inspeccionar o al que puede contribuir. Nunca se accede ni se transmiten archivos personales, historial del navegador o datos locales.',
+    'home.feature.eco.title': 'Más ecológico.',
+    'home.feature.eco.body': 'Entrena en GPUs de consumo que ya están encendidas. CrowdGPT no requiere nuevos centros de datos ni fabricación adicional de hardware, lo que supone una gran ventaja frente a la IA tradicional.',
+    'home.feature.transparent.title': 'Transparente.',
+    'home.feature.transparent.body': 'El cliente es un único archivo Python legible que cualquiera puede auditar y modificar. Los pesos del modelo son descargables, 100 % gratis y abiertos en HuggingFace.',
+    'home.trust.title': 'Una nota sobre la confianza',
+    'home.trust.p1': 'El cliente es un único archivo Python de código abierto legible por humanos. Descarga datos de entrenamiento públicos, entrena localmente y solo sube la actualización del modelo. No puede acceder a tus archivos ni comprometer tu máquina.',
+    'home.trust.p2': 'El servidor también está protegido. Cada actualización se valida por tamaño, valores NaN y límites de norma antes de ser contrarrestada por pares, y los reincidentes son expulsados del proyecto.',
+    'home.trust.link_line': '<a href="https://github.com/Vxtzq/CrowdGPT" target="_blank" rel="noopener noreferrer">Lee el código fuente</a> antes de ejecutarlo.',
+    'home.cta.title': 'Ayuda al proyecto a crecer.',
+    'home.cta.body': 'Cada contribución, incluso la más pequeña, mejora el modelo. Ejecuta un cliente, dale una estrella al repositorio o abre un issue.',
+    'home.cta.install': 'Guía de instalación',
+    'home.cta.star': 'Star en GitHub',
+
+    'install.crumb': 'inicio / instalar',
+    'install.h1': 'Instalar el cliente',
+    'install.sub': 'Instala todo con un solo comando. Aunque no tengas python/git instalado.',
+    'install.req.title': 'Requisitos de la app',
+    'install.req.li1': '~6 GB de espacio libre. PyTorch solo ocupa unos 2,5 GB.',
+    'install.req.li2': 'Se recomienda encarecidamente una GPU dedicada. NVIDIA (CUDA), AMD (ROCm / DirectML), Apple Silicon (MPS) e Intel Arc (XPU) son compatibles.',
+    'install.req.li3': 'Una conexión a internet estable para transmitir pesos del modelo y bloques de datos.',
+    'install.req.li4': 'El modo solo CPU funciona, pero es extremadamente lento.',
+    'install.req.foot': 'El instalador se encarga del resto: detección de GPU, el wheel de PyTorch correcto, Python y Git si faltan, y un entorno virtual aislado.',
+    'install.hero.title': 'Instalación en una línea',
+    'install.hero.badge': 'Recomendado',
+    'install.hero.body': 'Copia esto en tu terminal. Descarga el instalador, detecta tu hardware automáticamente y arranca el cliente.',
+    'install.manual': '¿Prefieres instalar manualmente? <a href="https://github.com/Vxtzq/CrowdGPT#manual-installation" target="_blank" rel="noopener noreferrer">Ver en GitHub →</a>',
+    'install.how.title': 'Cómo funciona el instalador',
+    'install.step1.title': 'Detectar hardware.',
+    'install.step1.body': 'Instala las dependencias correctas para tu tarjeta gráfica.',
+    'install.step2.title': 'Instalar dependencias.',
+    'install.step2.body': 'Python y Git se instalan si faltan, luego PyTorch desde el índice correcto y los requisitos del proyecto; todo dentro de un entorno virtual aislado para que no toque tu Python del sistema.',
+    'install.step3.title': 'Lanzar.',
+    'install.step3.body': 'Descarga los pesos del modelo desde HuggingFace, transmite un bloque de datos y empieza el entrenamiento. Puedes detenerlo en cualquier momento.',
+
+    'about.crumb': 'inicio / acerca de',
+    'about.h1': 'Acerca de - Cómo funciona',
+    'about.sub': 'Cómo CrowdGPT coordina miles de GPUs independientes para entrenar un único modelo de lenguaje cohesionado sin infraestructura desmesurada.',
+    'about.s1.title': '1. Asignación de tareas',
+    'about.s1.body': 'Cuando un dispositivo se conecta, el servidor le asigna un fragmento de datos específico (un bloque de 10 MB de texto tokenizado del conjunto público CrowdGPT) y los pesos globales actuales del modelo. El cliente descarga los pesos desde HuggingFace y transmite el bloque localmente mediante peticiones HTTP Range. El conjunto de datos es totalmente abierto y cualquiera puede contribuir.',
+    'about.s2.title': '2. Entrenamiento local',
+    'about.s2.body': 'La app realiza el entrenamiento de IA en el dispositivo local. Calcula el camino (el "delta") entre el modelo base y el modelo recién entrenado. Nunca se accede a tu ordenador.',
+    'about.s3.title': '3. Envío seguro',
+    'about.s3.body': 'La app comprime la actualización y la envía de vuelta al servidor para su validación:',
+    'about.s3.li1': 'Comprueba valores NaN o Inf en el delta.',
+    'about.s3.li2': 'Verifica que el tamaño del delta coincide exactamente con la arquitectura del modelo.',
+    'about.s3.li3': 'Asegura que la norma del delta está dentro de límites estadísticamente aceptables para prevenir envenenamiento.',
+    'about.s4.title': '4. Agregación',
+    'about.s4.body': 'Las actualizaciones válidas se promedian y se aplican periódicamente al modelo global de IA. Los pesos se suben automáticamente a HuggingFace para auditoría pública y uso/pruebas.',
+    'about.stat.parameters': 'Parámetros',
+    'about.stat.parameters.sub': 'Transformer denso',
+    'about.stat.vocab': 'Vocabulario',
+    'about.stat.vocab.sub': 'Tokenizer Qwen3',
+    'about.stat.layers': 'Capas',
+    'about.stat.layers.sub': 'Atención de consultas agrupadas',
+    'about.stat.precision': 'Precisión',
+    'about.stat.precision.sub': 'Soporte nativo de GPU',
+
+    'status.crumb': 'inicio / estado',
+    'status.h1': 'Estado de la red',
+    'status.sub': 'Métricas en tiempo real de la red de entrenamiento federado CrowdGPT.',
+    'status.stat.step': 'Paso global',
+    'status.stat.step.sub': 'Actualizaciones totales del optimizador',
+    'status.stat.tokens': 'Tokens procesados',
+    'status.stat.tokens.sub': 'En todos los clientes',
+    'status.stat.clients': 'Clientes activos',
+    'status.stat.clients.sub': 'Entrenando ahora',
+    'status.stat.loss': 'Pérdida del modelo',
+    'status.stat.loss.sub': 'Última agregación',
+    'status.explainer.title': 'Qué significan los números',
+    'status.explainer.li1': '<strong>Paso global:</strong> total de actualizaciones agregadas del optimizador aplicadas al modelo, entre todos los contribuyentes.',
+    'status.explainer.li2': '<strong>Tokens procesados:</strong> total acumulado de tokens entrenados por cada GPU del enjambre.',
+    'status.explainer.li3': '<strong>Clientes activos:</strong> GPUs que han contactado al coordinador en los últimos 10 minutos.',
+    'status.explainer.li4': '<strong>Pérdida del modelo:</strong> pérdida de entropía cruzada de la actualización agregada más reciente.',
+    'status.explainer.foot': 'Las estadísticas se actualizan automáticamente cada 15 segundos desde el CDN de HuggingFace. Los pesos globales del modelo se suben a HuggingFace cada 10 horas tras completarse las actualizaciones agregadas.',
+
+    'contrib.crumb': 'inicio / clasificación',
+    'contrib.h1': 'Clasificación de contribuyentes',
+    'contrib.sub': 'Los principales contribuyentes que impulsan el entrenamiento de CrowdGPT. El ranking se basa en el total de tokens procesados.',
+    'contrib.th.rank': 'Puesto',
+    'contrib.th.user': 'Usuario',
+    'contrib.th.tokens': 'Tokens',
+    'contrib.th.steps': 'Pasos',
+    'contrib.th.trust': 'Puntuación de confianza',
+    'contrib.th.subs': 'Envíos',
+
+    'contact.crumb': 'inicio / contacto',
+    'contact.h1': 'Ponte en contacto',
+    'contact.sub': '¿Preguntas, informes de errores o interés en ejecutar tu propio coordinador? Escríbenos.',
+    'contact.card1.title': 'Issues de GitHub',
+    'contact.card1.body': 'El mejor lugar para reportar errores, pedir funciones o discutir detalles técnicos de la lógica federada.',
+    'contact.card2.title': 'Email',
+    'contact.card2.body': 'Para consultas comerciales, oportunidades de colaboración o divulgaciones de seguridad sensibles.',
+    'contact.card3.title': 'Alojamiento',
+    'contact.card3.body': 'La API principal del coordinador está orgullosamente alojada y mantenida por Xevex.',
+    'contact.card4.title': 'Pesos del modelo',
+    'contact.card4.body': 'Todos los checkpoints entrenados y archivos de configuración están disponibles públicamente en HuggingFace.',
+    'contact.faq1.q': '¿Están seguros mis datos cuando ejecuto el cliente?',
+    'contact.faq1.a': 'Sí. El cliente transmite bloques de 10 MB desde el conjunto de datos público CrowdGPT en HuggingFace, un conjunto que cualquiera puede inspeccionar o al que puede contribuir. Tus archivos personales, el historial del navegador y cualquier otro dato local nunca se consultan ni se transmiten. Solo el delta matemático de los pesos sale de tu máquina.',
+    'contact.faq2.q': '¿Cuánto espacio en disco necesito?',
+    'contact.faq2.a': 'Alrededor de 4 GB libres. Los pesos del modelo ocupan unos 1,3 GB en bf16, cada bloque de datos es de solo 10 MB y se transmite bajo demanda, y los checkpoints locales para el cálculo del delta añaden unos 1,3 GB. El cliente limpia automáticamente los checkpoints antiguos, por lo que el uso de disco se mantiene estable.',
+    'contact.faq3.q': '¿Funciona en AMD o Apple Silicon?',
+    'contact.faq3.a': 'Sí. Las GPUs NVIDIA mediante CUDA son las recomendadas para mejor rendimiento. Las GPUs AMD son compatibles a través de ROCm en Linux (el instalador elige automáticamente el wheel ROCm correcto), y en Windows los usuarios de AMD pueden usar DirectML o ejecutar el instalador de Linux dentro de WSL2. Los Macs con Apple Silicon M1, M2 y M3 funcionan mediante el backend MPS, incluido en el wheel estándar de PyTorch para macOS. El modo solo CPU es compatible pero muy lento.',
+    'contact.faq4.q': '¿Necesito instalar Python o Git primero?',
+    'contact.faq4.a': 'No. El instalador detecta si Python y Git están presentes y los instala automáticamente si faltan (usando el gestor de paquetes del sistema en Linux, Homebrew o el instalador oficial en macOS, y winget o los instaladores oficiales en Windows). Todo se instala en un entorno virtual aislado para no afectar al resto de tu sistema.',
+    'contact.faq5.q': '¿Por qué antes recibía la versión CPU de PyTorch?',
+    'contact.faq5.a': 'El wheel de PyPI por defecto para <code>torch</code> es solo para CPU en todas las plataformas. Las instrucciones de instalación anteriores usaban <code>pip install -r requirements.txt</code>, que descargaba ese wheel de CPU incluso en máquinas con GPUs NVIDIA o AMD. El nuevo instalador elige explícitamente la URL de índice correcta (cu124, cu118, rocm6.1, xpu o cpu) según tu hardware detectado, por lo que esto ya no puede ocurrir.',
+    'contact.faq6.q': '¿Puedo ejecutar esto en una CPU?',
+    'contact.faq6.a': 'Técnicamente sí, y el instalador tiene un respaldo a CPU, pero será extremadamente lento. El cliente está optimizado para GPUs NVIDIA con CUDA. Si no se detecta ninguna GPU, usará la CPU, pero aportar cómputo significativo tardará mucho más.',
+    'contact.faq7.q': '¿Cómo se previenen las actualizaciones maliciosas?',
+    'contact.faq7.a': 'El coordinador aplica una validación estricta. Cada delta enviado se verifica para valores NaN/Inf, coincidencia exacta de tamaño y límites de norma. Las actualizaciones que se desvían demasiado de las distribuciones estadísticas esperadas son rechazadas, y los reincidentes son bloqueados temporalmente por subred.',
+
+    'footer.copy': 'CrowdGPT · Licencia MIT · server.crowdgpt.net orgullosamente alojado por <a href="https://xevex.dev" target="_blank" rel="noopener noreferrer">xevex</a>',
+    'footer.docs': 'Docs',
+    'footer.contact': 'Contacto'
+  },
+
+  tr: {
+    'nav.home': 'ana sayfa',
+    'nav.install': 'kurulum',
+    'nav.about': 'hakkında',
+    'nav.status': 'durum',
+    'nav.leaderboard': 'liderlik',
+    'nav.contact': 'iletişim',
+    'brand.source': 'kaynak',
+    'brand.source_full': "GitHub'da kaynak",
+
+    'home.hero.title': 'Herkesin sahip olduğu<span class="em"> yapay zeka</span>.',
+    'home.hero.sub': "CrowdGPT dünyanın ilk 0 $, veri merkezi olmayan ve %100 açık yapay zekasını oluşturmayı hedefliyor. Uygulamayı bilgisayarınızda çalıştırın, yapay zeka daha iyi olsun.",
+    'home.hero.install': 'Şimdi kur',
+    'home.hero.hf': "HuggingFace'de görüntüle",
+    'home.stat.contributions': 'Katkılar',
+    'home.stat.gpus': 'Aktif GPU sayısı',
+    'home.stat.tokens': 'İşlenen token',
+    'home.stat.loss': 'Mevcut kayıp',
+    'home.paradigm.title': 'Yapay zeka eğitimi için yeni bir paradigma.',
+    'home.paradigm.body': "Sınır modeli eğiten tek bir şirket, bir veri merkezinde binlerce A100 kullanır. Çoğu insanın bu donanımı yok. Ama milyonlarca insanın boşta duran RTX kartları olan oyun bilgisayarları var. CrowdGPT bu gücü kullanır ve eğitilen model, onu inşa etmeye yardım eden herkese aittir.",
+    'home.feature.privacy.title': 'Önce gizlilik.',
+    'home.feature.privacy.body': "GPU'nuz HuggingFace'deki herkese açık CrowdGPT veri setinden akan 10 MB'lık veri parçaları üzerinde eğitilir; herkesin inceleyebileceği veya katkıda bulunabileceği bir veri seti. Kişisel dosyalarınıza, tarayıcı geçmişinize veya yerel verilerinize asla erişilmez veya iletilmez.",
+    'home.feature.eco.title': 'Daha ekolojik.',
+    'home.feature.eco.body': "Zaten açık olan tüketici GPU'larında eğitilir. CrowdGPT yeni veri merkezleri veya ek donanım üretimi gerektirmez — bu, geleneksel yapay zekaya kıyasla büyük bir avantajdır.",
+    'home.feature.transparent.title': 'Şeffaf.',
+    'home.feature.transparent.body': "İstemci, herkesin denetleyebileceği ve değiştirebileceği tek, insan tarafından okunabilir bir Python dosyasıdır. Model ağırlıkları indirilebilir, %100 ücretsiz ve HuggingFace'de açıktır.",
+    'home.trust.title': 'Güven üzerine bir not',
+    'home.trust.p1': "İstemci, insan tarafından okunabilir tek bir açık kaynak Python dosyasıdır. Genel eğitim verilerini indirir, yerel olarak eğitir ve yalnızca model güncellemesini yükler. Dosyalarınıza erişemez veya makinenizi tehlikeye atamaz.",
+    'home.trust.p2': "Sunucu da korunmaktadır. Her güncelleme boyut, NaN değerleri ve norm sınırları açısından doğrulanır, ardından eşler tarafından çapraz kontrol edilir ve tekrarlanan ihlalciler projeden yasaklanır.",
+    'home.trust.link_line': 'Çalıştırmadan önce <a href="https://github.com/Vxtzq/CrowdGPT" target="_blank" rel="noopener noreferrer">kaynağı inceleyin</a>.',
+    'home.cta.title': 'Projenin büyümesine yardım edin.',
+    'home.cta.body': 'Her katkı, en küçüğü bile modeli daha iyi yapar. Bir istemci çalıştırın, depoya yıldız verin veya bir issue açın.',
+    'home.cta.install': 'Kurulum rehberi',
+    'home.cta.star': "GitHub'da yıldızla",
+
+    'install.crumb': 'ana sayfa / kurulum',
+    'install.h1': 'İstemciyi kur',
+    'install.sub': 'Her şeyi tek bir komutla kurun. Python/git kurulu olmasa bile.',
+    'install.req.title': 'Uygulama gereksinimleri',
+    'install.req.li1': '~6 GB boş disk alanı. Yalnızca PyTorch yaklaşık 2,5 GB.',
+    'install.req.li2': 'Ayrık bir GPU şiddetle önerilir. NVIDIA (CUDA), AMD (ROCm / DirectML), Apple Silicon (MPS) ve Intel Arc (XPU) desteklenir.',
+    'install.req.li3': 'Model ağırlıklarını ve veri parçalarını akıtmak için kararlı bir internet bağlantısı.',
+    'install.req.li4': 'Yalnızca CPU modu çalışır, ancak son derece yavaştır.',
+    'install.req.foot': 'Kurulum geri kalan her şeyi halleder: GPU algılama, doğru PyTorch tekerleği, eksikse Python ve Git, ve izole bir sanal ortam.',
+    'install.hero.title': 'Tek satırlık kurulum',
+    'install.hero.badge': 'Önerilen',
+    'install.hero.body': 'Bunu terminalinize yapıştırın. Kurulumu indirir, donanımınızı otomatik algılar ve istemciyi başlatır.',
+    'install.manual': 'Manuel kurulumu mu tercih edersiniz? <a href="https://github.com/Vxtzq/CrowdGPT#manual-installation" target="_blank" rel="noopener noreferrer">GitHub\'da görün →</a>',
+    'install.how.title': 'Kurulum nasıl çalışır',
+    'install.step1.title': 'Donanımı algıla.',
+    'install.step1.body': 'Ekran kartınız için doğru bağımlılıkları yükler.',
+    'install.step2.title': 'Bağımlılıkları yükle.',
+    'install.step2.body': "Python ve Git eksikse kurulur, ardından PyTorch doğru dizinden ve proje gereksinimleri; her şey izole bir sanal ortamda, böylece sistem Python'unuza dokunulmaz.",
+    'install.step3.title': 'Başlat.',
+    'install.step3.body': "Model ağırlıklarını HuggingFace'den indirir, bir veri parçası akıtır ve eğitime başlar. İstediğiniz zaman durdurabilirsiniz.",
+
+    'about.crumb': 'ana sayfa / hakkında',
+    'about.h1': 'Hakkında - Nasıl çalışır',
+    'about.sub': "CrowdGPT'nin binlerce bağımsız GPU'yu tek bir tutarlı dil modeli eğitmek için nasıl koordine ettiği.",
+    'about.s1.title': '1. Görev Ataması',
+    'about.s1.body': "Bir cihaz bağlandığında, sunucu ona belirli bir veri parçası (herkese açık CrowdGPT veri setinden 10 MB'lık tokenleştirilmiş metin parçası) ve mevcut küresel model ağırlıklarını atar. İstemci ağırlıkları HuggingFace'den indirir ve veri parçasını HTTP Range istekleriyle yerel olarak akıtır. Veri seti tamamen açıktır ve herkes katkıda bulunabilir.",
+    'about.s2.title': '2. Yerel Eğitim',
+    'about.s2.body': 'Uygulama, yapay zeka eğitimini yerel cihazda gerçekleştirir. Temel model ile yeni eğitilen model arasındaki yolu ("delta") hesaplar. Bilgisayarınızdaki hiçbir şeye asla erişilmez.',
+    'about.s3.title': '3. Güvenli Gönderim',
+    'about.s3.body': 'Uygulama güncellemeyi sıkıştırır ve doğrulama için sunucuya geri gönderir:',
+    'about.s3.li1': 'Deltadaki NaN veya Inf değerlerini kontrol eder.',
+    'about.s3.li2': 'Delta boyutunun model mimarisiyle tam olarak eşleştiğini doğrular.',
+    'about.s3.li3': 'Zehirlenmeyi önlemek için delta normunun istatistiksel olarak kabul edilebilir sınırlar içinde olduğundan emin olur.',
+    'about.s4.title': '4. Birleştirme',
+    'about.s4.body': "Geçerli güncellemeler ortalanır ve periyodik olarak küresel yapay zeka modeline uygulanır. Model ağırlıkları, herkese açık denetim ve kullanım/test için otomatik olarak HuggingFace'e gönderilir.",
+    'about.stat.parameters': 'Parametreler',
+    'about.stat.parameters.sub': 'Yoğun Transformer',
+    'about.stat.vocab': 'Kelime dağarcığı',
+    'about.stat.vocab.sub': 'Qwen3 Tokenizer',
+    'about.stat.layers': 'Katmanlar',
+    'about.stat.layers.sub': 'Gruplu Sorgu Dikkati',
+    'about.stat.precision': 'Hassasiyet',
+    'about.stat.precision.sub': 'Yerel GPU Desteği',
+
+    'status.crumb': 'ana sayfa / durum',
+    'status.h1': 'Ağ Durumu',
+    'status.sub': 'CrowdGPT federe eğitim ağının gerçek zamanlı metrikleri.',
+    'status.stat.step': 'Küresel Adım',
+    'status.stat.step.sub': 'Toplam optimize edici güncellemeleri',
+    'status.stat.tokens': 'İşlenen Token',
+    'status.stat.tokens.sub': 'Tüm istemciler genelinde',
+    'status.stat.clients': 'Aktif İstemciler',
+    'status.stat.clients.sub': 'Şu anda eğitimde',
+    'status.stat.loss': 'Model Kaybı',
+    'status.stat.loss.sub': 'En son birleştirilen',
+    'status.explainer.title': 'Sayılar ne anlama geliyor',
+    'status.explainer.li1': '<strong>Küresel Adım:</strong> tüm katkıda bulunanlar genelinde modele uygulanan toplam birleştirilmiş optimize edici güncellemeleri.',
+    'status.explainer.li2': '<strong>İşlenen Token:</strong> sürüdeki her GPU tarafından eğitilen kümülatif token sayısı.',
+    'status.explainer.li3': '<strong>Aktif İstemciler:</strong> son 10 dakika içinde koordinatöre ping atan GPU\'lar.',
+    'status.explainer.li4': '<strong>Model Kaybı:</strong> en son birleştirilmiş güncellemenin çapraz entropi kaybı.',
+    'status.explainer.foot': "İstatistikler HuggingFace CDN'inden her 15 saniyede bir otomatik yenilenir. Küresel model ağırlıkları, birleştirilmiş güncellemeler tamamlandıktan sonra her 10 saatte bir HuggingFace'e gönderilir.",
+
+    'contrib.crumb': 'ana sayfa / liderlik',
+    'contrib.h1': 'Katkıda Bulunan Liderlik Tablosu',
+    'contrib.sub': 'CrowdGPT eğitimini güçlendiren en iyi katkıda bulunanlar. Sıralama, işlenen toplam token sayısına dayanır.',
+    'contrib.th.rank': 'Sıra',
+    'contrib.th.user': 'Kullanıcı adı',
+    'contrib.th.tokens': 'Token',
+    'contrib.th.steps': 'Adımlar',
+    'contrib.th.trust': 'Güven Puanı',
+    'contrib.th.subs': 'Gönderimler',
+
+    'contact.crumb': 'ana sayfa / iletişim',
+    'contact.h1': 'İletişime Geçin',
+    'contact.sub': 'Sorular, hata raporları veya kendi koordinatörünüzü çalıştırmak mı istiyorsunuz? Bize ulaşın.',
+    'contact.card1.title': 'GitHub Issues',
+    'contact.card1.body': 'Hata bildirmek, özellik istemek veya federe mantığın teknik detaylarını tartışmak için en iyi yer.',
+    'contact.card2.title': 'E-posta',
+    'contact.card2.body': 'İş soruları, ortaklık fırsatları veya hassas güvenlik bildirimleri için.',
+    'contact.card3.title': 'Barındırma',
+    'contact.card3.body': "Birincil koordinatör API'si gururla Xevex tarafından barındırılır ve sürdürülür.",
+    'contact.card4.title': 'Model Ağırlıkları',
+    'contact.card4.body': "Eğitilmiş tüm model kontrol noktaları ve yapılandırma dosyaları HuggingFace'de herkese açık.",
+    'contact.faq1.q': 'İstemciyi çalıştırdığımda verilerim güvende mi?',
+    'contact.faq1.a': "Evet. İstemci, HuggingFace'deki herkese açık CrowdGPT veri setinden 10 MB'lık parçalar akıtır — herkesin inceleyebileceği veya katkıda bulunabileceği bir veri seti. Kişisel dosyalarınıza, tarayıcı geçmişinize veya başka bir yerel verinize asla erişilmez veya iletilmez. Makinenizden yalnızca matematiksel ağırlık deltası çıkar.",
+    'contact.faq2.q': 'Ne kadar disk alanına ihtiyacım var?',
+    'contact.faq2.a': "Yaklaşık 4 GB boş alan. Model ağırlıkları bf16'da yaklaşık 1,3 GB yer kaplar, her veri parçası yalnızca 10 MB'dır ve talep üzerine akıtılır, delta hesaplaması için yerel kontrol noktaları ise yaklaşık 1,3 GB ekler. İstemci eski kontrol noktalarını otomatik temizler, böylece disk kullanımı zaman içinde sabit kalır.",
+    'contact.faq3.q': 'AMD veya Apple Silicon üzerinde çalışır mı?',
+    'contact.faq3.a': "Evet. En iyi performans için CUDA üzerinden NVIDIA GPU'lar önerilir. AMD GPU'lar Linux'ta ROCm üzerinden desteklenir (kurulum doğru ROCm tekerleğini otomatik seçer) ve Windows'ta AMD kullanıcıları ya DirectML kullanabilir ya da WSL2 içinde Linux kurulumunu çalıştırabilir. Apple Silicon M1, M2 ve M3 Mac'ler standart macOS PyTorch tekerleğiyle birlikte gelen MPS arka ucu üzerinden çalışır. Yalnızca CPU modu desteklenir ama çok yavaştır.",
+    'contact.faq4.q': 'Önce Python veya Git yüklemem gerekiyor mu?',
+    'contact.faq4.a': "Hayır. Kurulum Python ve Git'in mevcut olup olmadığını algılar ve eksiklerse otomatik yükler (Linux'ta sistem paket yöneticisi, macOS'ta Homebrew veya resmi yükleyici, Windows'ta winget veya resmi yükleyiciler kullanılarak). Her şey izole bir sanal ortama yüklenir, böylece sisteminizin geri kalanı etkilenmez.",
+    'contact.faq5.q': 'Neden eskiden PyTorch\'un CPU sürümünü alıyordum?',
+    'contact.faq5.a': "<code>torch</code> için varsayılan PyPI tekerleği tüm platformlarda yalnızca CPU içindir. Önceki kurulum yönergeleri <code>pip install -r requirements.txt</code> kullanıyordu ve bu, NVIDIA veya AMD GPU'lu makinelerde bile CPU tekerleğini çekiyordu. Yeni kurulum, algılanan donanımınıza göre doğru dizin URL'sini (cu124, cu118, rocm6.1, xpu veya cpu) açıkça seçer, dolayısıyla bu bir daha olamaz.",
+    'contact.faq6.q': 'Bunu bir CPU üzerinde çalıştırabilir miyim?',
+    'contact.faq6.a': "Teknik olarak evet, kurulumun bir CPU yedeği var, ama son derece yavaş olacaktır. İstemci CUDA destekli NVIDIA GPU'lar için optimize edilmiştir. GPU algılanmazsa CPU'ya düşer, ancak anlamlı hesaplama katkısı sağlamak çok daha uzun sürer.",
+    'contact.faq7.q': 'Kötü niyetli güncellemeler nasıl önlenir?',
+    'contact.faq7.a': 'Koordinatör katı bir doğrulama uygular. Gönderilen her delta NaN/Inf değerleri, tam boyut eşleşmesi ve norm sınırları açısından kontrol edilir. Beklenen istatistiksel dağılımlardan çok sapan güncellemeler reddedilir ve tekrarlanan ihlalciler alt ağ tarafından geçici olarak yasaklanır.',
+
+    'footer.copy': 'CrowdGPT · MIT Lisansı · server.crowdgpt.net gururla <a href="https://xevex.dev" target="_blank" rel="noopener noreferrer">xevex</a> tarafından barındırılıyor',
+    'footer.docs': 'Docs',
+    'footer.contact': 'İletişim'
+  }
+};
+
+const LANG_FLAGS = { en: '🇬🇧', fr: '🇫🇷', de: '🇩🇪', es: '🇪🇸', tr: '🇹🇷' };
+
+let currentLang = 'en';
+
+/* ===== TRANSLATION ENGINE ===== */
+function detectInitialLang() {
+  const saved = localStorage.getItem('crowdgpt-lang');
+  if (saved && TRANSLATIONS[saved]) return saved;
+  const browser = (navigator.language || 'en').toLowerCase().split('-')[0];
+  if (TRANSLATIONS[browser]) return browser;
+  return 'en';
+}
+
+function applyTranslations() {
+  const dict = TRANSLATIONS[currentLang] || TRANSLATIONS.en;
+
+  document.querySelectorAll('[data-i18n]').forEach(el => {
+    const key = el.getAttribute('data-i18n');
+    if (dict[key] != null) el.textContent = dict[key];
+  });
+
+  document.querySelectorAll('[data-i18n-html]').forEach(el => {
+    const key = el.getAttribute('data-i18n-html');
+    if (dict[key] != null) el.innerHTML = dict[key];
+  });
+
+  document.documentElement.lang = currentLang;
+
+  const flagEl = document.getElementById('lang-flag');
+  if (flagEl) flagEl.textContent = LANG_FLAGS[currentLang] || '🇬🇧';
+
+  document.querySelectorAll('.lang-item').forEach(item => {
+    const isActive = item.dataset.lang === currentLang;
+    item.classList.toggle('active', isActive);
+    item.setAttribute('aria-selected', isActive ? 'true' : 'false');
+  });
+}
+
+function setLanguage(lang) {
+  if (!TRANSLATIONS[lang]) return;
+  currentLang = lang;
+  try { localStorage.setItem('crowdgpt-lang', lang); } catch (e) {}
+  applyTranslations();
+}
+
+/* ===== LANGUAGE DROPDOWN ===== */
+const langSelect = document.getElementById('lang-select');
+const langBtn = document.getElementById('lang-btn');
+
+if (langSelect && langBtn) {
+  langBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    const isOpen = langSelect.classList.toggle('open');
+    langBtn.setAttribute('aria-expanded', isOpen ? 'true' : 'false');
+  });
+
+  langSelect.querySelectorAll('.lang-item').forEach(item => {
+    item.addEventListener('click', (e) => {
+      e.stopPropagation();
+      setLanguage(item.dataset.lang);
+      langSelect.classList.remove('open');
+      langBtn.setAttribute('aria-expanded', 'false');
+    });
+  });
+
+  document.addEventListener('click', () => {
+    if (langSelect.classList.contains('open')) {
+      langSelect.classList.remove('open');
+      langBtn.setAttribute('aria-expanded', 'false');
+    }
+  });
+
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && langSelect.classList.contains('open')) {
+      langSelect.classList.remove('open');
+      langBtn.setAttribute('aria-expanded', 'false');
+    }
+  });
+}
+
+/* ===== STATUS / LEADERBOARD FETCHING ===== */
 function fmtNum(n) {
   if (n == null || isNaN(n)) return '—';
   if (n >= 1e12) return (n / 1e12).toFixed(2) + 'T';
@@ -2615,7 +3460,7 @@ function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
 
-// ===== HEALTH CHIP =====
+/* ===== HEALTH CHIP ===== */
 const healthState = {
   display: 'pending',
   consecutiveOk: 0,
@@ -2720,6 +3565,7 @@ renderHealth();
 checkHealth();
 setInterval(checkHealth, 30000);
 
+/* ===== THEME ASSETS ===== */
 function updateThemeAssets() {
   const logoImgs = Array.from(document.querySelectorAll('.logo-img')).filter(img => !img.closest('.header-measure'));
   const favicon = document.getElementById('favicon');
@@ -2729,7 +3575,7 @@ function updateThemeAssets() {
 }
 window.matchMedia('(prefers-color-scheme: light)').addEventListener('change', updateThemeAssets);
 
-// ===== HEADER OVERFLOW -> HAMBURGER MODE =====
+/* ===== HEADER OVERFLOW -> HAMBURGER MODE ===== */
 function createHeaderMeasure() {
   const header = document.querySelector('header');
   const inner = header?.querySelector('.header-inner');
@@ -2781,8 +3627,8 @@ if (document.fonts && document.fonts.ready) {
   document.fonts.ready.then(updateHeaderMode);
 }
 
-// ===== HASH ROUTER =====
-const VIEWS = ['home', 'install', 'protocol', 'status', 'contributors', 'contact'];
+/* ===== HASH ROUTER ===== */
+const VIEWS = ['home', 'install', 'about', 'status', 'contributors', 'contact'];
 const DEFAULT_VIEW = 'home';
 
 function getViewFromHash() {
@@ -2804,7 +3650,6 @@ function applyView(view) {
     a.classList.toggle('active', a.dataset.view === view);
   });
 
-  // Jump to top without triggering smooth-scroll animation
   const html = document.documentElement;
   const prev = html.style.scrollBehavior;
   html.style.scrollBehavior = 'auto';
@@ -2818,17 +3663,15 @@ function navigate(view) {
   if (current === view) {
     applyView(view);
   } else {
-    location.hash = view; // triggers hashchange -> applyView
+    location.hash = view;
   }
 }
 
-// Intercept clicks on anything with [data-view]
 document.querySelectorAll('[data-view]').forEach(el => {
   el.addEventListener('click', (e) => {
     const view = el.dataset.view;
     if (!view || !VIEWS.includes(view)) return;
 
-    // Let external links pass through
     const href = el.getAttribute('href');
     if (href && !href.startsWith('#')) return;
 
@@ -2853,7 +3696,6 @@ document.querySelectorAll('[data-view]').forEach(el => {
   });
 });
 
-// Keyboard support for role=link divs (logo)
 document.querySelectorAll('div[role="link"][data-view]').forEach(el => {
   el.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' || e.key === ' ') {
@@ -2867,13 +3709,12 @@ window.addEventListener('hashchange', () => {
   applyView(getViewFromHash());
 });
 
-// Normalize initial URL: add #home if no hash is present
 if (!location.hash) {
   history.replaceState(null, '', '#home');
 }
 applyView(getViewFromHash());
 
-// ===== MOBILE MENU =====
+/* ===== MOBILE MENU ===== */
 const mobileMenuBtn = document.querySelector('.mobile-menu-btn');
 const mobileMenuOverlay = document.querySelector('.mobile-menu-overlay');
 const mobileMenuClose = document.querySelector('.mobile-menu-close');
@@ -2899,7 +3740,7 @@ document.addEventListener('keydown', (e) => {
   }
 });
 
-// ===== OS TABS =====
+/* ===== OS TABS ===== */
 document.querySelectorAll('.os-tabs').forEach(group => {
   group.querySelectorAll('.os-tab').forEach(tab => {
     tab.addEventListener('click', () => {
@@ -2913,7 +3754,7 @@ document.querySelectorAll('.os-tabs').forEach(group => {
   });
 });
 
-// ===== TERMINAL COPY =====
+/* ===== TERMINAL COPY ===== */
 function copyTerminal(btn) {
   const terminal = btn.closest('.terminal');
   const cmds = terminal.querySelectorAll('.t-cmd');
@@ -2932,7 +3773,10 @@ function copyTerminal(btn) {
   });
 }
 
-// ===== INIT =====
+/* ===== INIT ===== */
+currentLang = detectInitialLang();
+applyTranslations();
+
 fetchStats();
 fetchLeaderboard();
 statsInterval = setInterval(fetchStats, 15000);

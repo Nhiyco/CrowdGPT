@@ -1,12 +1,9 @@
 #!/usr/bin/env python3
 """
-CrowdGPT GUI Client — HF weights + chunked upload edition.
-
-Weight source of truth: HuggingFace (via metadata from /fl/task?skip_weights=true).
-Delta upload: chunked (50 MB/chunk) with per-chunk SHA-256 and retries,
-compatible with Cloudflare tunnels (100 MB response cap).
+CrowdGPT GUI Client
 """
-import os, sys, io, json, time, struct, math, gc, threading, base64, logging, tempfile, atexit, subprocess, hashlib
+
+import os, sys, io, json, time, struct, math, gc, threading, base64, logging, tempfile, atexit, subprocess, hashlib, shutil
 from pathlib import Path
 import webview
 import numpy as np
@@ -20,18 +17,160 @@ from requests.exceptions import ChunkedEncodingError
 import gzip
 
 logging.getLogger("pywebview").setLevel(logging.CRITICAL)
+
 os.environ['PYTORCH_ALLOC_CONF'] = 'expandable_segments:True'
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
 sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s', datefmt='%H:%M:%S')
 log = logging.getLogger(__name__)
 
+# ============ AUTO-UPDATE ============
+CLIENT_VERSION = "0.5"   # bump alongside docs/version.txt to release an update
+VERSION_URL = "https://raw.githubusercontent.com/Vxtzq/CrowdGPT/main/docs/version.txt"
+CLIENT_URL  = "https://raw.githubusercontent.com/Vxtzq/CrowdGPT/main/client.py"
+UPDATE_TIMEOUT_VERSION = 5     # seconds for version.txt fetch
+UPDATE_TIMEOUT_CLIENT  = 60    # seconds for client.py fetch
+UPDATE_CHECK_BETWEEN_ROUNDS = True
+
+
+def _parse_version(v):
+    """'0.5' -> (0,5), '1.2.3-beta' -> (1,2,3), garbage -> (0,)"""
+    try:
+        parts = str(v).strip().split("-")[0].split(".")
+        return tuple(int(x) for x in parts[:4])
+    except Exception:
+        return (0,)
+
+
+def _fetch_remote_version():
+    try:
+        r = requests.get(VERSION_URL, timeout=UPDATE_TIMEOUT_VERSION)
+        r.raise_for_status()
+        line = r.text.strip().splitlines()[0].strip()
+        return line or None
+    except Exception as e:
+        log.info(f"Version check skipped: {e}")
+        return None
+
+
+def _download_new_client(expected_version):
+    try:
+        r = requests.get(CLIENT_URL, timeout=UPDATE_TIMEOUT_CLIENT)
+        r.raise_for_status()
+        code = r.text
+    except Exception as e:
+        log.warning(f"client.py download failed: {e}")
+        return None
+
+    # Sanity 1: it must be valid Python
+    try:
+        compile(code, "client.py", "exec")
+    except SyntaxError as e:
+        log.warning(f"Downloaded client.py failed syntax check: {e}")
+        return None
+
+    # Sanity 2: it must declare the version we expected from version.txt
+    markers = [
+        f'CLIENT_VERSION = "{expected_version}"',
+        f"CLIENT_VERSION = '{expected_version}'",
+    ]
+    if not any(m in code for m in markers):
+        log.warning(f"Downloaded client.py does not declare version {expected_version}")
+        return None
+
+    return code
+
+
+def _apply_update(new_code):
+    """Atomically replace the running client.py. Keeps a .bak for rollback."""
+    try:
+        current = Path(__file__).resolve()
+    except Exception:
+        return False
+
+    backup = current.with_name(current.name + ".bak")
+    tmp = current.with_name(current.name + ".new")
+
+    try:
+        try:
+            shutil.copy2(str(current), str(backup))
+        except Exception:
+            pass
+
+        tmp.write_text(new_code, encoding="utf-8")
+
+        try:
+            st = current.stat()
+            os.chmod(str(tmp), st.st_mode)
+        except Exception:
+            pass
+
+        os.replace(str(tmp), str(current))  # atomic on POSIX & Windows
+        return True
+    except Exception as e:
+        log.warning(f"Failed to apply update: {e}")
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except Exception:
+            pass
+        return False
+
+
+def check_for_update():
+    """
+    Returns:
+        True  -> update written to disk; caller should restart the process
+        False -> no update needed, or check/download failed
+    """
+    remote = _fetch_remote_version()
+    if not remote:
+        return False
+
+    if _parse_version(remote) <= _parse_version(CLIENT_VERSION):
+        return False
+
+    log.info(f"Update available: {CLIENT_VERSION} -> {remote}")
+    new_code = _download_new_client(remote)
+    if not new_code:
+        return False
+
+    if not _apply_update(new_code):
+        return False
+
+    log.info(f"client.py updated to {remote}")
+    return True
+
+
+def _restart_self():
+    """Re-exec this script with the same interpreter and args. Never returns on POSIX."""
+    python = sys.executable
+    script = str(Path(__file__).resolve())
+    args = [python, script] + sys.argv[1:]
+
+    if os.name == "nt":
+        # On Windows, detach a fresh process and exit the current one
+        subprocess.Popen(args, close_fds=True, creationflags=0x00000008)  # DETACHED_PROCESS
+        sys.exit(0)
+    else:
+        os.execv(python, args)  # never returns
+
+
 # ============ CONFIG ============
 CHECKPOINT_DIR = Path("checkpoints")
 CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
 
+DEFAULT_SERVER = "https://server.crowdgpt.net"
+
 DATASET_REPO_ID = "Vxtzq/CrowdGPT"
-TOKENIZER_REPO = "Qwen/Qwen3-0.6B"
+TOKENIZER_REPO = "Qwen/Qwen2.5-1.5B"
+HF_MODEL_REPO_ID = "Vxtzq/Crowd-v1"
+
+USE_HF_WEIGHTS = True
+
+UPLOAD_CHUNK_BYTES = 64 * 1024 * 1024  # 64 MB
+MAX_DIRECT_UPLOAD_BYTES = 80 * 1024 * 1024  # 80 MB
+MAX_CHUNK_RETRY = 4
 
 MODEL_CONFIG = {
     "vocabSize": 151669, "dim": 1536, "nLayers": 24, "nHeads": 16, "nKvHeads": 4,
@@ -42,13 +181,8 @@ N_LAYERS = MODEL_CONFIG["nLayers"]; N_HEADS = MODEL_CONFIG["nHeads"]
 N_KV_HEADS = MODEL_CONFIG["nKvHeads"]; HEAD_DIM = MODEL_CONFIG["headDim"]
 MAX_SEQ_LEN = MODEL_CONFIG["maxSeqLen"]; MLP_HIDDEN = MODEL_CONFIG["mlpHidden"]
 ENG_NUM_BUCKETS = 227865
-LOSS_CHUNK = 256; UPLOAD_BUFFER_MIN = 25
+LOSS_CHUNK = 256; UPLOAD_BUFFER_MIN = 25; TPS_DEGRADATION = 0.85
 ALLOWED_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64, 128]
-
-UPLOAD_CHUNK_BYTES = 50 * 1024 * 1024   # 50 MB per chunk
-UPLOAD_CHUNK_RETRIES = 5
-UPLOAD_INIT_RETRIES = 3
-
 
 def _calc_model_size():
     size = VOCAB_SIZE * DIM
@@ -58,15 +192,11 @@ def _calc_model_size():
     size += DIM*2
     return size
 
-
 EXPECTED_MODEL_SIZE = _calc_model_size()
 EXPECTED_ENGRAM_SIZE = ENG_NUM_BUCKETS * DIM
-EXPECTED_MODEL_BYTES = EXPECTED_MODEL_SIZE * 2
-EXPECTED_ENGRAM_BYTES = EXPECTED_ENGRAM_SIZE * 2
-EXPECTED_WEIGHT_BYTES = EXPECTED_MODEL_BYTES + EXPECTED_ENGRAM_BYTES
+EXPECTED_WEIGHT_BYTES = (EXPECTED_MODEL_SIZE + EXPECTED_ENGRAM_SIZE) * 2
 memory_config = {"ram_gb": 12, "is_auto_detected": False}
 train_device, train_backend = None, None
-
 
 def safe_float(v, default=0.0):
     try:
@@ -74,8 +204,6 @@ def safe_float(v, default=0.0):
         return float(v)
     except: return default
 
-
-# ============ JSON SANITIZER ============
 def sanitize_for_json(obj):
     if isinstance(obj, dict):
         return {str(k): sanitize_for_json(v) for k, v in obj.items()}
@@ -96,19 +224,16 @@ def sanitize_for_json(obj):
         pass
     return str(obj)
 
-
 # ============ TOKENIZER ============
 TOKENIZER = None
 _tokenizer_started = False
-PREVIEW_EVERY = 15
-
+PREVIEW_EVERY = 10
 
 def start_tokenizer_loader():
     global _tokenizer_started
     if _tokenizer_started: return
     _tokenizer_started = True
     threading.Thread(target=_load_tokenizer_worker, daemon=True).start()
-
 
 def _load_tokenizer_worker():
     global TOKENIZER
@@ -122,13 +247,11 @@ def _load_tokenizer_worker():
                     TOKENIZER = tok
                     log.info(f"Tokenizer loaded: {repo} ({len(tok)} tokens)")
                     return
-            except Exception:
-                continue
-        log.warning("No compatible tokenizer loaded.")
+            except Exception: continue
+        log.warning("No compatible tokenizer loaded. Preview will use token IDs.")
     except ImportError:
-        log.warning("transformers not installed.")
+        log.warning("transformers not installed. Preview will use token IDs.")
     TOKENIZER = None
-
 
 def decode_ids(ids, max_chars=220):
     try:
@@ -138,17 +261,15 @@ def decode_ids(ids, max_chars=220):
             s = ' '.join(s.split())
             if len(s) > max_chars: s = s[:max_chars] + "…"
             return s or "…"
-    except Exception:
-        pass
+    except Exception: pass
     s = ' '.join(f"#{int(i)}" for i in ids)
     if len(s) > max_chars: s = s[:max_chars] + "…"
     return s
 
-
 def decode_one(tok_id):
     s = decode_ids([tok_id], max_chars=32)
-    return s if s.strip() else "␠"
-
+    if not s.strip(): return "␠"
+    return s
 
 # ============ LOGOS / ICON ============
 LOGO_URI_LIGHT = ""
@@ -156,6 +277,7 @@ LOGO_URI_DARK = ""
 _lp_light = Path(__file__).parent / "docs/logo-black.svg"
 _lp_app = Path(__file__).parent / "docs/logo-app.svg"
 _lp_dark = Path(__file__).parent / "docs/logo-white.svg"
+
 if _lp_light.exists():
     try: LOGO_URI_LIGHT = "data:image/svg+xml;base64," + base64.b64encode(_lp_light.read_bytes()).decode()
     except: pass
@@ -171,15 +293,17 @@ if _lp_light.exists():
         import cairosvg
         png_bytes = cairosvg.svg2png(url=str(_lp_app), output_width=256, output_height=256)
         tmp = tempfile.NamedTemporaryFile(suffix='.png', delete=False)
-        tmp.write(png_bytes); tmp.close()
+        tmp.write(png_bytes)
+        tmp.close()
         ICON_PATH = os.path.abspath(tmp.name)
         _cleanup_icon.append(ICON_PATH)
-        atexit.register(lambda: [os.unlink(p) for p in _cleanup_icon if os.path.exists(p)])
-    except ImportError:
-        ICON_PATH = os.path.abspath(str(_lp_app))
-    except Exception:
-        ICON_PATH = os.path.abspath(str(_lp_app))
-
+        def _clean():
+            for p in _cleanup_icon:
+                try: os.unlink(p)
+                except: pass
+        atexit.register(_clean)
+    except ImportError: ICON_PATH = os.path.abspath(str(_lp_app))
+    except Exception: ICON_PATH = os.path.abspath(str(_lp_app))
 
 # ============ HARDWARE ============
 def get_available_backends():
@@ -190,23 +314,19 @@ def get_available_backends():
     try:
         import intel_extension_for_pytorch
         backends['xpu'] = hasattr(torch, 'xpu') and torch.xpu.is_available()
-    except ImportError:
-        backends['xpu'] = False
+    except ImportError: backends['xpu'] = False
     try:
         import torch_directml
         backends['directml'] = torch_directml.is_available()
-    except ImportError:
-        backends['directml'] = False
+    except ImportError: backends['directml'] = False
     backends['cpu'] = True
     return backends
-
 
 def get_best_default_backend():
     avail = get_available_backends()
     for bk in ['cuda', 'rocm', 'mps', 'xpu', 'directml', 'cpu']:
         if avail.get(bk): return bk
     return 'cpu'
-
 
 def detect_training_backend(force=None):
     if force and force != "auto":
@@ -238,7 +358,6 @@ def detect_training_backend(force=None):
     except ImportError: pass
     return torch.device('cpu'), "CPU"
 
-
 def auto_detect_vram_budget():
     global train_backend
     if train_backend in ("CUDA", "ROCM") and torch.cuda.is_available():
@@ -257,19 +376,15 @@ def auto_detect_vram_budget():
         memory_config.update({"ram_gb": round(max(1.0, psutil.virtual_memory().available/1024**3 - 2.0), 2), "is_auto_detected": True})
     except: pass
 
-
 def has_bitsandbytes():
-    try:
-        import bitsandbytes; return True
+    try: import bitsandbytes; return True
     except: return False
-
 
 def estimate_vram_bytes(bs, sl, u8):
     mb = EXPECTED_MODEL_SIZE*2; ob = EXPECTED_MODEL_SIZE*(4 if u8 else 12); gb = EXPECTED_MODEL_SIZE*4
     ab = N_LAYERS*(bs*sl*DIM*2 + bs*N_HEADS*64*sl*4)
     lb = bs*LOSS_CHUNK*VOCAB_SIZE*4; eb = bs*sl*DIM*2
     return int(mb+ob+gb+ab+lb+eb+0.8*1024**3)
-
 
 def recommend_batch_size(sl=2048):
     u8 = has_bitsandbytes(); budget = int(memory_config["ram_gb"]*1024**3); best = 1
@@ -278,7 +393,6 @@ def recommend_batch_size(sl=2048):
         else: break
     return best
 
-
 # ============ MODEL ============
 def precompute_freqs(dim, sl, dev):
     inv = 1.0/(10000.0**(torch.arange(0, dim, 2, dtype=torch.float32)/dim))
@@ -286,9 +400,7 @@ def precompute_freqs(dim, sl, dev):
     e = torch.cat((f, f), -1)
     return e.cos()[None, None, :, :].to(dev), e.sin()[None, None, :, :].to(dev)
 
-
 def rotate_half(x): return torch.cat((-x[..., x.shape[-1]//2:], x[..., :x.shape[-1]//2]), -1)
-
 
 class GroupedQueryAttention(nn.Module):
     def __init__(self):
@@ -298,7 +410,6 @@ class GroupedQueryAttention(nn.Module):
         self.wk = nn.Linear(DIM, N_KV_HEADS*HEAD_DIM, bias=False)
         self.wv = nn.Linear(DIM, N_KV_HEADS*HEAD_DIM, bias=False)
         self.wo = nn.Linear(DIM, DIM, bias=False)
-
     def forward(self, x, cos, sin, use_chunked=True):
         B, T, C = x.size()
         q = self.wq(x).view(B, T, self.nh, HEAD_DIM).transpose(1, 2)
@@ -313,7 +424,6 @@ class GroupedQueryAttention(nn.Module):
         a = a.masked_fill(torch.tril(torch.ones(T, T, device=x.device)).view(1, 1, T, T) == 0, float('-inf'))
         a = F.softmax(a, dim=-1, dtype=torch.float32).to(q.dtype)
         return self.wo((a @ v).transpose(1, 2).contiguous().view(B, T, C))
-
     def _chunked(self, q, k, v, B, T, C, cs=64):
         chunks = []
         for i in range(0, T, cs):
@@ -325,7 +435,6 @@ class GroupedQueryAttention(nn.Module):
             chunks.append(F.softmax(aw, dim=-1, dtype=torch.float32).to(q.dtype) @ v[:, :, :e, :])
         return self.wo(torch.cat(chunks, dim=2).transpose(1, 2).contiguous().view(B, T, C))
 
-
 class SwiGLU(nn.Module):
     def __init__(self):
         super().__init__()
@@ -333,7 +442,6 @@ class SwiGLU(nn.Module):
         self.w2 = nn.Linear(DIM, MLP_HIDDEN, bias=False)
         self.w3 = nn.Linear(MLP_HIDDEN, DIM, bias=False)
     def forward(self, x): return self.w3(F.silu(self.w1(x))*self.w2(x))
-
 
 class Block(nn.Module):
     def __init__(self):
@@ -343,7 +451,6 @@ class Block(nn.Module):
         x = x + self.attn(self.ln_1(x), cos, sin, use_chunked)
         return x + self.mlp(self.ln_2(x))
 
-
 class EngramMemory(nn.Module):
     def __init__(self, bn, device):
         super().__init__()
@@ -352,7 +459,6 @@ class EngramMemory(nn.Module):
         nn.init.normal_(self.table.weight, mean=0.0, std=0.02)
         self.use_async = device.type in ('cuda',) and torch.cuda.is_available()
         self.ts = torch.cuda.Stream(device=device) if self.use_async else None
-
     def forward(self, idx):
         px = torch.cat([torch.zeros_like(idx[:, :1]), idx[:, :-1]], dim=1)
         hi = (px*1000003 + idx) % ENG_NUM_BUCKETS
@@ -361,10 +467,8 @@ class EngramMemory(nn.Module):
         if self.use_async:
             with torch.cuda.stream(self.ts): cg = cr.to(self.device, non_blocking=True)
             torch.cuda.current_stream(self.device).wait_stream(self.ts)
-        else:
-            cg = cr.to(self.device)
+        else: cg = cr.to(self.device)
         return cg[inv].view(idx.shape[0], idx.shape[1], DIM)
-
 
 class SotaGPT(nn.Module):
     def __init__(self, bn, device):
@@ -377,10 +481,8 @@ class SotaGPT(nn.Module):
         if MODEL_CONFIG["weightTying"]: self.wte.weight = self.lm_head.weight
         cm, sm = precompute_freqs(HEAD_DIM, MAX_SEQ_LEN, device)
         self.register_buffer("freqs_cos", cm); self.register_buffer("freqs_sin", sm)
-
     def get_base_weights(self):
         return np.concatenate([p.detach().float().flatten().cpu().numpy() for n, p in self.named_parameters() if not n.startswith('engram.')])
-
     def load_base_weights(self, fw):
         ft = torch.from_numpy(fw) if not isinstance(fw, torch.Tensor) else fw
         o = 0
@@ -388,18 +490,14 @@ class SotaGPT(nn.Module):
             if not n.startswith('engram.'):
                 s = p.numel(); p.data.copy_(ft[o:o+s].view(p.shape).to(p.device)); o += s
 
-
 # ============ DATASET ============
 def _fetch_with_retry(url, headers=None, timeout=60, retries=5):
     for a in range(retries):
         try:
-            r = requests.get(url, headers=headers, timeout=timeout, allow_redirects=True)
-            r.raise_for_status(); return r
-        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout,
-                ChunkedEncodingError, http.client.IncompleteRead):
+            r = requests.get(url, headers=headers, timeout=timeout, allow_redirects=True); r.raise_for_status(); return r
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout, ChunkedEncodingError, http.client.IncompleteRead):
             if a < retries-1: time.sleep(2**(a+1))
             else: raise
-
 
 class StreamingShardDataset:
     STEPS_PER_SUBCHUNK = 500
@@ -411,9 +509,7 @@ class StreamingShardDataset:
         self.data, self.n, self.steps_used = None, 0, 0
         self._pft, self._pfr, self._lock = None, None, threading.Lock()
         self._load(self.off); self._prefetch(self.off+ss)
-
     def _url(self): return f"https://huggingface.co/datasets/{self.repo_id}/resolve/main/chunks/" + self._fmt.format(self.ci)
-
     def _discover(self, idx):
         for fmt in ("chunk_{:04d}.bin", "chunk_{:d}.bin"):
             url = f"https://huggingface.co/datasets/{self.repo_id}/resolve/main/chunks/" + fmt.format(idx)
@@ -425,17 +521,12 @@ class StreamingShardDataset:
                         if sz > 0: self._fmt = fmt; return sz
                 except: time.sleep(1)
         raise RuntimeError(f"No chunk {idx}")
-
     def _slice(self, off):
         end = min(off+self.sub_size, self.chunk_size)-1
         return _fetch_with_retry(self._url(), headers={'Range': f'bytes={off}-{end}'}, timeout=120).content
-
     def _set(self, raw):
-        tk = np.frombuffer(raw, dtype=np.uint32)
-        self.data, self.n, self.steps_used = tk, len(tk)//self.tps, 0
-
+        tk = np.frombuffer(raw, dtype=np.uint32); self.data, self.n, self.steps_used = tk, len(tk)//self.tps, 0
     def _load(self, off): self._set(self._slice(off)); self.off = off
-
     def _prefetch(self, off):
         if off >= self.chunk_size: return
         with self._lock: self._pfr = None
@@ -445,9 +536,7 @@ class StreamingShardDataset:
                 with self._lock: self._pfr = (off, r)
             except: pass
         self._pft = threading.Thread(target=w, daemon=True); self._pft.start()
-
     def needs_new_subchunk(self): return self.n == 0 or self.steps_used >= self.STEPS_PER_SUBCHUNK
-
     def advance(self, srv=None, fmt="bf16"):
         no = self.off+self.sub_size
         if no < self.chunk_size:
@@ -459,19 +548,33 @@ class StreamingShardDataset:
         self._req(srv, fmt)
         self.chunk_size = self._discover(self.ci); self.off = 0
         self._load(0); self._prefetch(self.sub_size); return True
-
     def _req(self, srv, fmt="bf16"):
         if not srv: return False
         try:
             h = {"Authorization": f"Bearer {self.auth_token}"} if self.auth_token else {}
             r = requests.get(f"{srv}/fl/task?format={fmt}&skip_weights=true", headers=h, timeout=30)
-            if r.status_code == 200:
-                raw = r.content; ml = struct.unpack('<I', raw[:4])[0]
-                ni = json.loads(raw[4:4+ml].decode()).get("datasetConfig", {}).get("chunkIdx", self.ci)
-                if ni != self.ci: self.ci = ni; return True
-        except: pass
-        return False
+            if r.status_code != 200:
+                return False
 
+            ct = (r.headers.get("content-type") or "").lower()
+            if "json" in ct:
+                md = r.json()
+            else:
+                raw = r.content
+                if len(raw) < 4:
+                    return False
+                ml = struct.unpack('<I', raw[:4])[0]
+                if len(raw) < 4 + ml:
+                    return False
+                md = json.loads(raw[4:4+ml].decode())
+
+            ni = md.get("datasetConfig", {}).get("chunkIdx", self.ci)
+            if ni != self.ci:
+                self.ci = ni
+                return True
+        except Exception:
+            pass
+        return False
     def get_batch(self, bs, seed=None):
         if self.data is None or self.n == 0: self.advance()
         self.steps_used += 1
@@ -481,318 +584,9 @@ class StreamingShardDataset:
         tgt = np.stack([self.data[x+1:x+self.tps] for x in s])
         return torch.tensor(inp, dtype=torch.long), torch.tensor(tgt, dtype=torch.long)
 
-
 def decompress_weights(raw, fmt="bf16"):
-    if fmt == "fp16":
-        return np.frombuffer(raw, dtype=np.uint16).view(np.float16).astype(np.float32)
+    if fmt == "fp16": return np.frombuffer(raw, dtype=np.uint16).view(np.float16).astype(np.float32)
     return torch.from_numpy(np.frombuffer(raw, dtype=np.uint16).copy()).view(torch.bfloat16).to(torch.float32).numpy()
-
-
-# ============ SAFETENSORS PARSING ============
-def _safetensors_extract(raw, tensor_key="weights"):
-    """Extract raw tensor bytes from a single-tensor safetensors blob."""
-    if len(raw) < 8:
-        raise ValueError(f"safetensors too small ({len(raw)} bytes)")
-    n = struct.unpack('<Q', raw[:8])[0]
-    if 8 + n > len(raw):
-        raise ValueError(f"safetensors header truncated (n={n}, len={len(raw)})")
-    header = json.loads(raw[8:8 + n].decode('utf-8'))
-    if tensor_key in header:
-        info = header[tensor_key]
-    elif "__metadata__" in header and len(header) == 2:
-        k = next(k for k in header if k != "__metadata__")
-        info = header[k]
-    elif len(header) == 1:
-        info = next(iter(header.values()))
-    else:
-        raise ValueError(f"safetensors tensor key {tensor_key!r} not found; keys={list(header.keys())}")
-    lo, hi = info["data_offsets"]
-    start = 8 + n + lo
-    end = 8 + n + hi
-    if end > len(raw):
-        raise ValueError(f"safetensors data truncated ({end} > {len(raw)})")
-    return raw[start:end]
-
-
-# ============ WEIGHTS DOWNLOAD (HF-first) ============
-def _download_url(url, expected_bytes, se, emit, label):
-    """Stream a direct URL, report progress, return bytes or None."""
-    try:
-        r = requests.get(url, timeout=(15, 3600), stream=True, allow_redirects=True)
-        if r.status_code != 200:
-            emit('log', f"{label}: HTTP {r.status_code}")
-            r.close(); return None
-        buf = []; got = 0; last = 0.0
-        for c in r.iter_content(chunk_size=1024 * 1024):
-            if se.is_set(): r.close(); return None
-            if not c: continue
-            buf.append(c); got += len(c)
-            now = time.time()
-            if now - last > 0.25:
-                emit('overlay_progress', {'done': got, 'total': expected_bytes}); last = now
-        r.close()
-        out = b"".join(buf)
-        if expected_bytes and len(out) < expected_bytes:
-            emit('log', f"{label}: truncated ({len(out):,} / {expected_bytes:,})")
-            return None
-        return out
-    except Exception as e:
-        emit('log', f"{label} error: {e}")
-        return None
-
-
-def _fetch_weights_via_hf(wmeta, se, emit):
-    """Download model + engram from HF. Returns concatenated raw bf16 bytes."""
-    files = wmeta.get("files") or {}
-    model_info = files.get("model")
-    engram_info = files.get("engram")
-    if not model_info or not engram_info:
-        emit('log', "HF metadata incomplete; cannot use HF path")
-        return None
-
-    emit('log', f"HF model: {model_info['size']/1e6:.0f} MB from {model_info['url']}")
-    raw_model = _download_url(model_info['url'], model_info['size'], se, emit, "model")
-    if raw_model is None: return None
-    try:
-        base = _safetensors_extract(raw_model, model_info.get('tensorKey', 'weights'))
-    except Exception as e:
-        emit('log', f"model safetensors parse failed: {e}")
-        return None
-    finally:
-        del raw_model
-
-    emit('log', f"HF engram: {engram_info['size']/1e6:.0f} MB")
-    raw_eng = _download_url(engram_info['url'], engram_info['size'], se, emit, "engram")
-    if raw_eng is None: return None
-    try:
-        eng = _safetensors_extract(raw_eng, engram_info.get('tensorKey', 'weights'))
-    except Exception as e:
-        emit('log', f"engram safetensors parse failed: {e}")
-        return None
-    finally:
-        del raw_eng
-
-    if len(base) < EXPECTED_MODEL_BYTES or len(eng) < EXPECTED_ENGRAM_BYTES:
-        emit('log', f"HF payload short: base={len(base):,} engram={len(eng):,}")
-        return None
-    return base[:EXPECTED_MODEL_BYTES] + eng[:EXPECTED_ENGRAM_BYTES]
-
-
-def fetch_task(srv, h, prec, se, emit):
-    """
-    Returns (metadata, weights_bytes).
-    - Prefers HF-direct download (metadata only over the wire).
-    - Falls back to inline /fl/task streaming if HF not advertised.
-    """
-    while not se.is_set():
-        try:
-            emit('status', 'downloading')
-            emit('overlay_show', {'title_key': 'dl_weights', 'indeterminate': False})
-
-            # --- Step 1: metadata only (tiny) ---
-            r = requests.get(f"{srv}/fl/task?format={prec}&skip_weights=true",
-                             headers=h, timeout=(15, 120))
-            if r.status_code != 200:
-                emit('overlay_hide', {})
-                emit('log', f"/fl/task HTTP {r.status_code}: {r.text[:120]}")
-                time.sleep(10); continue
-            if r.headers.get("X-Status") == "wait":
-                emit('overlay_hide', {})
-                for _ in range(10):
-                    if se.is_set(): return None, None
-                    time.sleep(1)
-                continue
-
-            metadata = r.json()
-            wmeta = metadata.get("weights") or {}
-            source = wmeta.get("source")
-
-            # --- Step 2: HF preferred ---
-            if source == "huggingface":
-                emit('log', f"HF source: {wmeta.get('repo')} @ {str(wmeta.get('revision'))[:12]}")
-                wb = _fetch_weights_via_hf(wmeta, se, emit)
-                if wb is not None and len(wb) >= EXPECTED_WEIGHT_BYTES:
-                    emit('overlay_hide', {})
-                    emit('status', 'preparing')
-                    emit('log', f"Weights ready: {len(wb):,} bytes (HF)")
-                    return metadata, wb
-                emit('log', "⚠️ HF download failed; falling back to inline /fl/task")
-
-            # --- Step 3: inline fallback ---
-            emit('log', "Downloading weights inline from /fl/task (may fail via Cloudflare tunnel)")
-            r = requests.get(f"{srv}/fl/task?format={prec}",
-                             headers=h, timeout=(15, 3600), stream=True)
-            if r.status_code != 200 or r.headers.get("X-Status") == "wait":
-                r.close(); emit('overlay_hide', {})
-                time.sleep(10); continue
-
-            cl_total = int(r.headers.get('content-length', 0) or 0)
-            total = cl_total if cl_total > 0 else EXPECTED_WEIGHT_BYTES
-            chunks = []; done = 0; last = 0.0
-            for chunk in r.iter_content(chunk_size=512 * 1024):
-                if not chunk: continue
-                chunks.append(chunk); done += len(chunk)
-                now = time.time()
-                if now - last > 0.25:
-                    emit('overlay_progress', {'done': done, 'total': total}); last = now
-            r.close()
-            emit('overlay_hide', {})
-
-            raw = b"".join(chunks); del chunks
-            if len(raw) < 8:
-                emit('log', f"/fl/task returned {len(raw)} bytes; retrying"); time.sleep(5); continue
-            ml = struct.unpack('<I', raw[:4])[0]
-            if 4 + ml > len(raw):
-                emit('log', f"Truncated header (ml={ml}, len={len(raw)}); retrying"); time.sleep(5); continue
-            md = json.loads(raw[4:4 + ml].decode())
-            wb = raw[4 + ml:]
-            emit('log', f"/fl/task inline: metadata OK, weights={len(wb):,} bytes")
-            if len(wb) < EXPECTED_WEIGHT_BYTES:
-                emit('log', f"⚠️ inline truncated at {len(wb):,} (expected {EXPECTED_WEIGHT_BYTES:,}); retrying")
-                time.sleep(10); continue
-            emit('status', 'preparing')
-            return md, wb
-
-        except Exception as e:
-            emit('overlay_hide', {})
-            if se.is_set(): return None, None
-            emit('log', f"Task fetch failed: {e}"); time.sleep(15)
-
-
-# ============ CHUNKED UPLOAD ============
-def upload_delta_chunked(srv, h, tid, loss, local_steps, tokens_processed,
-                         dbf, si, sv, se, emit):
-    """
-    Build the delta payload, gzip it to a temp file, then upload via:
-      POST /fl/submit/init   (JSON metadata, sha256 of gzipped payload)
-      POST /fl/submit/chunk  (50 MB per chunk, X-Chunk-Sha256 header)
-      POST /fl/submit/finalize
-    Retries each chunk up to UPLOAD_CHUNK_RETRIES times with exponential backoff.
-    Returns True on success.
-    """
-    pl = json.dumps({
-        "taskId": tid, "loss": loss, "localSteps": local_steps,
-        "tokensProcessed": tokens_processed, "loraRank": 0, "isDelta": True,
-        "weightFormat": "bf16", "hasEngram": True, "engramSparseCount": int(len(si)),
-    }).encode()
-
-    gz_path = None
-    try:
-        # --- Step 1: gzip payload to a temp file (bounded memory) ---
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.bin.gz') as tmp:
-            gz_path = tmp.name
-        with gzip.open(gz_path, 'wb', compresslevel=2) as gz:
-            gz.write(struct.pack('<I', len(pl)))
-            gz.write(pl)
-            gz.write(np.ascontiguousarray(dbf).tobytes()); del dbf
-            gz.write(np.ascontiguousarray(si).tobytes()); del si
-            gz.write(np.ascontiguousarray(sv).tobytes()); del sv
-
-        compressed_size = os.path.getsize(gz_path)
-        emit('log', f"Payload compressed: {compressed_size/1e6:.1f} MB")
-
-        # --- Step 2: sha256 of the whole gzipped file ---
-        h_sha = hashlib.sha256()
-        with open(gz_path, 'rb') as f:
-            while True:
-                b = f.read(4 * 1024 * 1024)
-                if not b: break
-                h_sha.update(b)
-        checksum = h_sha.hexdigest()
-
-        chunk_size = UPLOAD_CHUNK_BYTES
-        chunks = (compressed_size + chunk_size - 1) // chunk_size
-        emit('log', f"Uploading {chunks} chunk(s) of {chunk_size//1024//1024} MB")
-
-        # --- Step 3: init ---
-        init_payload = {
-            "taskId": tid,
-            "totalBytes": compressed_size,
-            "chunkSize": chunk_size,
-            "chunks": chunks,
-            "checksum": checksum,
-            "weightFormat": "bf16",
-            "hasEngram": True,
-            "engramSparseCount": int(len(si) if isinstance(si, np.ndarray) else 0),
-            "loss": loss,
-            "localSteps": local_steps,
-            "tokensProcessed": tokens_processed,
-            "loraRank": 0,
-            "isDelta": True,
-        }
-        # si was already deleted during gzip; use the recorded count. Fix below.
-        # Recompute count from the ORIGINAL si before deletion — patch: we
-        # stored it as engram_sparse_count before the write. Simplest fix:
-        # reconstruct here from a passed-in value.
-        # (See call site: we pass `si_count` as len(si) before calling.)
-        upload_id = None
-        for attempt in range(UPLOAD_INIT_RETRIES):
-            try:
-                r = requests.post(f"{srv}/fl/submit/init", headers=h, json=init_payload, timeout=60)
-                if r.status_code == 200:
-                    upload_id = r.json()["uploadId"]; break
-                emit('log', f"init attempt {attempt+1}: HTTP {r.status_code}: {r.text[:120]}")
-            except Exception as e:
-                emit('log', f"init attempt {attempt+1}: {e}")
-            time.sleep(2 ** attempt)
-        if not upload_id:
-            emit('log', "❌ init failed after retries"); return False
-
-        # --- Step 4: chunks ---
-        with open(gz_path, 'rb') as f:
-            for i in range(chunks):
-                if se.is_set(): return False
-                chunk_bytes = f.read(chunk_size)
-                chunk_sha = hashlib.sha256(chunk_bytes).hexdigest()
-
-                ok = False
-                for attempt in range(UPLOAD_CHUNK_RETRIES):
-                    if se.is_set(): return False
-                    try:
-                        r = requests.post(
-                            f"{srv}/fl/submit/chunk",
-                            params={"uploadId": upload_id, "index": i},
-                            headers={"Content-Type": "application/octet-stream",
-                                     "X-Chunk-Sha256": chunk_sha, **h},
-                            data=chunk_bytes,
-                            timeout=(15, 600),
-                        )
-                        if r.status_code == 200:
-                            ok = True; break
-                        emit('log', f"chunk {i+1}/{chunks} attempt {attempt+1}: HTTP {r.status_code}: {r.text[:80]}")
-                    except Exception as e:
-                        emit('log', f"chunk {i+1}/{chunks} attempt {attempt+1}: {e}")
-                    time.sleep(2 ** attempt)
-                if not ok:
-                    emit('log', f"❌ chunk {i+1}/{chunks} failed after {UPLOAD_CHUNK_RETRIES} retries")
-                    return False
-
-                done = min((i+1) * chunk_size, compressed_size)
-                emit('overlay_progress', {'done': done, 'total': compressed_size})
-                emit('log', f"  ✓ chunk {i+1}/{chunks} ({done/1e6:.1f}/{compressed_size/1e6:.1f} MB)")
-
-        # --- Step 5: finalize ---
-        for attempt in range(UPLOAD_INIT_RETRIES):
-            try:
-                r = requests.post(f"{srv}/fl/submit/finalize",
-                                  headers={**h},
-                                  json={"uploadId": upload_id},
-                                  timeout=600)
-                if r.status_code == 200:
-                    emit('log', f"✅ Submitted successfully ({chunks} chunks)")
-                    return True
-                emit('log', f"finalize attempt {attempt+1}: HTTP {r.status_code}: {r.text[:120]}")
-            except Exception as e:
-                emit('log', f"finalize attempt {attempt+1}: {e}")
-            time.sleep(2 ** attempt)
-        emit('log', "❌ finalize failed after retries")
-        return False
-
-    finally:
-        if gz_path and os.path.exists(gz_path):
-            try: os.unlink(gz_path)
-            except: pass
-
 
 # ============ AUTH ============
 def do_login(srv, u, p):
@@ -803,11 +597,8 @@ def do_login(srv, u, p):
         except: msg = r.text
         if "invalid" in msg.lower() or "credentials" in msg.lower(): return None, "invalid_credentials"
         return None, "login_failed"
-    except requests.exceptions.ConnectionError:
-        return None, "network"
-    except:
-        return None, "network"
-
+    except requests.exceptions.ConnectionError: return None, "network"
+    except: return None, "network"
 
 def do_register(srv, u, email, p):
     try:
@@ -821,11 +612,8 @@ def do_register(srv, u, email, p):
         if "password" in msg_l: return None, "weak_password"
         if "invalid" in msg_l: return None, "invalid_input"
         return None, "register_failed"
-    except requests.exceptions.ConnectionError:
-        return None, "network"
-    except:
-        return None, "network"
-
+    except requests.exceptions.ConnectionError: return None, "network"
+    except: return None, "network"
 
 # ============ HEARTBEAT / ROUND ============
 class HeartbeatManager:
@@ -851,7 +639,6 @@ class HeartbeatManager:
                         self.emit('log', f"ULTIMATUM: {rm:.0f} min left!"); self.stop_training.set()
             except: pass
             self.shutdown.wait(timeout=15)
-
 
 def wait_for_round(srv, h, se, emit):
     overlay_on = False
@@ -880,40 +667,302 @@ def wait_for_round(srv, h, se, emit):
                 for _ in range(30):
                     if se.is_set(): hide(); return None
                     time.sleep(1)
-            else:
-                time.sleep(10)
-        except:
-            time.sleep(10)
+            else: time.sleep(10)
+        except: time.sleep(10)
     hide(); return None
 
+# ============ TASK METADATA / HF WEIGHTS ============
+def fetch_task_metadata(srv, h, se, emit):
+    while not se.is_set():
+        try:
+            r = requests.get(
+                f"{srv}/fl/task?format=bf16&skip_weights=true",
+                headers=h,
+                timeout=30,
+            )
+
+            if r.headers.get("X-Status") == "wait":
+                for _ in range(10):
+                    if se.is_set(): return None
+                    time.sleep(1)
+                continue
+
+            if r.status_code == 200:
+                ct = (r.headers.get("content-type") or "").lower()
+
+                if "json" in ct:
+                    md = r.json()
+                    if md.get("status") == "wait":
+                        for _ in range(10):
+                            if se.is_set(): return None
+                            time.sleep(1)
+                        continue
+                    return md
+
+                raw = r.content
+                if len(raw) >= 4:
+                    ml = struct.unpack('<I', raw[:4])[0]
+                    if len(raw) >= 4 + ml:
+                        return json.loads(raw[4:4+ml].decode())
+
+                raise RuntimeError("Invalid task metadata response")
+
+            if r.status_code in (503, 504):
+                time.sleep(10)
+                continue
+
+            time.sleep(5)
+
+        except Exception as e:
+            if se.is_set(): return None
+            emit('log', f"Task metadata fetch failed: {e}")
+            time.sleep(10)
+
+    return None
+
+def _weight_cache_path(revision, filename):
+    rev = str(revision or "main").strip().replace("/", "_").replace("\\", "_")
+    d = CHECKPOINT_DIR / "hf_weights" / rev
+    d.mkdir(parents=True, exist_ok=True)
+    return d / filename
+
+def _download_file_with_progress(url, dest, emit, stop_evt, expected_size=None, label="file"):
+    dest.parent.mkdir(parents=True, exist_ok=True)
+
+    if dest.exists():
+        sz = dest.stat().st_size
+        if expected_size is None or sz == int(expected_size):
+            log.info(f"Using cached weight file: {dest}")
+            return dest
+        try:
+            dest.unlink()
+        except Exception:
+            pass
+
+    last_err = None
+
+    for attempt in range(3):
+        if stop_evt.is_set():
+            raise KeyboardInterrupt("Stop requested during weight download")
+
+        tmp = dest.with_suffix(dest.suffix + ".part")
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except Exception:
+            pass
+
+        try:
+            log.info(f"Downloading {label}: {url}")
+            r = requests.get(
+                url,
+                stream=True,
+                timeout=(15, 3600),
+                allow_redirects=True,
+            )
+            r.raise_for_status()
+
+            content_length = int(r.headers.get("content-length", 0) or 0)
+            total = int(expected_size) if expected_size else content_length
+            done = 0
+            last_emit = 0.0
+
+            with open(tmp, "wb") as f:
+                for chunk in r.iter_content(chunk_size=1024 * 1024):
+                    if stop_evt.is_set():
+                        raise KeyboardInterrupt("Stop requested during weight download")
+
+                    if not chunk:
+                        continue
+
+                    f.write(chunk)
+                    done += len(chunk)
+
+                    now = time.time()
+                    if now - last_emit > 0.25:
+                        emit("overlay_progress", {"done": done, "total": total})
+                        last_emit = now
+
+            if expected_size and done != int(expected_size):
+                raise RuntimeError(
+                    f"Downloaded size mismatch for {label}: got {done}, expected {expected_size}"
+                )
+
+            os.replace(tmp, dest)
+            log.info(f"Finished downloading {label}: {dest}")
+            return dest
+
+        except KeyboardInterrupt:
+            raise
+        except Exception as e:
+            last_err = e
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except Exception:
+                pass
+
+            if attempt < 2:
+                emit("log", f"Download retry {attempt + 1} for {label}: {e}")
+                time.sleep(5 * (attempt + 1))
+
+    raise RuntimeError(f"Failed to download {label}: {last_err}")
+
+def _load_safetensors_flat(path, expected_numel, label="weights"):
+    try:
+        from safetensors.torch import load_file
+    except ImportError as e:
+        raise RuntimeError("Missing dependency: safetensors. Add 'safetensors' to requirements.") from e
+
+    tensors = load_file(str(path))
+
+    if "weights" in tensors:
+        t = tensors["weights"]
+    elif "flat" in tensors:
+        t = tensors["flat"]
+    elif len(tensors) == 1:
+        t = next(iter(tensors.values()))
+    else:
+        raise RuntimeError(
+            f"{label}: could not identify expected tensor key. "
+            f"Expected 'weights' or 'flat'. Found keys: {list(tensors.keys())[:20]}"
+        )
+
+    arr = t.to(torch.float32).flatten().cpu().numpy()
+
+    del tensors, t
+    gc.collect()
+
+    if arr.size != int(expected_numel):
+        raise RuntimeError(
+            f"{label} element count mismatch: got {arr.size}, expected {expected_numel}."
+        )
+
+    return arr
+
+def fetch_weights_from_hf(md, se, emit):
+    wcfg = md.get("weights") or {}
+
+    if wcfg.get("source") != "huggingface":
+        raise RuntimeError("Task metadata does not advertise Hugging Face weights.")
+
+    revision = wcfg.get("revision") or "main"
+    files = wcfg.get("files") or {}
+
+    model_info = files.get("model") or {}
+    engram_info = files.get("engram") or {}
+
+    model_url = model_info.get("url") or (
+        f"https://huggingface.co/{HF_MODEL_REPO_ID}/resolve/{revision}/model_bf16.safetensors"
+    )
+    engram_url = engram_info.get("url") or (
+        f"https://huggingface.co/{HF_MODEL_REPO_ID}/resolve/{revision}/engram_bf16.safetensors"
+    )
+
+    model_size = model_info.get("size")
+    engram_size = engram_info.get("size")
+
+    if not model_size:
+        try:
+            hr = requests.head(model_url, allow_redirects=True, timeout=30)
+            model_size = int(hr.headers.get("content-length", 0) or 0) or None
+        except Exception:
+            model_size = None
+
+    if not engram_size:
+        try:
+            hr = requests.head(engram_url, allow_redirects=True, timeout=30)
+            engram_size = int(hr.headers.get("content-length", 0) or 0) or None
+        except Exception:
+            engram_size = None
+
+    model_path = _weight_cache_path(revision, "model_bf16.safetensors")
+    engram_path = _weight_cache_path(revision, "engram_bf16.safetensors")
+
+    emit("status", "downloading")
+    emit("overlay_show", {"title_key": "dl_weights", "indeterminate": False})
+
+    _download_file_with_progress(
+        model_url,
+        model_path,
+        emit,
+        se,
+        expected_size=model_size,
+        label="model_bf16.safetensors",
+    )
+
+    _download_file_with_progress(
+        engram_url,
+        engram_path,
+        emit,
+        se,
+        expected_size=engram_size,
+        label="engram_bf16.safetensors",
+    )
+
+    emit("overlay_hide", {})
+    emit("status", "preparing")
+    emit("log", "Loading weights from safetensors...")
+
+    iw = _load_safetensors_flat(model_path, EXPECTED_MODEL_SIZE, "model weights")
+    ie = _load_safetensors_flat(engram_path, EXPECTED_ENGRAM_SIZE, "engram weights")
+
+    return iw, ie
+
+def fetch_task(srv, h, prec, se, emit):
+    while not se.is_set():
+        try:
+            emit('status', 'downloading')
+            emit('overlay_show', {'title_key': 'dl_weights', 'indeterminate': False})
+            r = requests.get(f"{srv}/fl/task?format={prec}", headers=h, timeout=(15, 3600), stream=True)
+            if r.headers.get("X-Status") == "wait":
+                r.close(); emit('overlay_hide', {})
+                for _ in range(10):
+                    if se.is_set(): return None, None
+                    time.sleep(1)
+                continue
+            cl_total = int(r.headers.get('content-length', 0) or 0)
+            total = cl_total if cl_total > 0 else EXPECTED_WEIGHT_BYTES
+            chunks = []; done = 0; last = 0.0
+            for chunk in r.iter_content(chunk_size=512*1024):
+                if not chunk: continue
+                chunks.append(chunk); done += len(chunk)
+                now = time.time()
+                if now - last > 0.25:
+                    emit('overlay_progress', {'done': done, 'total': total}); last = now
+            r.close()
+            emit('overlay_progress', {'done': done, 'total': total})
+            emit('overlay_hide', {})
+            emit('status', 'preparing')
+            raw = b"".join(chunks); del chunks
+            ml = struct.unpack('<I', raw[:4])[0]
+            return json.loads(raw[4:4+ml].decode()), raw[4+ml:]
+        except Exception as e:
+            emit('overlay_hide', {})
+            if se.is_set(): return None, None
+            emit('log', f"Task fetch failed: {e}"); time.sleep(15)
 
 # ============ FORWARD / LOSS ============
-def _chunk_ce(m, xs, ys):
-    return F.cross_entropy(m.lm_head(xs).reshape(-1, VOCAB_SIZE), ys.reshape(-1))
-
+def _chunk_ce(m, xs, ys): return F.cross_entropy(m.lm_head(xs).reshape(-1, VOCAB_SIZE), ys.reshape(-1))
 
 def _fwl(m, x, y, sl, ua, ad, ls=1.0, preview=False):
     def fwd():
         xe = m.wte(x)
         if ua:
             with torch.autocast(device_type='cuda', enabled=False): eo = m.engram(x)
-        else:
-            eo = m.engram(x)
+        else: eo = m.engram(x)
         xe = xe + eo.to(xe.dtype)
-        for b in m.blocks:
-            xe = checkpoint(b, xe, m.freqs_cos, m.freqs_sin, True, use_reentrant=False)
+        for b in m.blocks: xe = checkpoint(b, xe, m.freqs_cos, m.freqs_sin, True, use_reentrant=False)
         return m.ln_f(xe)
 
     nc = max(1, math.ceil(sl/LOSS_CHUNK))
     if ua:
         with torch.autocast(device_type='cuda', dtype=ad):
             xe = fwd()
-            lo = sum(checkpoint(_chunk_ce, m, xe[:, i:i+LOSS_CHUNK, :], y[:, i:i+LOSS_CHUNK], use_reentrant=False)
-                     for i in range(0, sl, LOSS_CHUNK))/nc
+            lo = sum(checkpoint(_chunk_ce, m, xe[:, i:i+LOSS_CHUNK, :], y[:, i:i+LOSS_CHUNK], use_reentrant=False) for i in range(0, sl, LOSS_CHUNK))/nc
     else:
         xe = fwd()
-        lo = sum(checkpoint(_chunk_ce, m, xe[:, i:i+LOSS_CHUNK, :], y[:, i:i+LOSS_CHUNK], use_reentrant=False)
-                 for i in range(0, sl, LOSS_CHUNK))/nc
+        lo = sum(checkpoint(_chunk_ce, m, xe[:, i:i+LOSS_CHUNK, :], y[:, i:i+LOSS_CHUNK], use_reentrant=False) for i in range(0, sl, LOSS_CHUNK))/nc
 
     cards = []
     if preview:
@@ -926,16 +975,19 @@ def _fwl(m, x, y, sl, ua, ad, ls=1.0, preview=False):
                     p = T - offset - 1
                     if p >= 9: items.append((0, p))
                 items = items[:6]
+
                 for b, p in items:
                     if p < 9 or p >= T: continue
                     start = max(0, p - 9)
                     ctx_ids = x[b, start:p + 1].tolist()
                     target_id = int(y[b, p].item())
+
                     hidden = xe[b, p, :].unsqueeze(0).to(m.lm_head.weight.dtype)
                     logits = m.lm_head(hidden).float()
                     probs = torch.softmax(logits[0], dim=-1)
                     prob, pred = torch.max(probs, dim=0)
                     pred_id = int(pred.item())
+
                     cards.append({
                         'context': decode_ids(ctx_ids),
                         'target': decode_one(target_id),
@@ -948,8 +1000,163 @@ def _fwl(m, x, y, sl, ua, ad, ls=1.0, preview=False):
         except Exception as e:
             log.warning(f"Preview extraction failed: {e}")
             cards = []
+
     return lo * ls, cards
 
+# ============ CHUNKED UPLOAD HELPERS ============
+def _sha256_hex(data):
+    return hashlib.sha256(data).hexdigest()
+
+def _post_json_with_retry(url, payload, h, emit, se, timeout=60, retries=4):
+    last_err = None
+
+    for attempt in range(retries):
+        if se.is_set():
+            raise KeyboardInterrupt("Stop requested")
+
+        try:
+            r = requests.post(url, json=payload, headers=h, timeout=timeout)
+
+            if r.status_code == 503:
+                emit("log", "Server busy/aggregating, waiting before retry...")
+                last_err = RuntimeError("server busy 503")
+                time.sleep(10)
+                continue
+
+            r.raise_for_status()
+            return r
+
+        except KeyboardInterrupt:
+            raise
+        except Exception as e:
+            last_err = e
+            if attempt < retries - 1:
+                emit("log", f"POST retry {attempt + 1}: {e}")
+                time.sleep(min(20, 2 ** (attempt + 1)))
+
+    raise RuntimeError(f"POST {url} failed: {last_err}")
+
+def _chunked_submit_once(srv, h, compressed_data, meta, emit, se, chunk_size):
+    total = len(compressed_data)
+    chunks = max(1, math.ceil(total / chunk_size))
+    checksum = _sha256_hex(compressed_data)
+
+    init_payload = {
+        **meta,
+        "totalBytes": total,
+        "chunkSize": chunk_size,
+        "chunks": chunks,
+        "checksum": checksum,
+    }
+
+    emit("log", f"Initializing chunked upload: {chunks} chunks, {total / (1024*1024):.1f} MB total")
+
+    r = _post_json_with_retry(
+        f"{srv}/fl/submit/init",
+        init_payload,
+        h,
+        emit,
+        se,
+        timeout=60,
+        retries=4,
+    )
+
+    j = r.json()
+    upload_id = j.get("uploadId")
+
+    if not upload_id:
+        raise RuntimeError("Server did not return uploadId")
+
+    for idx in range(chunks):
+        if se.is_set():
+            raise KeyboardInterrupt("Stop requested during upload")
+
+        start = idx * chunk_size
+        end = min(total, start + chunk_size)
+        part = compressed_data[start:end]
+        part_sha = _sha256_hex(part)
+
+        attempt = 0
+        while True:
+            try:
+                rr = requests.post(
+                    f"{srv}/fl/submit/chunk?uploadId={upload_id}&index={idx}",
+                    data=part,
+                    headers={
+                        **h,
+                        "Content-Type": "application/octet-stream",
+                        "X-Chunk-Sha256": part_sha,
+                    },
+                    timeout=300,
+                )
+
+                if rr.status_code == 413:
+                    raise RuntimeError("CHUNK_TOO_LARGE")
+
+                rr.raise_for_status()
+                break
+
+            except KeyboardInterrupt:
+                raise
+            except Exception as e:
+                if "CHUNK_TOO_LARGE" in str(e):
+                    raise
+
+                attempt += 1
+                if se.is_set() or attempt >= MAX_CHUNK_RETRY:
+                    raise
+
+                emit("log", f"Chunk {idx + 1}/{chunks} failed, retry {attempt}: {e}")
+                time.sleep(min(20, 2 ** attempt))
+
+        emit("overlay_progress", {"done": end, "total": total})
+
+    emit("log", "Finalizing chunked upload...")
+
+    return _post_json_with_retry(
+        f"{srv}/fl/submit/finalize",
+        {"uploadId": upload_id},
+        h,
+        emit,
+        se,
+        timeout=900,
+        retries=2,
+    )
+
+def chunked_submit_delta(srv, h, compressed_data, meta, emit, se):
+    chunk_size = UPLOAD_CHUNK_BYTES
+
+    while True:
+        try:
+            return _chunked_submit_once(srv, h, compressed_data, meta, emit, se, chunk_size)
+        except Exception as e:
+            msg = str(e)
+            if ("CHUNK_TOO_LARGE" in msg or "413" in msg) and chunk_size > 8 * 1024 * 1024:
+                chunk_size = max(8 * 1024 * 1024, chunk_size // 2)
+                emit("log", f"Chunk too large. Reducing chunk size to {chunk_size / (1024*1024):.0f} MB and retrying.")
+                continue
+            raise
+
+def stream_with_progress(data, emit_cb, total_size, stop_evt):
+    chunk_size = 128 * 1024
+    uploaded = 0
+    last_emit = 0.0
+
+    for i in range(0, len(data), chunk_size):
+        if stop_evt.is_set():
+            raise KeyboardInterrupt("Stop requested")
+
+        chunk = data[i:i + chunk_size]
+        uploaded += len(chunk)
+
+        now = time.time()
+        if now - last_emit > 0.25:
+            emit_cb("overlay_progress", {"done": uploaded, "total": total_size})
+            last_emit = now
+
+        yield chunk
+
+    emit_cb("overlay_progress", {"done": total_size, "total": total_size})
 
 # ============ TRAIN ROUND ============
 def run_single_round_wrapper(srv, at, se, emit):
@@ -970,25 +1177,67 @@ def run_single_round_wrapper(srv, at, se, emit):
     tid = ""
 
     try:
-        emit('log', "Fetching weights (HF-preferred)…")
-        md, wb = fetch_task(srv, h, "bf16", se, emit)
-        if md is None: return
-
-        emit('status', 'preparing')
-        emit('log', "Preparing model…")
-
-        tid, gs = md['taskId'], md['globalStep']
-        sl = 2048
-        if len(wb) < EXPECTED_WEIGHT_BYTES:
-            emit('log', f"❌ Weight buffer too small: {len(wb):,} / {EXPECTED_WEIGHT_BYTES:,}")
+        emit('log', "Fetching task metadata...")
+        md = fetch_task_metadata(srv, h, se, emit)
+        if md is None:
             return
 
-        iw = decompress_weights(wb[:EXPECTED_MODEL_BYTES], "bf16")
-        ie = decompress_weights(wb[EXPECTED_MODEL_BYTES:EXPECTED_WEIGHT_BYTES], "bf16")
-        del wb; gc.collect()
+        tid = md.get("taskId")
+        gs = md.get("globalStep")
+        sl = MAX_SEQ_LEN
+
+        if not tid:
+            emit("log", "Task metadata missing taskId.")
+            return
+
+        iw = ie = None
+
+        if USE_HF_WEIGHTS:
+            wcfg = md.get("weights") or {}
+            if wcfg.get("source") == "huggingface":
+                try:
+                    emit('log', "Downloading weights from Hugging Face...")
+                    iw, ie = fetch_weights_from_hf(md, se, emit)
+                except KeyboardInterrupt:
+                    raise
+                except Exception as e:
+                    emit('log', f"Hugging Face weight download failed: {e}")
+                    emit('log', "Falling back to coordinator weight stream...")
+                    iw = ie = None
+
+        if iw is None or ie is None:
+            emit('log', "Downloading weights from coordinator...")
+            md2, wb = fetch_task(srv, h, "bf16", se, emit)
+            if md2 is None:
+                return
+
+            md = md2
+            tid = md.get("taskId")
+            gs = md.get("globalStep")
+
+            if not tid:
+                emit("log", "Coordinator task metadata missing taskId.")
+                return
+
+            bbl = EXPECTED_MODEL_SIZE * 2
+            ebl = EXPECTED_ENGRAM_SIZE * 2
+            needed = bbl + ebl
+
+            if len(wb) < needed:
+                raise RuntimeError(f"Incomplete coordinator weight payload: got {len(wb)}, expected {needed}")
+
+            iw = decompress_weights(wb[:bbl], "bf16")
+            ie = decompress_weights(wb[bbl:bbl + ebl], "bf16")
+
+            del wb
+            gc.collect()
+
+        emit('status', 'preparing')
+        emit('log', "Preparing model...")
 
         dc = md.get("datasetConfig", {})
         sc = md.get("shardConfig", {})
+
         ds = StreamingShardDataset(
             dc.get("repoId", DATASET_REPO_ID),
             dc.get("chunkIdx", 0),
@@ -999,6 +1248,7 @@ def run_single_round_wrapper(srv, at, se, emit):
         )
 
         bs = recommend_batch_size(sl)
+
         while bs >= 1:
             try:
                 if train_backend in ("CUDA", "ROCM"):
@@ -1018,11 +1268,11 @@ def run_single_round_wrapper(srv, at, se, emit):
                         try: torch.cuda.empty_cache()
                         except: pass
                     gc.collect(); bs = max(1, bs//2)
-                else:
-                    raise
+                else: raise
 
         if model is None:
-            emit('log', "Failed to initialize model."); return
+            emit('log', "Failed to initialize model.")
+            return
 
         mbt = bs*sl; as_ = max(1, round(131072/mbt)); ls = 1.0/as_
 
@@ -1037,11 +1287,13 @@ def run_single_round_wrapper(srv, at, se, emit):
 
         bp = [p for n, p in model.named_parameters() if not n.startswith('engram.')]
         ep = list(model.engram.parameters())
+
         try:
             import bitsandbytes as bnb
             ob = bnb.optim.AdamW8bit(bp, lr=1e-4, betas=(0.9, 0.95), weight_decay=0.01)
         except:
             ob = torch.optim.AdamW(bp, lr=1e-4, betas=(0.9, 0.95), weight_decay=0.01)
+
         try:
             oe = torch.optim.SparseAdam(ep, lr=1e-4)
         except:
@@ -1051,7 +1303,7 @@ def run_single_round_wrapper(srv, at, se, emit):
         ua = train_backend in ("CUDA", "ROCM") and torch.cuda.is_bf16_supported()
         ad = torch.bfloat16 if ua else None
 
-        emit('log', "Calibrating speed…")
+        emit('log', "Calibrating speed...")
         cs_ = time.time()
         cal_global_steps = 3
         target_micro_steps = 100
@@ -1067,40 +1319,63 @@ def run_single_round_wrapper(srv, at, se, emit):
                     if ds.needs_new_subchunk(): ds.advance(srv, "bf16")
                     sd = (abs(hash("cal")) % 10000) + cal_done*1000 + mi
                     x, y = ds.get_batch(bs, seed=sd); x, y = x.to(train_device), y.to(train_device)
+
                     want_preview = (micro_step == 0) or ((micro_step + 1) % PREVIEW_EVERY == 0)
                     lo, cards = _fwl(model, x, y, sl, ua, ad, ls, preview=want_preview)
-                    lval = float(lo.item()); micro_step += 1
-                    if cards: emit('model_preview', {'step': micro_step, 'cards': cards})
+                    lval = float(lo.item())
+                    micro_step += 1
+
+                    if cards:
+                        emit('model_preview', {'step': micro_step, 'cards': cards})
+
                     if cal_done >= 1 and mi == 0:
                         elapsed = time.time() - cs_
                         sps_micro = elapsed / micro_step
                         rh = max(0.1, rs.get("max_round_hours", 2.0) - rs.get("round_elapsed_hours", 0))
                         remaining = max(60, (rh*3600) - elapsed - (UPLOAD_BUFFER_MIN*60))
                         target_micro_steps = micro_step + int(remaining / sps_micro)
+
                     elapsed_cal = time.time() - cs_
                     current_tps = tt / max(elapsed_cal, 1.0)
+
+                    time_left_mins = 0
+                    if cal_done >= 1 and micro_step > 0:
+                        elapsed = time.time() - cs_
+                        sps_micro = elapsed / micro_step
+                        rh = max(0.1, rs.get("max_round_hours", 2.0) - rs.get("round_elapsed_hours", 0))
+                        remaining = max(60, (rh*3600) - elapsed - (UPLOAD_BUFFER_MIN*60))
+                        time_left_mins = remaining / 60.0
+
                     emit('cal_stats', {
-                        'step': micro_step, 'total': target_micro_steps,
+                        'step': micro_step,
+                        'total': target_micro_steps,
                         'loss': safe_float(lval * as_, 10.0),
                         'microbatch': micro_step,
-                        'tps': safe_float(current_tps)
+                        'tps': safe_float(current_tps),
+                        'time_left': safe_float(time_left_mins)
                     })
+
                     lo.backward()
                     oe.step(); oe.zero_grad(set_to_none=True)
                     tt += x.numel(); del lo, x, y
+
                 if hb.should_stop() or se.is_set(): return
+
             except RuntimeError as e:
                 if "out of memory" not in str(e).lower(): raise
                 ha(); continue
+
             torch.nn.utils.clip_grad_norm_(bp, 1.0)
             ob.step(); ob.zero_grad(set_to_none=True)
-            gc.collect(); cal_done += 1
+            gc.collect()
+            cal_done += 1
 
         if se.is_set(): return
 
         rh = max(0.1, rs.get("max_round_hours", 2.0) - rs.get("round_elapsed_hours", 0))
         remaining = max(60, (rh*3600) - (time.time() - cs_) - (UPLOAD_BUFFER_MIN*60))
         dl = time.time() + remaining
+
         if micro_step > 0:
             sps_micro = (time.time() - cs_) / micro_step
             target_micro_steps = micro_step + int(remaining / sps_micro)
@@ -1111,6 +1386,7 @@ def run_single_round_wrapper(srv, at, se, emit):
         emit('log', f"Target: ~{target_micro_steps} micro-steps")
 
         last_stats_emit = 0.0
+
         while time.time() < dl:
             if hb.should_stop() or se.is_set(): break
             ob.zero_grad(set_to_none=True)
@@ -1121,13 +1397,18 @@ def run_single_round_wrapper(srv, at, se, emit):
                     if ds.needs_new_subchunk(): ds.advance(srv, "bf16")
                     sd = (abs(hash("t")) % 10000) + micro_step*1000 + mi
                     x, y = ds.get_batch(bs, seed=sd); x, y = x.to(train_device), y.to(train_device)
+
                     want_preview = (micro_step == 0) or ((micro_step + 1) % PREVIEW_EVERY == 0)
                     lo, cards = _fwl(model, x, y, sl, ua, ad, ls, preview=want_preview)
                     lval = float(lo.item())*as_
                     lo.backward()
                     oe.step(); oe.zero_grad(set_to_none=True)
+
                     als += lval; tt += x.numel(); cc += 1; micro_step += 1
-                    if cards: emit('model_preview', {'step': micro_step, 'cards': cards})
+
+                    if cards:
+                        emit('model_preview', {'step': micro_step, 'cards': cards})
+
                     rem_time = max(1, dl - time.time())
                     elapsed_total = time.time() - cs_
                     if micro_step > 5:
@@ -1136,45 +1417,139 @@ def run_single_round_wrapper(srv, at, se, emit):
                         current_target = micro_step + future_steps
                         if current_target > target_micro_steps:
                             target_micro_steps = current_target
+
                     if time.time() - last_stats_emit > 0.25 or time.time() >= dl:
                         last_stats_emit = time.time()
                         lv = als/cc if cc > 0 else 10.0
                         ctps = tt/max(time.time()-cs_, 1)
                         emit('stats', {
-                            'step': micro_step, 'target': target_micro_steps,
-                            'loss': safe_float(lv, 10.0), 'tps': safe_float(ctps),
-                            'global_step': gs, 'round': cr,
+                            'step': micro_step,
+                            'target': target_micro_steps,
+                            'loss': safe_float(lv, 10.0),
+                            'tps': safe_float(ctps),
+                            'global_step': gs,
+                            'round': cr,
                             'time_left': safe_float(max(0, (dl-time.time())/60))
                         })
+
                     del lo, x, y
+
                 if hb.should_stop() or se.is_set(): break
+
             except RuntimeError as e:
                 if "out of memory" not in str(e).lower(): raise
                 ha(); continue
+
             if cc == 0: break
             torch.nn.utils.clip_grad_norm_(bp, 1.0)
             ob.step(); ob.zero_grad(set_to_none=True)
 
         if se.is_set():
-            emit('log', "Stopped by user. Skipping upload."); return
+            emit('log', "Stopped by user. Skipping upload.")
+            return
 
         fl = float(lval) if lval else 10.0
         emit('log', f"Done: {micro_step} micro-steps, loss {fl:.4f}")
         emit('status', 'uploading')
 
-        # --- Build delta ---
-        dbf = torch.from_numpy(model.get_base_weights()-iw).to(torch.bfloat16).view(torch.uint16).numpy()
-        ed = model.engram.table.weight.data.cpu()-iew
-        rn = ed.abs().sum(dim=1); k = max(1, int(len(rn)*0.10))
-        tv, ti = torch.topk(rn, k); ai = ti[tv > 1e-8]
+        dbf = torch.from_numpy(model.get_base_weights() - iw).to(torch.bfloat16).view(torch.uint16).numpy()
+        ed = model.engram.table.weight.data.cpu() - iew
+        rn = ed.abs().sum(dim=1)
+        k = max(1, int(len(rn) * 0.10))
+        tv, ti = torch.topk(rn, k)
+        ai = ti[tv > 1e-8]
         si = ai.cpu().numpy().astype(np.uint32) if len(ai) else np.array([], dtype=np.uint32)
         sv = ed[ai].to(torch.bfloat16).view(torch.uint16).numpy() if len(ai) else np.array([], dtype=np.uint16)
 
+        has_engram = bool(len(si) > 0)
+        engram_sparse_count = int(len(si))
+
+        pl = json.dumps({
+            "taskId": tid,
+            "loss": fl,
+            "localSteps": micro_step,
+            "tokensProcessed": tt,
+            "loraRank": 0,
+            "isDelta": True,
+            "weightFormat": "bf16",
+            "hasEngram": has_engram,
+            "engramSparseCount": engram_sparse_count,
+        }).encode()
+
+        bi = (
+            struct.pack('<I', len(pl))
+            + pl
+            + np.ascontiguousarray(dbf).tobytes()
+            + np.ascontiguousarray(si).tobytes()
+            + np.ascontiguousarray(sv).tobytes()
+        )
+
+        compressed_data = gzip.compress(bi, compresslevel=6)
+        upload_size_mb = len(compressed_data) / (1024 * 1024)
+
+        del dbf, ed, si, sv, pl, bi
+        gc.collect()
+
+        meta = {
+            "taskId": tid,
+            "loss": fl,
+            "localSteps": micro_step,
+            "tokensProcessed": tt,
+            "loraRank": 0,
+            "isDelta": True,
+            "weightFormat": "bf16",
+            "hasEngram": has_engram,
+            "engramSparseCount": engram_sparse_count,
+        }
+
         emit('overlay_show', {'title_key': 'uploading', 'indeterminate': False})
-        ok = upload_delta_chunked(srv, h, tid, fl, micro_step, tt, dbf, si, sv, se, emit)
-        emit('overlay_hide', {})
-        if not ok:
-            emit('log', "❌ Upload failed; delta not submitted")
+        emit('log', f"Uploading {upload_size_mb:.1f} MB delta to server...")
+
+        r = None
+
+        try:
+            if len(compressed_data) <= MAX_DIRECT_UPLOAD_BYTES:
+                try:
+                    r = requests.post(
+                        f"{srv}/fl/submit",
+                        headers={
+                            "Content-Type": "application/octet-stream",
+                            "Content-Encoding": "gzip",
+                            **h,
+                        },
+                        data=stream_with_progress(compressed_data, emit, len(compressed_data), se),
+                        timeout=600,
+                    )
+
+                    if r.status_code == 413:
+                        emit("log", "Direct upload rejected by edge/proxy. Switching to chunked upload...")
+                        r = chunked_submit_delta(srv, h, compressed_data, meta, emit, se)
+
+                except Exception as e:
+                    if len(compressed_data) > 8 * 1024 * 1024:
+                        emit("log", f"Direct upload failed ({e}). Trying chunked upload...")
+                        r = chunked_submit_delta(srv, h, compressed_data, meta, emit, se)
+                    else:
+                        raise
+            else:
+                r = chunked_submit_delta(srv, h, compressed_data, meta, emit, se)
+
+            if r is not None and r.status_code == 200:
+                emit("log", "Submitted successfully!")
+            elif r is not None:
+                emit("log", f"Submit failed: {r.text[:200]}")
+
+        except KeyboardInterrupt:
+            emit("log", "Upload aborted by user.")
+        except Exception as e:
+            emit("log", f"Upload failed: {e}")
+        finally:
+            emit("overlay_hide", {})
+            try:
+                del compressed_data
+            except Exception:
+                pass
+            gc.collect()
 
     finally:
         hb.stop()
@@ -1182,5 +1557,1194 @@ def run_single_round_wrapper(srv, at, se, emit):
         gc.collect()
         if train_backend in ("CUDA", "ROCM"):
             try:
-                torch.cuda.empty_cache(); gc.collect(); torch.cuda.empty_cache()
+                torch.cuda.empty_cache()
+                gc.collect()
+                torch.cuda.empty_cache()
             except: pass
+
+# ============ HTML / CSS / JS ============
+HTML = """<!DOCTYPE html>
+<html><head><meta charset="UTF-8">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+:root{
+  --bg:#fafaf9; --bg-soft:#ffffff; --bg-softer:#f0f0ee;
+  --text:#111113; --text-dim:#3a3a40; --text-muted:#6b6b73;
+  --border:#e4e4e1; --border-strong:#d0d0cb;
+  --accent:#16a34a; --accent-dim:#15803d;
+  --warn:#b45309;
+  --err:#dc2626; --err-soft:rgba(220,38,38,.06); --err-border:rgba(220,38,38,.28);
+  --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;
+  --mono:'JetBrains Mono',ui-monospace,"SF Mono",Menlo,Consolas,monospace;
+  --r:6px;
+}
+body.dark{
+  --bg:#1a1a1e; --bg-soft:#242428; --bg-softer:#2e2e33;
+  --text:#e8e8ec; --text-dim:#b8b8be; --text-muted:#888890;
+  --border:#3a3a40; --border-strong:#505058;
+  --accent:#22c55e; --accent-dim:#4ade80;
+  --warn:#fbbf24;
+  --err:#f87171; --err-soft:rgba(248,113,113,.08); --err-border:rgba(248,113,113,.35);
+}
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{height:100%;width:100%}
+body{background:var(--bg);color:var(--text);font-family:var(--sans);display:flex;flex-direction:column;overflow:hidden;font-size:14px;line-height:1.5}
+.mono{font-family:var(--mono)}
+
+header{flex:0 0 auto;height:54px;border-bottom:1px solid var(--border);background:var(--bg);display:flex;align-items:center;justify-content:space-between;padding:0 clamp(12px,2vw,20px);gap:10px}
+.logo{display:flex;align-items:center;gap:9px;min-width:0}
+.logo-img{height:22px;width:auto}
+.logo-fallback{width:24px;height:24px;border:1px solid var(--border-strong);display:none;place-items:center;font-size:13px;font-weight:600}
+.logo-text{font-size:15px;font-weight:600;white-space:nowrap}
+.logo-ver{font-family:var(--mono);font-size:10px;color:var(--text-muted);border:1px solid var(--border);padding:1px 5px;border-radius:3px}
+.header-right{display:flex;align-items:center;gap:8px}
+#user-info{font-family:var(--mono);font-size:11px;color:var(--text-muted);max-width:110px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+.theme-toggle{
+  width:30px;height:30px;flex:0 0 auto;
+  display:flex;align-items:center;justify-content:center;
+  background:var(--bg-soft);color:var(--text);
+  border:1px solid var(--border);border-radius:4px;
+  cursor:pointer;outline:none;font-size:14px;line-height:1;padding:0;
+}
+.theme-toggle:hover{border-color:var(--border-strong)}
+.theme-toggle .icon-sun{display:none}
+.theme-toggle .icon-moon{display:inline}
+body.dark .theme-toggle .icon-sun{display:inline}
+body.dark .theme-toggle .icon-moon{display:none}
+
+body:not(.dashboard-active) #backend-select { display: none; }
+
+.backend-select, .lang-select{
+  font-family:var(--sans);font-size:12px;
+  background:var(--bg-soft);color:var(--text);
+  border:1px solid var(--border);
+  padding:5px 22px 5px 8px;border-radius:4px;
+  cursor:pointer;outline:none;appearance:none;-webkit-appearance:none;
+  background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='8' height='5' viewBox='0 0 8 5'><path d='M0 0l4 5 4-5z' fill='%236b6b73'/></svg>");
+  background-repeat:no-repeat;background-position:right 7px center;background-size:8px;
+}
+body.dark .backend-select, body.dark .lang-select{
+  background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='8' height='5' viewBox='0 0 8 5'><path d='M0 0l4 5 4-5z' fill='%23888890'/></svg>");
+}
+.backend-select:hover, .lang-select:hover{border-color:var(--border-strong)}
+.backend-select:focus, .lang-select:focus{border-color:var(--accent)}
+.backend-select:disabled{opacity:.5;cursor:not-allowed}
+.backend-select option:disabled{color:var(--text-muted);opacity:.5}
+
+main{flex:1 1 auto;min-height:0;overflow-y:auto;overflow-x:hidden;padding:clamp(10px,2vw,18px) clamp(12px,2vw,20px)}
+.view{display:none;height:100%;min-height:0}
+.view.active{display:flex;flex-direction:column}
+
+#view-login.active{flex:1 1 auto;align-items:center;justify-content:center;padding:10px 0;min-height:0}
+.login-box{
+  width: min(380px, 100%); max-height: 100%; overflow-y: auto;
+  background: var(--bg-soft); border: 1px solid var(--border);
+  padding: clamp(14px, 2.5vw, 24px); border-radius: 8px;
+  display: flex; flex-direction: column;
+}
+.auth-screen{display:none;flex-direction:column;gap:0}
+.auth-screen.active{display:flex}
+
+.login-box h2{font-size:clamp(17px,3vw,21px);font-weight:600;text-align:center;margin-bottom:3px}
+.login-box h2 .em{color:var(--accent);font-weight:700}
+.login-sub{font-size:12px;color:var(--text-dim);text-align:center;margin-bottom:14px}
+.fg{margin-bottom:9px}
+.fg label{display:block;font-size:9px;color:var(--text-muted);margin-bottom:3px;font-family:var(--mono);text-transform:uppercase;letter-spacing:.07em}
+input{width:100%;font-family:inherit;font-size:12.5px;background:var(--bg-softer);color:var(--text);border:1px solid var(--border);padding:8px 10px;border-radius:4px;outline:none;transition:border-color .15s}
+input:focus{border-color:var(--accent)}
+input.err{border-color:var(--err)}
+
+button{font-family:inherit;font-size:12.5px;font-weight:500;cursor:pointer;border-radius:4px;transition:all .15s}
+.btn-primary{background:var(--text);color:var(--bg);border:1px solid var(--text);padding:9px 14px}
+.btn-primary:hover:not(:disabled){opacity:.85}
+.btn-danger{background:transparent;color:var(--err);border:1px solid var(--err);padding:9px 14px}
+.btn-danger:hover:not(:disabled){background:var(--err);color:#fff}
+button:disabled{opacity:.4;cursor:not-allowed}
+.auth-btn{width:100%;margin-top:2px}
+
+.error-box{
+  display:none;margin-top:8px;padding:8px 10px 8px 12px;
+  background:var(--err-soft);border:1px solid var(--err-border);border-left:3px solid var(--err);
+  border-radius:4px;font-size:12px;color:var(--err);line-height:1.4;
+}
+.error-box.show{display:block}
+
+.auth-switch{margin-top:12px;font-size:12px;color:var(--text-muted);text-align:center}
+.auth-switch a{color:var(--accent-dim);font-weight:500;cursor:pointer;text-decoration:none;border-bottom:1px solid transparent;transition:border-color .15s}
+.auth-switch a:hover{border-bottom-color:var(--accent-dim)}
+
+.anon-hint{margin-top:10px;padding-top:10px;border-top:1px solid var(--border);font-size:11px;color:var(--text-muted);text-align:center;line-height:1.4}
+.anon-hint a{color:var(--text-dim);cursor:pointer;text-decoration:none;border-bottom:1px dotted var(--border-strong)}
+.anon-hint a:hover{color:var(--text);border-bottom-color:var(--text)}
+
+.dash{display:flex;flex-direction:column;gap:12px;flex:1 1 auto;min-height:0}
+.dash-head{display:flex;align-items:center;justify-content:space-between;gap:10px;flex:0 0 auto}
+.dash-title{font-size:17px;font-weight:600}
+.status-badge{font-family:var(--mono);font-size:10px;padding:3px 10px;border-radius:100px;background:rgba(22,163,74,.08);color:var(--accent-dim);border:1px solid rgba(22,163,74,.35);white-space:nowrap}
+body.dark .status-badge{background:rgba(34,197,94,.12);border-color:rgba(34,197,94,.4)}
+
+.stats-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;flex:0 0 auto}
+.stat-card{background:var(--bg-soft);border:1px solid var(--border);padding:12px 14px;border-radius:var(--r);min-width:0}
+.stat-val{font-family:var(--mono);font-size:clamp(17px,2.4vw,22px);font-weight:500;color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.stat-val.accent{color:var(--accent-dim)}
+.stat-lbl{font-size:11px;color:var(--text-muted);margin-top:2px}
+
+.panel{background:var(--bg-soft);border:1px solid var(--border);border-radius:var(--r);padding:10px 12px;flex:0 0 auto}
+.panel.flex{flex:1 1 auto;display:flex;flex-direction:column;min-height:160px}
+.panel-head{display:flex;justify-content:space-between;gap:8px;align-items:center;margin-bottom:8px;font-family:var(--mono);font-size:11px;color:var(--text-muted);flex-wrap:wrap}
+.panel-head .pv{color:var(--text)}
+.progress-track{height:6px;background:var(--bg-softer);border:1px solid var(--border);border-radius:3px;overflow:hidden}
+.progress-fill{height:100%;width:0%;background:var(--accent);transition:width .4s ease}
+
+.dash-body{
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 12px;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+@media (min-width: 800px) {
+  .dash-body { grid-template-columns: 1fr 1fr; }
+}
+.col {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-height: 0;
+}
+.panel-content {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-strong) transparent;
+}
+
+.graph-container{position:relative;height:230px}
+#loss-graph{position:absolute;inset:0;width:100%;height:100%;display:block;transition:opacity .2s}
+#loss-graph.hidden-graph{opacity:0;pointer-events:none}
+.graph-empty{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:var(--text-muted);font-family:var(--mono);font-size:11px;transition:opacity .2s}
+.graph-empty.hidden-empty{opacity:0;pointer-events:none}
+
+.pred-lines{display:flex;flex-direction:column;gap:6px;font-family:var(--mono);font-size:12px}
+.preview-empty{color:var(--text-muted);text-align:center;padding:24px 0;font-size:11px}
+.pred-line{
+  display:flex;justify-content:space-between;align-items:center;gap:12px;padding:6px 8px;
+  border-radius:4px;border:1px solid var(--border);background:var(--bg-softer);
+  animation:lineIn .24s ease;
+}
+@keyframes lineIn{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+.pred-line.good{border-left:3px solid var(--accent)}
+.pred-line.bad{border-left:3px solid var(--err)}
+.pred-main{display:flex;flex-wrap:wrap;align-items:center;gap:6px;min-width:0;flex:1}
+.pred-text{color:var(--text-dim);font-size:12px;word-break:break-word}
+.pred-token{font-weight:600;padding:1px 5px;border-radius:3px;font-size:12px}
+.good .pred-token{background:rgba(22,163,74,.10);color:var(--accent-dim)}
+.bad .pred-token{background:rgba(220,38,38,.08);color:var(--err)}
+.pred-side{display:flex;align-items:center;gap:8px;color:var(--text-muted);font-size:10px;white-space:nowrap;flex:0 0 auto}
+.pred-badge{font-weight:600}
+.good .pred-badge{color:var(--accent-dim)}
+.bad .pred-badge{color:var(--err)}
+
+.status-strip{
+  flex:0 0 auto;font-family:var(--mono);font-size:11px;color:var(--text-muted);
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding:4px 0;
+}
+.ss-event{display:block;width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+.controls{flex:0 0 auto;display:flex;gap:8px;justify-content:flex-end;align-items:center;flex-wrap:wrap}
+
+.overlay{position:fixed;inset:0;background:rgba(250,250,249,.86);backdrop-filter:blur(3px);display:flex;align-items:center;justify-content:center;z-index:50;opacity:0;pointer-events:none;transition:opacity .25s}
+body.dark .overlay{background:rgba(26,26,30,.86)}
+.overlay.show{opacity:1;pointer-events:auto}
+.overlay-card{width:min(420px,88vw);background:var(--bg-soft);border:1px solid var(--border);border-radius:8px;padding:22px 24px}
+.overlay-title{font-size:15px;font-weight:600;margin-bottom:4px}
+.overlay-subtitle{font-size:12.5px;color:var(--text-muted);margin-bottom:14px;line-height:1.5;display:none}
+.overlay-subtitle.show{display:block}
+.overlay-bar{height:10px;background:var(--bg-softer);border:1px solid var(--border);border-radius:5px;overflow:hidden;position:relative}
+.overlay-bar.hidden{display:none}
+.overlay-fill{height:100%;width:0%;background:linear-gradient(90deg,#15803d,#16a34a 55%,#4ade80);transition:width .25s ease}
+body.dark .overlay-fill{background:linear-gradient(90deg,#15803d,#22c55e 55%,#86efac)}
+.overlay-bar.indet .overlay-fill{width:35%;transition:none;animation:indet 1.15s ease-in-out infinite}
+@keyframes indet{0%{transform:translateX(-100%)}100%{transform:translateX(300%)}}
+.overlay-sub{margin-top:10px;font-family:var(--mono);font-size:11px;color:var(--text-muted);display:flex;justify-content:space-between;gap:8px}
+
+.overlay-card .overlay-msg{font-size:13px;color:var(--text-dim);line-height:1.5;margin-bottom:16px}
+.overlay-card .overlay-actions{display:flex;gap:8px;justify-content:flex-end}
+.overlay-card .overlay-actions button{min-width:90px;justify-content:center}
+
+.motd-overlay {
+  position: fixed;
+  top: 24px;
+  left: 50%;
+  transform: translateX(-50%) translateY(-20px);
+  width: min(520px, 92vw);
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--warn);
+  border-radius: 6px;
+  padding: 16px 20px;
+  box-shadow: 0 12px 32px rgba(0,0,0,0.08);
+  z-index: 200;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.4s ease, transform 0.4s cubic-bezier(0.16, 1, 0.3, 1);
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+body.dark .motd-overlay {
+  box-shadow: 0 12px 32px rgba(0,0,0,0.4);
+}
+.motd-overlay.show {
+  opacity: 1;
+  pointer-events: auto;
+  transform: translateX(-50%) translateY(0);
+}
+.motd-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+.motd-title {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--warn);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--mono);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+.motd-close {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 12px;
+  line-height: 1;
+  padding: 4px 8px;
+  border-radius: 4px;
+  font-family: var(--mono);
+  transition: all 0.15s;
+}
+.motd-close:hover {
+  color: var(--text);
+  border-color: var(--border-strong);
+  background: var(--bg-softer);
+}
+.motd-text {
+  font-size: 13px;
+  color: var(--text-dim);
+  line-height: 1.65;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 240px;
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-strong) transparent;
+}
+
+@media (max-width:520px){
+  header{height:auto;flex-wrap:wrap;padding:8px 12px}
+  #user-info{display:none}
+  .controls button{flex:1}
+}
+</style></head>
+<body>
+<header>
+  <div class="logo">
+    <img src="__LOGO__" id="logo-img" data-light="__LOGO__" data-dark="__LOGO_DARK__" class="logo-img" alt="" onerror="this.style.display='none';this.nextElementSibling.style.display='grid';">
+    <div class="logo-fallback">C</div>
+    <span class="logo-text">CrowdGPT</span>
+    <span class="logo-ver">v__VERSION__</span>
+  </div>
+  <div class="header-right">
+    <span id="user-info"></span>
+    <select class="backend-select" id="backend-select" disabled></select>
+    <select class="lang-select" id="lang-select">
+      <option value="en">🇬🇧 English</option>
+      <option value="fr">🇫🇷 Français</option>
+      <option value="es">🇪🇸 Español</option>
+      <option value="de">🇩🇪 Deutsch</option>
+      <option value="tr">🇹🇷 Türkçe</option>
+    </select>
+    <button class="theme-toggle" id="theme-toggle" title="Toggle dark mode"><span class="icon-moon">🌙</span><span class="icon-sun">☀️</span></button>
+  </div>
+</header>
+
+<main>
+  <div id="view-login" class="view active">
+    <div class="login-box">
+      <div class="auth-screen active" id="screen-login">
+        <h2><span data-i18n="login_pre"></span><span class="em">CrowdGPT</span></h2>
+        <p class="login-sub" data-i18n="login_sub"></p>
+        <div class="fg"><label data-i18n="server_url"></label><input type="text" id="login-server" value="https://server.crowdgpt.net"></div>
+        <div class="fg"><label data-i18n="username"></label><input type="text" id="login-user" data-i18n-ph="ph_user" autocomplete="username"></div>
+        <div class="fg"><label data-i18n="password"></label><input type="password" id="login-pass" autocomplete="current-password"></div>
+        <div class="error-box" id="login-error"></div>
+        <button id="btn-login" class="btn-primary auth-btn" data-i18n="login_btn"></button>
+        <div class="auth-switch">
+          <span data-i18n="no_account"></span>
+          <a id="go-to-register" data-i18n="register_link"></a>
+        </div>
+        <div class="anon-hint">
+          <span data-i18n="anon_preface"></span>
+          <a id="btn-anon" data-i18n="anon_link"></a>
+        </div>
+      </div>
+
+      <div class="auth-screen" id="screen-register">
+        <h2><span data-i18n="register_title_pre"></span><span class="em">CrowdGPT</span></h2>
+        <p class="login-sub" data-i18n="register_sub"></p>
+        <div class="fg"><label data-i18n="server_url"></label><input type="text" id="reg-server" value="https://server.crowdgpt.net"></div>
+        <div class="fg"><label data-i18n="username"></label><input type="text" id="reg-user" data-i18n-ph="ph_user" autocomplete="username"></div>
+        <div class="fg"><label data-i18n="email"></label><input type="email" id="reg-email" autocomplete="email"></div>
+        <div class="fg"><label data-i18n="password"></label><input type="password" id="reg-pass" autocomplete="new-password"></div>
+        <div class="error-box" id="reg-error"></div>
+        <button id="btn-register" class="btn-primary auth-btn" data-i18n="register_btn"></button>
+        <div class="auth-switch">
+          <span data-i18n="have_account"></span>
+          <a id="go-to-login" data-i18n="login_link"></a>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="view-dashboard" class="view">
+    <div class="dash">
+      <div class="dash-head">
+        <span class="dash-title" data-i18n="dash_title"></span>
+        <span class="status-badge" id="status-indicator"></span>
+      </div>
+
+      <div class="stats-grid">
+        <div class="stat-card"><div class="stat-val accent" id="stat-loss">—</div><div class="stat-lbl" data-i18n="loss"></div></div>
+        <div class="stat-card"><div class="stat-val" id="stat-tps">—</div><div class="stat-lbl" data-i18n="tokens_sec"></div></div>
+        <div class="stat-card"><div class="stat-val" id="stat-time">—</div><div class="stat-lbl" data-i18n="time_left"></div></div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <span><span data-i18n="round"></span> <span class="pv" id="stat-round">—</span> · <span data-i18n="step"></span> <span class="pv" id="stat-step-cur">0</span>/<span class="pv" id="stat-step-tot">0</span></span>
+          <span class="pv" id="progress-text">0%</span>
+        </div>
+        <div class="progress-track"><div class="progress-fill" id="progress-bar"></div></div>
+      </div>
+
+      <div class="dash-body">
+        <div class="col">
+          <div class="panel flex">
+            <div class="panel-head">
+              <span data-i18n="loss_history"></span>
+              <span class="pv" id="graph-last"></span>
+            </div>
+            <div class="graph-container">
+              <canvas id="loss-graph"></canvas>
+              <div class="graph-empty" id="graph-empty" data-i18n="waiting_data"></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="col">
+          <div class="panel flex">
+            <div class="panel-head">
+              <span data-i18n="model_thoughts"></span>
+              <span class="pv" id="preview-step">—</span>
+            </div>
+            <div class="panel-content">
+              <div id="model-preview" class="pred-lines">
+                <div class="preview-empty" data-i18n="waiting_preview"></div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="status-strip">
+        <span class="ss-event" id="status-event"></span>
+      </div>
+
+      <div class="controls">
+        <button id="btn-start" class="btn-primary api-btn" data-i18n="start"></button>
+        <button id="btn-stop" class="btn-danger api-btn" data-i18n="stop" disabled></button>
+      </div>
+    </div>
+  </div>
+</main>
+
+<div class="overlay" id="overlay">
+  <div class="overlay-card">
+    <div class="overlay-title" id="overlay-title"></div>
+    <div class="overlay-subtitle" id="overlay-subtitle"></div>
+    <div class="overlay-bar" id="overlay-bar"><div class="overlay-fill" id="overlay-fill"></div></div>
+    <div class="overlay-sub"><span id="overlay-pct"></span><span id="overlay-mb"></span></div>
+  </div>
+</div>
+
+<div class="overlay" id="backend-overlay">
+  <div class="overlay-card">
+    <div class="overlay-title" data-i18n="backend_change_title"></div>
+    <div class="overlay-msg" data-i18n="backend_change_msg"></div>
+    <div class="overlay-actions">
+      <button id="btn-backend-cancel" class="btn-danger" data-i18n="cancel"></button>
+      <button id="btn-backend-confirm" class="btn-primary" data-i18n="confirm"></button>
+    </div>
+  </div>
+</div>
+
+<div class="motd-overlay" id="motd-overlay">
+  <div class="motd-header">
+    <div class="motd-title">⚠️ <span data-i18n="motd_title">System Notice</span></div>
+    <button class="motd-close" id="motd-close" data-i18n="close">Close</button>
+  </div>
+  <div class="motd-text" id="motd-text"></div>
+</div>
+
+<script>
+const I18N={
+ en:{
+   login_pre:"Sign in to ",login_sub:"Welcome back to the swarm.",
+   register_title_pre:"Join ",register_sub:"Create your account and start contributing.",
+   server_url:"Server address",username:"Username",password:"Password",email:"Email",
+   ph_user:" ",
+   login_btn:"Log in",register_btn:"Create account",
+   no_account:"No account yet?",register_link:"Create one",
+   have_account:"Already registered?",login_link:"Log in",
+   anon_preface:"Prefer to stay anonymous?",anon_link:"Skip and contribute anonymously",
+   dash_title:"Training",loss:"Loss",tokens_sec:"Tokens/sec",time_left:"Time left",round:"Round",step:"Step",
+   loss_history:"Loss history",waiting_data:"Waiting for training data…",
+   model_thoughts:"Model Predictions",waiting_preview:"Waiting for first prediction…",
+   idle:"Idle",training:"Training…",waiting:"Waiting…",uploading:"Uploading…",
+   downloading:"Downloading…",preparing:"Preparing…",calibrating:"Calibrating…",
+   dl_weights:"Downloading weights…",wait_coord:"Waiting for coordinator…",
+   wait_coord_sub:"This can take a few minutes. The coordinator aggregates updates from all clients between rounds.",
+   start:"Start training",stop:"Stop",
+   backend_change_title:"Switch backend?",
+   backend_change_msg:"Switching backend will reset your current training session and restart the round. Your contribution so far will be discarded. Continue?",
+   cancel:"Cancel",confirm:"Switch & restart",
+   err_invalid_credentials:"Invalid username or password.",
+   err_username_taken:"This username is already taken. Please choose another.",
+   err_email_taken:"An account with this email already exists.",
+   err_weak_password:"Password must be at least 6 characters.",
+   err_invalid_input:"Please check your input and try again.",
+   err_login_failed:"Could not log in. Please try again.",
+   err_register_failed:"Could not create account. Please try again.",
+   err_network:"Cannot reach the server.",
+   motd_title:"System Notice", close:"Close"
+ },
+ fr:{
+   login_pre:"Connexion à ",login_sub:"Bon retour parmi nous.",
+   register_title_pre:"Rejoignez ",register_sub:"Créez votre compte et commencez à contribuer.",
+   server_url:"Adresse du serveur",username:"Nom d'utilisateur",password:"Mot de passe",email:"E-mail",
+   ph_user:" ",
+   login_btn:"Se connecter",register_btn:"Créer le compte",
+   no_account:"Pas encore de compte ?",register_link:"Créer un compte",
+   have_account:"Déjà inscrit ?",login_link:"Se connecter",
+   anon_preface:"Vous préférez rester anonyme ?",anon_link:"Continuer anonymement",
+   dash_title:"Entraînement",loss:"Perte",tokens_sec:"Tokens/sec",time_left:"Reste",round:"Manche",step:"Étape",
+   loss_history:"Historique de perte",waiting_data:"En attente de données…",
+   model_thoughts:"Prédictions du modèle",waiting_preview:"En attente de la première prédiction…",
+   idle:"Inactif",training:"Entraînement…",waiting:"Attente…",uploading:"Envoi…",
+   downloading:"Téléchargement…",preparing:"Préparation…",calibrating:"Calibration…",
+   dl_weights:"Téléchargement des poids…",wait_coord:"En attente du coordinateur…",
+   wait_coord_sub:"Cela peut prendre quelques minutes.",
+   start:"Démarrer l'entraînement",stop:"Arrêter",
+   backend_change_title:"Changer de backend ?",
+   backend_change_msg:"Changer de backend réinitialisera votre session.",
+   cancel:"Annuler",confirm:"Changer & redémarrer",
+   err_invalid_credentials:"Nom d'utilisateur ou mot de passe invalide.",
+   err_username_taken:"Ce nom d'utilisateur est déjà pris.",
+   err_email_taken:"Un compte avec cet e-mail existe déjà.",
+   err_weak_password:"Le mot de passe doit contenir au moins 6 caractères.",
+   err_invalid_input:"Veuillez vérifier vos informations.",
+   err_login_failed:"Connexion impossible. Réessayez.",
+   err_register_failed:"Création du compte impossible. Réessayez.",
+   err_network:"Serveur injoignable.",
+   motd_title:"Avis système", close:"Fermer"
+ },
+ es:{
+   login_pre:"Inicia sesión en ",login_sub:"Bienvenido de vuelta al enjambre.",
+   register_title_pre:"Únete a ",register_sub:"Crea tu cuenta y empieza a contribuir.",
+   server_url:"Dirección del servidor",username:"Nombre de usuario",password:"Contraseña",email:"Correo",
+   ph_user:" ",
+   login_btn:"Iniciar sesión",register_btn:"Crear cuenta",
+   no_account:"¿Aún no tienes cuenta?",register_link:"Crear una",
+   have_account:"¿Ya estás registrado?",login_link:"Iniciar sesión",
+   anon_preface:"¿Prefieres seguir anónimo?",anon_link:"Continuar anónimamente",
+   dash_title:"Entrenamiento",loss:"Pérdida",tokens_sec:"Tokens/seg",time_left:"Queda",round:"Ronda",step:"Paso",
+   loss_history:"Historial de pérdida",waiting_data:"Esperando datos…",
+   model_thoughts:"Predicciones del modelo",waiting_preview:"Esperando la primera predicción…",
+   idle:"Inactivo",training:"Entrenando…",waiting:"Esperando…",uploading:"Subiendo…",
+   downloading:"Descargando…",preparing:"Preparando…",calibrating:"Calibrando…",
+   dl_weights:"Descargando pesos…",wait_coord:"Esperando al coordinador…",
+   wait_coord_sub:"Esto puede tardar unos minutos.",
+   start:"Iniciar entrenamiento",stop:"Detener",
+   backend_change_title:"¿Cambiar de backend?",
+   backend_change_msg:"Cambiar de backend reiniciará tu sesión.",
+   cancel:"Cancelar",confirm:"Cambiar y reiniciar",
+   err_invalid_credentials:"Usuario o contraseña incorrectos.",
+   err_username_taken:"Este nombre de usuario ya está en uso.",
+   err_email_taken:"Ya existe una cuenta con este correo.",
+   err_weak_password:"La contraseña debe tener al menos 6 caracteres.",
+   err_invalid_input:"Revisa los datos e inténtalo de nuevo.",
+   err_login_failed:"No se pudo iniciar sesión. Inténtalo de nuevo.",
+   err_register_failed:"No se pudo crear la cuenta. Inténtalo de nuevo.",
+   err_network:"No se puede contactar el servidor.",
+   motd_title:"Aviso del sistema", close:"Cerrar"
+ },
+ de:{
+   login_pre:"Anmelden bei ",login_sub:"Willkommen zurück im Schwarm.",
+   register_title_pre:"Tritt ",register_sub:"Erstelle dein Konto und trage bei.",
+   server_url:"Serveradresse",username:"Benutzername",password:"Passwort",email:"E-Mail",
+   ph_user:" ",
+   login_btn:"Anmelden",register_btn:"Konto erstellen",
+   no_account:"Noch kein Konto?",register_link:"Jetzt erstellen",
+   have_account:"Bereits registriert?",login_link:"Anmelden",
+   anon_preface:"Lieber anonym bleiben?",anon_link:"Anonym weitermachen",
+   dash_title:"Training",loss:"Verlust",tokens_sec:"Tokens/Sek",time_left:"Rest",round:"Runde",step:"Schritt",
+   loss_history:"Verlustverlauf",waiting_data:"Warte auf Trainingsdaten…",
+   model_thoughts:"Modellvorhersagen",waiting_preview:"Warte auf erste Vorhersage…",
+   idle:"Bereit",training:"Training…",waiting:"Warten…",uploading:"Upload…",
+   downloading:"Wird heruntergeladen…",preparing:"Vorbereitung…",calibrating:"Kalibrierung…",
+   dl_weights:"Gewichte werden heruntergeladen…",wait_coord:"Warte auf Koordinator…",
+   wait_coord_sub:"Das kann ein paar Minuten dauern.",
+   start:"Training starten",stop:"Stopp",
+   backend_change_title:"Backend wechseln?",
+   backend_change_msg:"Das Wechseln des Backends setzt deine Sitzung zurück.",
+   cancel:"Abbrechen",confirm:"Wechseln & neu starten",
+   err_invalid_credentials:"Benutzername oder Passwort ungültig.",
+   err_username_taken:"Dieser Benutzername ist bereits vergeben.",
+   err_email_taken:"Ein Konto mit dieser E-Mail existiert bereits.",
+   err_weak_password:"Das Passwort muss mindestens 6 Zeichen lang sein.",
+   err_invalid_input:"Bitte Eingabe prüfen und erneut versuchen.",
+   err_login_failed:"Anmeldung fehlgeschlagen. Bitte erneut versuchen.",
+   err_register_failed:"Konto konnte nicht erstellt werden. Bitte erneut versuchen.",
+   err_network:"Server nicht erreichbar.",
+   motd_title:"Systemmeldung", close:"Schließen"
+ },
+ tr:{
+   login_pre:"Giriş yap: ",login_sub:"Sürüye tekrar hoş geldin.",
+   register_title_pre:"Katıl: ",register_sub:"Hesabını oluştur ve katkıda bulunmaya başla.",
+   server_url:"Sunucu adresi",username:"Kullanıcı adı",password:"Şifre",email:"E-posta",
+   ph_user:" ",
+   login_btn:"Giriş yap",register_btn:"Hesap oluştur",
+   no_account:"Hesabın yok mu?",register_link:"Bir tane oluştur",
+   have_account:"Zaten kayıtlı mısın?",login_link:"Giriş yap",
+   anon_preface:"Anonim kalmayı mı tercih edersin?",anon_link:"Atla ve anonim olarak katkıda bulun",
+   dash_title:"Eğitim",loss:"Kayıp",tokens_sec:"Token/sn",time_left:"Kalan",round:"Tur",step:"Adım",
+   loss_history:"Kayıp geçmişi",waiting_data:"Eğitim verisi bekleniyor…",
+   model_thoughts:"Model Tahminleri",waiting_preview:"İlk tahmin bekleniyor…",
+   idle:"Boşta",training:"Eğitiliyor…",waiting:"Bekleniyor…",uploading:"Yükleniyor…",
+   downloading:"İndiriliyor…",preparing:"Hazırlanıyor…",calibrating:"Kalibre ediliyor…",
+   dl_weights:"Ağırlıklar indiriliyor…",wait_coord:"Koordinatör bekleniyor…",
+   wait_coord_sub:"Bu birkaç dakika sürebilir.",
+   start:"Eğitimi başlat",stop:"Durdur",
+   backend_change_title:"Backend değiştir?",
+   backend_change_msg:"Backend değiştirmek mevcut oturumu sıfırlayacak.",
+   cancel:"İptal",confirm:"Değiştir & yeniden başlat",
+   err_invalid_credentials:"Geçersiz kullanıcı adı veya şifre.",
+   err_username_taken:"Bu kullanıcı adı zaten alınmış. Lütfen başka bir tane seçin.",
+   err_email_taken:"Bu e-posta ile zaten bir hesap mevcut.",
+   err_weak_password:"Şifre en az 6 karakter olmalıdır.",
+   err_invalid_input:"Lütfen girdinizi kontrol edip tekrar deneyin.",
+   err_login_failed:"Giriş yapılamadı. Lütfen tekrar deneyin.",
+   err_register_failed:"Hesap oluşturulamadı. Lütfen tekrar deneyin.",
+   err_network:"Sunucuya ulaşılamıyor.",
+   motd_title:"Sistem Uyarısı", close:"Kapat"
+ }
+};
+
+let lang='en',statusKey='idle';
+let pendingBackend=null;
+const lossHistory=[];const MAXP=80;
+function t(k){return (I18N[lang]&&I18N[lang][k])||I18N.en[k]||k}
+function applyT(){
+  document.querySelectorAll('[data-i18n]').forEach(e=>e.textContent=t(e.getAttribute('data-i18n')));
+  document.querySelectorAll('[data-i18n-ph]').forEach(e=>e.placeholder=t(e.getAttribute('data-i18n-ph')));
+  document.getElementById('status-indicator').textContent=t(statusKey);
+}
+document.getElementById('lang-select').addEventListener('change',e=>{lang=e.target.value;applyT()});
+
+function showAuthScreen(name){
+  document.querySelectorAll('.auth-screen').forEach(s=>s.classList.remove('active'));
+  document.getElementById('screen-'+name).classList.add('active');
+  const loginSrv = document.getElementById('login-server');
+  const regSrv = document.getElementById('reg-server');
+  if(name==='register' && loginSrv.value) regSrv.value = loginSrv.value;
+  if(name==='login' && regSrv.value) loginSrv.value = regSrv.value;
+  document.getElementById('login-error').classList.remove('show');
+  document.getElementById('reg-error').classList.remove('show');
+}
+document.getElementById('go-to-register').addEventListener('click',e=>{e.preventDefault();showAuthScreen('register')});
+document.getElementById('go-to-login').addEventListener('click',e=>{e.preventDefault();showAuthScreen('login')});
+
+function callApi(n,...a){if(window.pywebview&&window.pywebview.api&&window.pywebview.api[n]){window.pywebview.api[n](...a);return true}return false}
+window.addEventListener('pywebviewready',()=>{
+  document.body.classList.add('ready');
+  callApi('get_backends');
+});
+
+document.getElementById('btn-login').addEventListener('click',()=>{
+  const srv=document.getElementById('login-server').value.trim();
+  const u=document.getElementById('login-user').value.trim();
+  const p=document.getElementById('login-pass').value;
+  if(!u||!p){ showLoginError('err_invalid_credentials'); return; }
+  document.getElementById('login-error').classList.remove('show');
+  document.getElementById('btn-login').disabled=true;
+  callApi('login',srv,u,p);
+});
+
+document.getElementById('btn-register').addEventListener('click',()=>{
+  const srv=document.getElementById('reg-server').value.trim();
+  const u=document.getElementById('reg-user').value.trim();
+  const email=document.getElementById('reg-email').value.trim();
+  const p=document.getElementById('reg-pass').value;
+  if(!u||!email||!p){ showRegError('err_invalid_input'); return; }
+  document.getElementById('reg-error').classList.remove('show');
+  document.getElementById('btn-register').disabled=true;
+  callApi('register',srv,u,email,p);
+});
+
+document.getElementById('btn-anon').addEventListener('click',e=>{
+  e.preventDefault();
+  callApi('login_anon');
+});
+
+document.getElementById('btn-start').addEventListener('click',()=>{if(callApi('start')){document.getElementById('btn-start').disabled=true;document.getElementById('btn-stop').disabled=false}});
+document.getElementById('btn-stop').addEventListener('click',()=>{callApi('stop');document.getElementById('btn-start').disabled=false;document.getElementById('btn-stop').disabled=true});
+
+document.getElementById('backend-select').addEventListener('change',e=>{
+  const newBackend = e.target.value;
+  if(newBackend === window._currentBackend){ return; }
+  if(statusKey === 'idle'){
+    callApi('set_backend', newBackend);
+  } else {
+    pendingBackend = newBackend;
+    document.getElementById('backend-overlay').classList.add('show');
+  }
+});
+
+document.getElementById('btn-backend-cancel').addEventListener('click',()=>{
+  document.getElementById('backend-overlay').classList.remove('show');
+  const sel = document.getElementById('backend-select');
+  sel.value = window._currentBackend || sel.value;
+  pendingBackend = null;
+});
+
+document.getElementById('btn-backend-confirm').addEventListener('click',()=>{
+  document.getElementById('backend-overlay').classList.remove('show');
+  if(pendingBackend){
+    callApi('set_backend', pendingBackend);
+    pendingBackend = null;
+  }
+});
+
+function showLoginError(code){
+  const el=document.getElementById('login-error');
+  el.textContent=t(code);
+  el.classList.add('show');
+  document.getElementById('btn-login').disabled=false;
+}
+function showRegError(code){
+  const el=document.getElementById('reg-error');
+  el.textContent=t(code);
+  el.classList.add('show');
+  document.getElementById('btn-register').disabled=false;
+}
+
+function mb(b){return (b/1048576).toFixed(1)}
+function overlayShow(data){
+  document.getElementById('overlay').classList.add('show');
+  document.getElementById('overlay-title').textContent=t(data.title_key);
+  
+  const sub = document.getElementById('overlay-subtitle');
+  if(data.subtitle_key){
+    sub.textContent = t(data.subtitle_key);
+    sub.classList.add('show');
+  } else {
+    sub.classList.remove('show');
+  }
+  
+  const bar = document.getElementById('overlay-bar');
+  const subBox = document.querySelector('#overlay .overlay-sub');
+  if(data.hide_bar){
+    bar.classList.add('hidden');
+    subBox.style.display = 'none';
+  } else {
+    bar.classList.remove('hidden');
+    subBox.style.display = 'flex';
+    bar.classList.toggle('indet',!!data.indeterminate);
+    document.getElementById('overlay-fill').style.width=data.indeterminate?'':'0%';
+    document.getElementById('overlay-pct').textContent='';
+    document.getElementById('overlay-mb').textContent='';
+  }
+}
+function overlayHide(){document.getElementById('overlay').classList.remove('show')}
+
+function drawGraph(){
+  const c=document.getElementById('loss-graph');
+  if(!c) return;
+  const empty=document.getElementById('graph-empty');
+  
+  if(lossHistory.length < 2){
+    c.classList.add('hidden-graph');
+    if(empty) empty.classList.remove('hidden-empty');
+    return;
+  }
+
+  c.classList.remove('hidden-graph');
+  if(empty) empty.classList.add('hidden-empty');
+
+  const rect=c.getBoundingClientRect();
+  const W = rect.width;
+  const H = rect.height;
+
+  if(W < 10 || H < 10) {
+      requestAnimationFrame(drawGraph);
+      return;
+  }
+
+  const ctx=c.getContext('2d');
+  const dpr=window.devicePixelRatio||1;
+  c.width=Math.round(W*dpr);
+  c.height=Math.round(H*dpr);
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+  ctx.clearRect(0,0,W,H);
+
+  const data=lossHistory.slice(-MAXP);
+  const mn=Math.min(...data),mx=Math.max(...data),range=(mx-mn)||1;
+  const pad=6,pH=H-pad*2,pW=W-pad*2,st=pW/(data.length-1);
+  const isDark=document.body.classList.contains('dark');
+  const gridColor=isDark?'rgba(255,255,255,.06)':'rgba(17,17,19,.07)';
+  const lineColor=isDark?'#22c55e':'#16a34a';
+
+  ctx.strokeStyle=gridColor;ctx.lineWidth=1;
+  for(let g=1;g<4;g++){const y=pad+pH*g/4;ctx.beginPath();ctx.moveTo(pad,y);ctx.lineTo(pad+pW,y);ctx.stroke()}
+
+  const pt=i=>[pad+i*st,pad+pH-(data[i]-mn)/range*pH];
+  ctx.beginPath();
+  data.forEach((v,i)=>{const[x,y]=pt(i);i?ctx.lineTo(x,y):ctx.moveTo(x,y)});
+  ctx.lineTo(pad+pW,pad+pH);ctx.lineTo(pad,pad+pH);ctx.closePath();
+  const gr=ctx.createLinearGradient(0,0,0,H);
+  gr.addColorStop(0,isDark?'rgba(34,197,94,.20)':'rgba(22,163,74,.16)');gr.addColorStop(1,'rgba(22,163,74,0)');
+  ctx.fillStyle=gr;ctx.fill();
+
+  ctx.beginPath();
+  data.forEach((v,i)=>{const[x,y]=pt(i);i?ctx.lineTo(x,y):ctx.moveTo(x,y)});
+  ctx.strokeStyle=lineColor;ctx.lineWidth=1.5;ctx.stroke();
+  const[lx,ly]=pt(data.length-1);
+  ctx.fillStyle=lineColor;ctx.beginPath();ctx.arc(lx,ly,2.5,0,Math.PI*2);ctx.fill();
+}
+
+window.handleEvent=function(ev,data){
+  if(ev==='login_success'){
+    document.getElementById('view-login').classList.remove('active');
+    document.getElementById('view-dashboard').classList.add('active');
+    document.body.classList.add('dashboard-active');
+    document.getElementById('user-info').textContent=data.username;
+    document.getElementById('btn-login').disabled=false;
+    document.getElementById('btn-register').disabled=false;
+    requestAnimationFrame(drawGraph);
+  }
+  else if(ev==='login_error'){
+    const code = data.code || 'err_invalid_credentials';
+    const errMap = {
+      invalid_credentials:'err_invalid_credentials',
+      login_failed:'err_login_failed',
+      username_taken:'err_username_taken',
+      email_taken:'err_email_taken',
+      weak_password:'err_weak_password',
+      invalid_input:'err_invalid_input',
+      register_failed:'err_register_failed',
+      network:'err_network'
+    };
+    const tKey = errMap[code] || 'err_login_failed';
+    const loginActive = document.getElementById('screen-login').classList.contains('active');
+    if(loginActive) showLoginError(tKey);
+    else showRegError(tKey);
+  }
+  else if(ev==='meta'){}
+  else if(ev==='log'){document.getElementById('status-event').textContent=data}
+  else if(ev==='backends'){
+    const sel = document.getElementById('backend-select');
+    sel.innerHTML = '';
+    window._currentBackend = data.current;
+    const order = [
+      {key:'cuda', label:'CUDA (NVIDIA)'},
+      {key:'rocm', label:'ROCm (AMD)'},
+      {key:'mps', label:'MPS (Apple)'},
+      {key:'xpu', label:'XPU (Intel)'},
+      {key:'directml', label:'DirectML (Windows)'},
+      {key:'cpu', label:'CPU'}
+    ];
+    order.forEach(bk=>{
+      const opt = document.createElement('option');
+      opt.value = bk.key;
+      opt.textContent = bk.label;
+      opt.disabled = !data.available[bk.key];
+      if(bk.key === data.current) opt.selected = true;
+      sel.appendChild(opt);
+    });
+    sel.disabled = false;
+  }
+  else if(ev==='overlay_show'){overlayShow(data)}
+  else if(ev==='overlay_progress'){
+    const bar=document.getElementById('overlay-bar');
+    if(data.total>0){
+      bar.classList.remove('indet');
+      const pct=Math.min(100,data.done/data.total*100);
+      document.getElementById('overlay-fill').style.width=pct+'%';
+      document.getElementById('overlay-pct').textContent=pct.toFixed(1)+'%';
+      document.getElementById('overlay-mb').textContent=mb(data.done)+' / '+mb(data.total)+' MB';
+    }else{bar.classList.add('indet');document.getElementById('overlay-mb').textContent=mb(data.done)+' MB'}
+  }
+  else if(ev==='overlay_hide'){overlayHide()}
+  else if(ev==='cal_stats' || ev==='stats'){
+    const loss = Number(data.loss);
+    const tps = Number(data.tps);
+    const step = Number(data.step);
+    const target = ev==='cal_stats' ? Number(data.total) : Number(data.target);
+    const time_left = Number(data.time_left);
+
+    if(isFinite(loss)){
+        document.getElementById('stat-loss').textContent=loss.toFixed(4);
+        document.getElementById('graph-last').textContent=loss.toFixed(4);
+        if(loss > 0){
+            lossHistory.push(loss);
+            if(lossHistory.length>MAXP*2)lossHistory.splice(0,lossHistory.length-MAXP*2);
+        }
+    }
+    if(isFinite(tps)){
+        document.getElementById('stat-tps').textContent=Math.round(tps);
+    }
+    if(isFinite(time_left)){
+        document.getElementById('stat-time').textContent=Math.round(time_left)+'m';
+    }
+    
+    document.getElementById('stat-round').textContent = ev==='cal_stats' ? '—' : (data.round != null ? data.round : '—');
+    document.getElementById('stat-step-cur').textContent=isFinite(step) ? step : 0;
+    document.getElementById('stat-step-tot').textContent=isFinite(target) ? target : 0;
+    
+    const pct = (isFinite(step) && isFinite(target) && target > 0) ? Math.min(100, (step/target)*100) : 0;
+    document.getElementById('progress-bar').style.width=pct+'%';
+    document.getElementById('progress-text').textContent=pct.toFixed(1)+'%';
+    
+    requestAnimationFrame(drawGraph);
+  }
+  else if(ev==='model_preview'){
+    const container = document.getElementById('model-preview');
+    const stepEl = document.getElementById('preview-step');
+    if(!container || !stepEl) return;
+    stepEl.textContent = 'Step ' + data.step;
+    
+    let html = '';
+    if(data.cards && data.cards.length > 0){
+        data.cards.forEach((card) => {
+            const cls = card.match ? 'good' : 'bad';
+            const badge = card.match ? '✓' : '✗';
+            const prob = (typeof card.prob === 'number' && isFinite(card.prob)) ? (card.prob*100).toFixed(1)+'%' : '';
+            
+            html += '<div class="pred-line ' + cls + '">' +
+                '<div class="pred-main">' +
+                '<span class="pred-text">' + escapeHtml(card.context) + '</span>' +
+                '<span class="pred-token">' + escapeHtml(card.pred) + '</span>' +
+                '</div>' +
+                '<div class="pred-side">' +
+                '<span class="pred-badge">' + badge + '</span>' +
+                '<span class="pred-target">target: ' + escapeHtml(card.target) + '</span>' +
+                '<span class="pred-prob">' + prob + '</span>' +
+                '</div>' +
+                '</div>';
+        });
+    } else {
+        html = '<div class="preview-empty">' + escapeHtml(t('waiting_preview')) + '</div>';
+    }
+    
+    container.innerHTML = html;
+  }
+  else if(ev==='preview_loss'){}
+  else if(ev==='status'){
+    statusKey=data;
+    document.getElementById('status-indicator').textContent=t(statusKey);
+    if(data==='training'||data==='idle'||data==='calibrating'||data==='preparing')overlayHide();
+    if(data==='idle'){document.getElementById('btn-start').disabled=false;document.getElementById('btn-stop').disabled=true}
+  }
+};
+
+function escapeHtml(s){
+  return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({
+    '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+  }[c]));
+}
+
+window.addEventListener('resize',()=>requestAnimationFrame(drawGraph));
+if(window.ResizeObserver){new ResizeObserver(()=>requestAnimationFrame(drawGraph)).observe(document.getElementById('loss-graph'))}
+
+/* ===== DARK MODE + LOGO SWAP (fully guarded) ===== */
+function updateLogo(){
+  try {
+    var img = document.getElementById('logo-img');
+    if(!img) return;
+    var isDark = document.body.classList.contains('dark');
+    var src = isDark ? img.getAttribute('data-dark') : img.getAttribute('data-light');
+    if(src && src.length > 30) img.src = src;
+  } catch(e){}
+}
+
+(function(){
+  try{
+    var saved=null;
+    try{ saved=localStorage.getItem('crowdgpt-theme'); }catch(e){}
+    var prefersDark=false;
+    try{ prefersDark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches; }catch(e){}
+    if(saved==='dark' || (!saved && prefersDark)){ document.body.classList.add('dark'); }
+    updateLogo();
+  }catch(e){}
+  var tbtn=document.getElementById('theme-toggle');
+  if(tbtn){
+    tbtn.addEventListener('click',function(){
+      document.body.classList.toggle('dark');
+      try{ localStorage.setItem('crowdgpt-theme', document.body.classList.contains('dark')?'dark':'light'); }catch(e){}
+      updateLogo();
+      requestAnimationFrame(drawGraph);
+    });
+  }
+})();
+
+applyT();
+
+// Fetch Message of the Day (Once per day)
+(function(){
+  const key = 'crowdgpt_motd_last_day';
+  const today = new Date().toISOString().slice(0, 10);
+
+  let last = null;
+  try { last = localStorage.getItem(key); } catch(e) {}
+
+  if (last === today) return;
+
+  fetch('https://raw.githubusercontent.com/Vxtzq/CrowdGPT/main/docs/motd.txt')
+    .then(r => r.ok ? r.text() : '')
+    .then(text => {
+      text = (text || '').trim();
+      if (!text) return;
+
+      document.getElementById('motd-text').textContent = text;
+      document.getElementById('motd-overlay').classList.add('show');
+
+      try { localStorage.setItem(key, today); } catch(e) {}
+    })
+    .catch(() => {});
+})();
+
+document.getElementById('motd-close').addEventListener('click', () => {
+  document.getElementById('motd-overlay').classList.remove('show');
+});
+</script></body></html>"""
+
+# ============ API ============
+class Api:
+    def __init__(self):
+        self.window=None; self.stop_event=threading.Event()
+        self.thread=None; self.auth_token=None; self.username=None
+        self.server_url=DEFAULT_SERVER; self._lp=0.0
+        self.selected_backend = get_best_default_backend()
+
+    def emit(self, ev, data):
+        if not self.window: return
+        if ev=='preview_loss':
+            n=time.time()
+            if n-self._lp<0.4: return
+            self._lp=n
+        try: 
+            clean_data = sanitize_for_json(data)
+            self.window.evaluate_js(f"window.handleEvent({json.dumps(ev)}, {json.dumps(clean_data)});")
+        except Exception as e:
+            log.warning(f"Emit failed for {ev}: {e}")
+
+    def get_backends(self):
+        available = get_available_backends()
+        self.emit('backends', {'available': available, 'current': self.selected_backend})
+
+    def set_backend(self, backend_name):
+        self.selected_backend = backend_name
+        if self.thread and self.thread.is_alive():
+            self.stop_event.set()
+
+    def login(self, s, u, p):
+        self.server_url = s or self.server_url
+        threading.Thread(target=self._do_login, args=(u, p), daemon=True).start()
+
+    def _do_login(self, u, p):
+        tok, err = do_login(self.server_url, u, p)
+        if tok:
+            self.auth_token, self.username = tok, u
+            self.emit('login_success', {'username': u})
+        else:
+            self.emit('login_error', {'code': err or 'login_failed'})
+
+    def register(self, s, u, email, p):
+        self.server_url = s or self.server_url
+        threading.Thread(target=self._do_register, args=(u, email, p), daemon=True).start()
+
+    def _do_register(self, u, email, p):
+        tok, err = do_register(self.server_url, u, email, p)
+        if tok:
+            self.auth_token, self.username = tok, u
+            self.emit('login_success', {'username': u})
+        else:
+            self.emit('login_error', {'code': err or 'register_failed'})
+
+    def login_anon(self):
+        self.auth_token, self.username = None, "anonymous"
+        self.emit('login_success', {'username': 'anonymous'})
+
+    def start(self):
+        if self.thread and self.thread.is_alive(): return
+        self.stop_event.clear(); self.thread=threading.Thread(target=self._rs, daemon=True); self.thread.start()
+        
+    def stop(self): self.stop_event.set()
+
+    def _check_updates_between_rounds(self):
+        """Between rounds, check for updates. If applied, restart the process."""
+        try:
+            if check_for_update():
+                self.emit('log', f"🔄 Updated to a new version — restarting...")
+                self.emit('status', 'idle')
+                time.sleep(2)
+                _restart_self()  # never returns on POSIX
+        except Exception as e:
+            log.warning(f"Update check failed: {e}")
+    
+    def _rs(self):
+        global train_device, train_backend
+        try:
+            train_device, train_backend = detect_training_backend(self.selected_backend)
+            self.emit('meta',{'backend':train_backend})
+            self.emit('log',f"Backend: {train_backend} ({train_device})")
+            auto_detect_vram_budget()
+            self.emit('log',f"VRAM: {memory_config['ram_gb']:.1f} GB")
+        except Exception as e:
+            self.emit('log',f"Error: {e}"); self.emit('status','idle'); return
+            
+        round_count = 0
+        while not self.stop_event.is_set():
+            round_count += 1
+            self.emit('log', f"{'='*40}")
+            self.emit('log', f"Starting Round Cycle #{round_count}")
+            self.emit('log', f"{'='*40}")
+            
+            try: 
+                run_single_round_wrapper(self.server_url, self.auth_token, self.stop_event, self.emit)
+            except KeyboardInterrupt:
+                self.stop_event.set()
+                break
+            except Exception as e: 
+                self.emit('log',f"Round failed: {e}")
+
+            if self.stop_event.is_set(): 
+                break
+
+            # Between rounds: safe place to apply an update and restart
+            if UPDATE_CHECK_BETWEEN_ROUNDS:
+                self._check_updates_between_rounds()
+
+            self.emit('status', 'waiting')
+            self.emit('log', "✅ Round complete. Auto-relaunching next round in 10s...")
+            for _ in range(10):
+                if self.stop_event.is_set(): break
+                time.sleep(1)
+                
+        self.emit('status','idle')
+        self.emit('log', "👋 Training stopped by user.")
+
+
+def startup():
+    try:
+        scr = webview.screens[0]
+        aw, ah = scr.width, scr.height
+        w = max(480, min(1040, int(aw * 0.80)))
+        h = max(360, min(800, int(ah * 0.80)))
+        w = min(w, aw - 16); h = min(h, ah - 48)
+        w = max(320, w); h = max(240, h)
+        window.resize(w, h)
+        window.move(max(0, (aw - w)//2), max(0, (ah - h)//2))
+    except Exception:
+        pass
+    
+    def set_window_icon():
+        try:
+            import gi
+            gi.require_version('Gtk', '3.0')
+            from gi.repository import Gtk, GdkPixbuf
+            
+            icon_path = None
+            if ICON_PATH and os.path.exists(ICON_PATH):
+                icon_path = ICON_PATH
+            elif _lp_light.exists():
+                icon_path = str(_lp_light.absolute())
+                
+            if not icon_path:
+                return
+                
+            for w in Gtk.Window.list_toplevels():
+                if w.get_title() == "CrowdGPT":
+                    pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_scale(icon_path, 64, 64, True)
+                    w.set_icon(pixbuf)
+                    break
+        except Exception:
+            pass
+
+    threading.Timer(0.5, set_window_icon).start()
+
+
+if __name__ == "__main__":
+    # ---- Auto-update check, before any UI is created ----
+    print(f"CrowdGPT client v{CLIENT_VERSION}")
+    try:
+        if check_for_update():
+            print("Update applied. Restarting...")
+            _restart_self()
+            # If _restart_self somehow returns, continue normally
+    except Exception as e:
+        log.warning(f"Auto-update check error: {e}")
+
+    api = Api()
+    start_tokenizer_loader()
+    
+    kwargs = {
+        "js_api": api,
+        "width": 1000,
+        "height": 720,
+        "min_size": (320, 240),
+    }
+    
+    html_out = (HTML
+        .replace("__LOGO__", LOGO_URI_LIGHT)
+        .replace("__LOGO_DARK__", LOGO_URI_DARK)
+        .replace("__VERSION__", CLIENT_VERSION)
+    )
+    
+    try:
+        if ICON_PATH and os.path.exists(ICON_PATH):
+            window = webview.create_window(
+                "CrowdGPT", html=html_out,
+                icon=ICON_PATH, **kwargs
+            )
+        else:
+            window = webview.create_window(
+                "CrowdGPT", html=html_out,
+                **kwargs
+            )
+    except TypeError:
+        window = webview.create_window(
+            "CrowdGPT", html=html_out,
+            **kwargs
+        )
+    
+    api.window = window
+    webview.start(startup, debug=False)

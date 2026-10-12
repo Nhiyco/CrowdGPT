@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-CrowdGPT GUI Client v0.12 — AMD→CPU default, persistence, DirectML fixes, backend selector.
+CrowdGPT GUI Client v2 — AMD→CPU default, persistence, DirectML fixes, backend selector.
 """
 import os, sys, io, json, time, struct, math, gc, threading, base64, logging, tempfile, atexit, subprocess, hashlib, shutil
 from pathlib import Path
@@ -1529,7 +1529,7 @@ def run_single_round_wrapper(srv, at, se, emit):
                     r = requests.post(
                         f"{srv}/fl/submit",
                         headers={"Content-Type": "application/octet-stream", "Content-Encoding": "gzip", **h},
-                        data=stream_with_progress(compressed_data, emit, len(compressed_data), se),
+                        data=compressed_data,
                         timeout=600,
                     )
                     if r.status_code == 413:

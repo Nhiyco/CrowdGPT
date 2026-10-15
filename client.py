@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-CrowdGPT GUI Client v2 — AMD→CPU default, persistence, DirectML fixes, backend selector.
+CrowdGPT GUI Client v3 — Layer offloading + DirectML runtime fallback.
 """
 import os, sys, io, json, time, struct, math, gc, threading, base64, logging, tempfile, atexit, subprocess, hashlib, shutil
 from pathlib import Path
@@ -22,7 +22,7 @@ sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='repla
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s', datefmt='%H:%M:%S')
 log = logging.getLogger(__name__)
 
-CLIENT_VERSION = "1"
+CLIENT_VERSION = "3"
 VERSION_URL = "https://raw.githubusercontent.com/Vxtzq/CrowdGPT/main/docs/version.txt"
 CLIENT_URL  = "https://raw.githubusercontent.com/Vxtzq/CrowdGPT/main/client.py"
 
@@ -413,6 +413,64 @@ def _is_directml(t):
     except Exception:
         return False
 
+def _is_directml_device(d):
+    try:
+        return d.type == 'privateuseone'
+    except Exception:
+        return False
+
+def _is_accel_error(msg):
+    """Detect DirectML/CUDA errors that warrant a fallback to CPU."""
+    m = msg.lower()
+    return any(k in m for k in (
+        "privateuse1", "unbox expects", "not implemented for",
+        "not supported", "internal assert", "dml",
+        "scatter", "compilegraph", "out of memory", "allocation",
+        "device_type", "not implemented for unique",
+    ))
+
+def _plan_gpu_layers(device, backend_name, ram_gb):
+    """
+    Decide how many transformer blocks to place on the accelerator.
+    Everything else (embeddings, lm_head, remaining blocks) stays on CPU.
+    """
+    try:
+        if backend_name == "CPU" or device.type == 'cpu':
+            return 0
+    except Exception:
+        return 0
+
+    ram_bytes = int(max(0.5, ram_gb) * 1024**3)
+    budget = int(ram_bytes * 0.80)  # 20% safety margin
+
+    params_per_block = (
+        DIM * 2
+        + DIM * (N_HEADS * HEAD_DIM)
+        + DIM * (N_KV_HEADS * HEAD_DIM) * 2
+        + DIM * DIM
+        + DIM * 2
+        + DIM * MLP_HIDDEN * 2
+        + MLP_HIDDEN * DIM
+    )
+    # fp32 weights + fp32 grad + fp32 Adam m + fp32 Adam v = 4× param count × 4 bytes
+    bytes_per_block = params_per_block * 4 * 4
+
+    if backend_name == "DIRECTML":
+        # DirectML is functional but fragile on this model.
+        # Cap at 2 blocks and rely on runtime fallback if anything breaks.
+        n_fit = int(budget // bytes_per_block)
+        n = max(0, min(2, min(N_LAYERS, n_fit)))
+        log.info(f"[PLACEMENT] DirectML: budget {ram_gb:.1f} GB → {n} block(s) on GPU")
+        return n
+
+    n_fit = int(budget // bytes_per_block)
+    n_fit = max(0, min(N_LAYERS, n_fit))
+    if n_fit < 1:
+        log.warning(f"[PLACEMENT] {backend_name}: budget {ram_gb:.1f} GB too small for any block on GPU")
+        return 0
+    log.info(f"[PLACEMENT] {backend_name}: budget {ram_gb:.1f} GB → {n_fit} block(s) on GPU")
+    return n_fit
+
 class GroupedQueryAttention(nn.Module):
     def __init__(self):
         super().__init__()
@@ -442,9 +500,13 @@ class GroupedQueryAttention(nn.Module):
         return self.wo((a @ v).transpose(1, 2).contiguous().view(B, T, C))
 
     def _chunked(self, q, k, v, B, T, C, cs=64):
+        # Some backends (DirectML) cannot materialize expanded views into CPU memory.
+        # Force .contiguous() before moving to CPU to avoid that.
         use_cpu = _is_directml(q)
         if use_cpu:
-            q_ = q.cpu(); k_ = k.cpu(); v_ = v.cpu()
+            q_ = q.contiguous().cpu()
+            k_ = k.contiguous().cpu()
+            v_ = v.contiguous().cpu()
         else:
             q_, k_, v_ = q, k, v
         chunks = []
@@ -483,6 +545,7 @@ class Block(nn.Module):
         return x + self.mlp(self.ln_2(x))
 
 class EngramMemory(nn.Module):
+    """Always runs on CPU. Output is moved to `device` for the caller."""
     def __init__(self, bn, device):
         super().__init__()
         self.device = device
@@ -490,17 +553,34 @@ class EngramMemory(nn.Module):
         nn.init.normal_(self.table.weight, mean=0.0, std=0.02)
 
     def forward(self, idx):
-        px = torch.cat([torch.zeros_like(idx[:, :1]), idx[:, :-1]], dim=1)
-        hi = (px * 1000003 + idx) % ENG_NUM_BUCKETS
-        hi_cpu = hi.reshape(-1).cpu()
-        uq, inv = torch.unique(hi_cpu, return_inverse=True)
+        # Everything CPU-side, then a single transfer of the result.
+        idx_cpu = idx.detach().cpu()
+        px = torch.cat([torch.zeros_like(idx_cpu[:, :1]), idx_cpu[:, :-1]], dim=1)
+        hi = (px * 1000003 + idx_cpu) % ENG_NUM_BUCKETS
+        uq, inv = torch.unique(hi.reshape(-1), return_inverse=True)
         cr = self.table(uq)
         out = cr[inv].view(idx.shape[0], idx.shape[1], DIM)
         return out.to(self.device)
 
 class SotaGPT(nn.Module):
-    def __init__(self, bn, device):
+    """
+    Layer-offloaded transformer. `gpu_layers` = number of leading blocks
+    placed on `device`. Everything else (embeddings, remaining blocks,
+    lm_head, ln_f) stays on CPU.
+    """
+    def __init__(self, bn, device, gpu_layers=None):
         super().__init__()
+        self.main_device = device
+        self.cpu_device = torch.device('cpu')
+        self.backend_name = bn
+
+        if gpu_layers is None:
+            gpu_layers = _plan_gpu_layers(device, bn, memory_config["ram_gb"])
+        self.gpu_layers = max(0, min(N_LAYERS, int(gpu_layers)))
+        self.gpu_layer_set = set(range(self.gpu_layers))
+        self.all_on_gpu = (self.gpu_layers == N_LAYERS) and (device.type != 'cpu')
+        self.any_on_gpu = (self.gpu_layers > 0) and (device.type != 'cpu')
+
         self.wte = nn.Embedding(VOCAB_SIZE, DIM)
         self.engram = EngramMemory(bn, device)
         self.blocks = nn.ModuleList([Block() for _ in range(N_LAYERS)])
@@ -508,9 +588,88 @@ class SotaGPT(nn.Module):
         self.lm_head = nn.Linear(DIM, VOCAB_SIZE, bias=False)
         if MODEL_CONFIG["weightTying"]:
             self.wte.weight = self.lm_head.weight
-        cm, sm = precompute_freqs(HEAD_DIM, MAX_SEQ_LEN, device)
-        self.register_buffer("freqs_cos", cm)
-        self.register_buffer("freqs_sin", sm)
+
+        cm_main, sm_main = precompute_freqs(HEAD_DIM, MAX_SEQ_LEN, device)
+        self.register_buffer("freqs_cos_main", cm_main)
+        self.register_buffer("freqs_sin_main", sm_main)
+
+        cm_cpu, sm_cpu = precompute_freqs(HEAD_DIM, MAX_SEQ_LEN, self.cpu_device)
+        self.register_buffer("freqs_cos_cpu", cm_cpu)
+        self.register_buffer("freqs_sin_cpu", sm_cpu)
+
+        for i, block in enumerate(self.blocks):
+            if self.all_on_gpu or i in self.gpu_layer_set:
+                block.to(device)
+            else:
+                block.to(self.cpu_device)
+
+        if self.all_on_gpu:
+            self.wte.to(device)
+            self.ln_f.to(device)
+            self.lm_head.to(device)
+        else:
+            # Head stays on CPU. Keeps VRAM free for block offloading
+            # and avoids the huge vocab matmul living on the accelerator.
+            self.wte.to(self.cpu_device)
+            self.ln_f.to(self.cpu_device)
+            self.lm_head.to(self.cpu_device)
+
+        self.engram.table.to('cpu')
+
+        log.info(
+            f"🧠 SotaGPT: {self.gpu_layers}/{N_LAYERS} blocks on {device.type}, "
+            f"head on {self.ln_f.weight.device.type}"
+        )
+
+    def _block_device(self, i):
+        if self.all_on_gpu or i in self.gpu_layer_set:
+            return self.main_device
+        return self.cpu_device
+
+    def forward_features(self, idx, use_chunked=True, use_ckpt=True):
+        """Runs embeddings + all blocks + final LN. Returns [B, T, DIM]."""
+        x = self.wte(idx)
+        cur_dev = x.device
+
+        for i, block in enumerate(self.blocks):
+            target = self._block_device(i)
+            if target != cur_dev:
+                x = x.to(target)
+                cur_dev = target
+
+            if cur_dev == self.cpu_device:
+                cos, sin = self.freqs_cos_cpu, self.freqs_sin_cpu
+            else:
+                cos, sin = self.freqs_cos_main, self.freqs_sin_main
+
+            if use_ckpt:
+                x = checkpoint(block, x, cos, sin, use_chunked, use_reentrant=False)
+            else:
+                x = block(x, cos, sin, use_chunked)
+
+        head_dev = self.ln_f.weight.device
+        if x.device != head_dev:
+            x = x.to(head_dev)
+        return self.ln_f(x)
+
+    def forward(self, idx, use_chunked=True, use_ckpt=True):
+        x = self.forward_features(idx, use_chunked, use_ckpt)
+        return self.lm_head(x)
+
+    def to_cpu_only(self):
+        """Hard fallback: put everything on CPU. Optimizer references stay valid."""
+        self.gpu_layers = 0
+        self.gpu_layer_set = set()
+        self.all_on_gpu = False
+        self.any_on_gpu = False
+        self.main_device = self.cpu_device
+        for block in self.blocks:
+            block.to(self.cpu_device)
+        self.wte.to(self.cpu_device)
+        self.ln_f.to(self.cpu_device)
+        self.lm_head.to(self.cpu_device)
+        self.engram.table.to('cpu')
+        self.engram.device = self.cpu_device
 
     def get_base_weights(self):
         return np.concatenate([
@@ -1038,37 +1197,37 @@ def _chunk_ce(m, xs, ys):
     return F.cross_entropy(m.lm_head(xs).reshape(-1, VOCAB_SIZE), ys.reshape(-1))
 
 def _fwl(m, x, y, sl, ua, ad, ls=1.0, preview=False):
+    """
+    Forward + loss. Uses model.forward_features to respect layer placement.
+    Wraps compute in try/except so callers can fall back to CPU on failure.
+    """
+    use_ckpt = m.all_on_gpu and m.main_device.type == 'cuda'
+
     def fwd():
-        xe = m.wte(x)
-        if ua:
-            with torch.autocast(device_type='cuda', enabled=False):
-                eo = m.engram(x)
-        else:
-            eo = m.engram(x)
-        xe = xe + eo.to(xe.dtype)
-        for b in m.blocks:
-            xe = checkpoint(b, xe, m.freqs_cos, m.freqs_sin, True, use_reentrant=False)
-        return m.ln_f(xe)
+        return m.forward_features(x, use_chunked=True, use_ckpt=use_ckpt)
 
     nc = max(1, math.ceil(sl / LOSS_CHUNK))
     if ua:
         with torch.autocast(device_type='cuda', dtype=ad):
             xe = fwd()
+            head_dev = m.lm_head.weight.device
+            if xe.device != head_dev:
+                xe = xe.to(head_dev)
+            y_dev = y.to(head_dev)
             lo = sum(
-                checkpoint(_chunk_ce, m, xe[:, i:i + LOSS_CHUNK, :], y[:, i:i + LOSS_CHUNK], use_reentrant=False)
+                checkpoint(_chunk_ce, m, xe[:, i:i + LOSS_CHUNK, :], y_dev[:, i:i + LOSS_CHUNK], use_reentrant=False)
                 for i in range(0, sl, LOSS_CHUNK)
             ) / nc
     else:
         xe = fwd()
-        on_dml = _is_directml(xe)
-        def chunk_loss(i):
-            xs = xe[:, i:i + LOSS_CHUNK, :]
-            ys = y[:, i:i + LOSS_CHUNK]
-            if on_dml:
-                xs = xs.contiguous()
-                ys = ys.contiguous()
-            return checkpoint(_chunk_ce, m, xs, ys, use_reentrant=False)
-        lo = sum(chunk_loss(i) for i in range(0, sl, LOSS_CHUNK)) / nc
+        head_dev = m.lm_head.weight.device
+        if xe.device != head_dev:
+            xe = xe.to(head_dev)
+        y_dev = y.to(head_dev)
+        lo = sum(
+            checkpoint(_chunk_ce, m, xe[:, i:i + LOSS_CHUNK, :], y_dev[:, i:i + LOSS_CHUNK], use_reentrant=False)
+            for i in range(0, sl, LOSS_CHUNK)
+        ) / nc
 
     cards = []
     if preview:
@@ -1209,6 +1368,23 @@ def stream_with_progress(data, emit_cb, total_size, stop_evt):
         yield chunk
     emit_cb("overlay_progress", {"done": total_size, "total": total_size})
 
+def _build_model(bn, device, iw, ie, emit):
+    """Build a SotaGPT with layer placement and load base + engram weights."""
+    model = SotaGPT(bn, device)
+    model.engram.table.to('cpu')
+
+    try:
+        print(f"[IW-PROBE] iw: shape={getattr(iw, 'shape', None)} size={getattr(iw, 'size', None)}", flush=True)
+        print(f"[IW-PROBE] ie: shape={getattr(ie, 'shape', None)} size={getattr(ie, 'size', None)}", flush=True)
+    except Exception:
+        pass
+
+    model.load_base_weights(iw)
+    model.engram.table.weight.data.copy_(torch.from_numpy(ie).view(model.engram.table.weight.shape))
+    model.engram.table.to('cpu')
+    model.train()
+    return model
+
 def run_single_round_wrapper(srv, at, se, emit):
     global train_device, train_backend
     h = {"Authorization": f"Bearer {at}"} if at else {}
@@ -1224,6 +1400,7 @@ def run_single_round_wrapper(srv, at, se, emit):
     lval = 10.0
     tt = 0
     tid = ""
+    tried_cpu_fallback = False
     try:
         emit('log', "Fetching task metadata...")
         md = fetch_task_metadata(srv, h, se, emit)
@@ -1270,6 +1447,7 @@ def run_single_round_wrapper(srv, at, se, emit):
             ie = decompress_weights(wb[bbl:bbl + ebl], "bf16")
             del wb
             gc.collect()
+
         emit('status', 'preparing')
         emit('log', "Preparing model...")
         dc = md.get("datasetConfig", {})
@@ -1283,26 +1461,15 @@ def run_single_round_wrapper(srv, at, se, emit):
             at,
         )
         bs = recommend_batch_size(sl)
+
+        # ---- Build model with layer placement, retry on OOM ----
         while bs >= 1:
             try:
                 if train_backend in ("CUDA", "ROCM"):
-                    try:
-                        torch.cuda.empty_cache()
-                    except Exception:
-                        pass
+                    try: torch.cuda.empty_cache()
+                    except Exception: pass
                 gc.collect()
-                model = SotaGPT(train_backend, train_device)
-                model.engram.table.to('cpu')
-                try:
-                    print(f"[IW-PROBE] iw: type={type(iw).__name__} shape={getattr(iw, 'shape', None)} size={getattr(iw, 'size', None)}", flush=True)
-                    print(f"[IW-PROBE] ie: type={type(ie).__name__} shape={getattr(ie, 'shape', None)} size={getattr(ie, 'size', None)}", flush=True)
-                except Exception as _pe:
-                    print(f"[IW-PROBE] probe failed: {_pe}", flush=True)
-                model.load_base_weights(iw)
-                model.engram.table.weight.data.copy_(torch.from_numpy(ie).view(model.engram.table.weight.shape))
-                model = model.to(train_device)
-                model.engram.table.to('cpu')
-                model.train()
+                model = _build_model(train_backend, train_device, iw, ie, emit)
                 break
             except RuntimeError as e:
                 if "out of memory" in str(e).lower():
@@ -1310,20 +1477,21 @@ def run_single_round_wrapper(srv, at, se, emit):
                         del model
                         model = None
                     if train_backend in ("CUDA", "ROCM"):
-                        try:
-                            torch.cuda.empty_cache()
-                        except Exception:
-                            pass
+                        try: torch.cuda.empty_cache()
+                        except Exception: pass
                     gc.collect()
                     bs = max(1, bs // 2)
                 else:
                     raise
+
         if model is None:
             emit('log', "Failed to initialize model.")
             return
+
         mbt = bs * sl
         as_ = max(1, round(131072 / mbt))
         ls = 1.0 / as_
+
         def ha():
             nonlocal as_, ls
             as_ = max(1, as_ // 2)
@@ -1331,11 +1499,10 @@ def run_single_round_wrapper(srv, at, se, emit):
             ob.zero_grad(set_to_none=True)
             gc.collect()
             if train_backend in ("CUDA", "ROCM"):
-                try:
-                    torch.cuda.empty_cache()
-                except Exception:
-                    pass
+                try: torch.cuda.empty_cache()
+                except Exception: pass
             emit('log', f"OOM -> accum now {as_}x")
+
         bp = [p for n, p in model.named_parameters() if not n.startswith('engram.')]
         ep = list(model.engram.parameters())
         try:
@@ -1347,9 +1514,16 @@ def run_single_round_wrapper(srv, at, se, emit):
             oe = torch.optim.SparseAdam(ep, lr=1e-4)
         except Exception:
             oe = torch.optim.AdamW(ep, lr=1e-4, weight_decay=0.01)
+
         iew = model.engram.table.weight.data.cpu().clone()
+
+        # Autocast only for CUDA + bf16 support
         ua = train_backend in ("CUDA", "ROCM") and torch.cuda.is_bf16_supported()
         ad = torch.bfloat16 if ua else None
+
+        emit('log', f"Backend: {train_backend} | autocast: {ua} | "
+                   f"bs={bs} | accum={as_} | dtype={'bf16' if ua else 'fp32'}")
+
         emit('log', "Calibrating speed...")
         cs_ = time.time()
         cal_global_steps = 3
@@ -1370,7 +1544,35 @@ def run_single_round_wrapper(srv, at, se, emit):
                     x, y = ds.get_batch(bs, seed=sd)
                     x, y = x.to(train_device), y.to(train_device)
                     want_preview = (micro_step == 0) or ((micro_step + 1) % PREVIEW_EVERY == 0)
-                    lo, cards = _fwl(model, x, y, sl, ua, ad, ls, preview=want_preview)
+
+                    # ---- DirectML/GPU runtime fallback ----
+                    try:
+                        lo, cards = _fwl(model, x, y, sl, ua, ad, ls, preview=want_preview)
+                    except RuntimeError as re:
+                        if (not tried_cpu_fallback) and _is_accel_error(str(re)):
+                            emit('log', f"⚠️ {train_backend} op failed at fwd: {str(re)[:120]}")
+                            emit('log', "🔻 Falling back to CPU-only model...")
+                            model.to_cpu_only()
+                            train_backend_local = "CPU (fallback)"
+                            # Rebuild optimizer over same params — objects unchanged
+                            bp = [p for n, p in model.named_parameters() if not n.startswith('engram.')]
+                            ep = list(model.engram.parameters())
+                            try:
+                                import bitsandbytes as bnb
+                                ob = bnb.optim.AdamW8bit(bp, lr=1e-4, betas=(0.9, 0.95), weight_decay=0.01)
+                            except Exception:
+                                ob = torch.optim.AdamW(bp, lr=1e-4, betas=(0.9, 0.95), weight_decay=0.01)
+                            try:
+                                oe = torch.optim.SparseAdam(ep, lr=1e-4)
+                            except Exception:
+                                oe = torch.optim.AdamW(ep, lr=1e-4, weight_decay=0.01)
+                            ua = False; ad = None
+                            tried_cpu_fallback = True
+                            emit('log', "✅ Retrying on CPU-only model")
+                            lo, cards = _fwl(model, x, y, sl, ua, ad, ls, preview=want_preview)
+                        else:
+                            raise
+
                     lval = float(lo.item())
                     micro_step += 1
                     if cards:
@@ -1391,8 +1593,7 @@ def run_single_round_wrapper(srv, at, se, emit):
                         remaining = max(60, (rh * 3600) - elapsed - (UPLOAD_BUFFER_MIN * 60))
                         time_left_mins = remaining / 60.0
                     emit('cal_stats', {
-                        'step': micro_step,
-                        'total': target_micro_steps,
+                        'step': micro_step, 'total': target_micro_steps,
                         'loss': safe_float(lval * as_, 10.0),
                         'microbatch': micro_step,
                         'tps': safe_float(current_tps),
@@ -1444,7 +1645,31 @@ def run_single_round_wrapper(srv, at, se, emit):
                     x, y = ds.get_batch(bs, seed=sd)
                     x, y = x.to(train_device), y.to(train_device)
                     want_preview = (micro_step == 0) or ((micro_step + 1) % PREVIEW_EVERY == 0)
-                    lo, cards = _fwl(model, x, y, sl, ua, ad, ls, preview=want_preview)
+
+                    try:
+                        lo, cards = _fwl(model, x, y, sl, ua, ad, ls, preview=want_preview)
+                    except RuntimeError as re:
+                        if (not tried_cpu_fallback) and _is_accel_error(str(re)):
+                            emit('log', f"⚠️ {train_backend} op failed at fwd: {str(re)[:120]}")
+                            emit('log', "🔻 Falling back to CPU-only model...")
+                            model.to_cpu_only()
+                            bp = [p for n, p in model.named_parameters() if not n.startswith('engram.')]
+                            ep = list(model.engram.parameters())
+                            try:
+                                import bitsandbytes as bnb
+                                ob = bnb.optim.AdamW8bit(bp, lr=1e-4, betas=(0.9, 0.95), weight_decay=0.01)
+                            except Exception:
+                                ob = torch.optim.AdamW(bp, lr=1e-4, betas=(0.9, 0.95), weight_decay=0.01)
+                            try:
+                                oe = torch.optim.SparseAdam(ep, lr=1e-4)
+                            except Exception:
+                                oe = torch.optim.AdamW(ep, lr=1e-4, weight_decay=0.01)
+                            ua = False; ad = None
+                            tried_cpu_fallback = True
+                            lo, cards = _fwl(model, x, y, sl, ua, ad, ls, preview=want_preview)
+                        else:
+                            raise
+
                     lval = float(lo.item()) * as_
                     lo.backward()
                     oe.step()
@@ -1468,12 +1693,9 @@ def run_single_round_wrapper(srv, at, se, emit):
                         lv = als / cc if cc > 0 else 10.0
                         ctps = tt / max(time.time() - cs_, 1)
                         emit('stats', {
-                            'step': micro_step,
-                            'target': target_micro_steps,
-                            'loss': safe_float(lv, 10.0),
-                            'tps': safe_float(ctps),
-                            'global_step': gs,
-                            'round': cr,
+                            'step': micro_step, 'target': target_micro_steps,
+                            'loss': safe_float(lv, 10.0), 'tps': safe_float(ctps),
+                            'global_step': gs, 'round': cr,
                             'time_left': safe_float(max(0, (dl - time.time()) / 60)),
                         })
                     del lo, x, y
@@ -1552,7 +1774,7 @@ def run_single_round_wrapper(srv, at, se, emit):
         except Exception as e:
             emit("log", f"Upload failed: {e}")
         finally:
-            emit("overlay_hide", {})
+            emit('overlay_hide', {})
             try:
                 del compressed_data
             except Exception:
@@ -1793,8 +2015,8 @@ document.getElementById('go-to-login').addEventListener('click',e=>{e.preventDef
 function callApi(n,...a){if(window.pywebview&&window.pywebview.api&&window.pywebview.api[n]){window.pywebview.api[n](...a);return true}return false}
 window.addEventListener('pywebviewready',()=>callApi('get_backends'));
 document.getElementById('backend-select').addEventListener('change',e=>{const nb=e.target.value;if(nb===window._currentBackend)return;callApi('set_backend',nb);});
-document.getElementById('btn-login').addEventListener('click',()=>{const srv=document.getElementById('login-server').value.trim();const u=document.getElementById('login-user').value.trim();const p=document.getElementById('login-pass').value;if(!u||!p){showLoginError('err_invalid_credentials');return}document.getElementById('btn-login').disabled=true;callApi('login',srv,u,p)});
-document.getElementById('btn-register').addEventListener('click',()=>{const srv=document.getElementById('reg-server').value.trim();const u=document.getElementById('reg-user').value.trim();const email=document.getElementById('reg-email').value.trim();const p=document.getElementById('reg-pass').value;if(!u||!email||!p){showRegError('err_invalid_input');return}document.getElementById('btn-register').disabled=true;callApi('register',srv,u,email,p)});
+document.getElementById('btn-login').addEventListener('click',()=>{const srv=document.getElementById('login-server').value.trim();const u=document.getElementById('login-user').value.trim();const p=document.getElementById('login-pass').value;if(!u||!p){showLoginError('err_invalid_credentials');return}document.getElementById('login-error').classList.remove('show');document.getElementById('btn-login').disabled=true;callApi('login',srv,u,p)});
+document.getElementById('btn-register').addEventListener('click',()=>{const srv=document.getElementById('reg-server').value.trim();const u=document.getElementById('reg-user').value.trim();const email=document.getElementById('reg-email').value.trim();const p=document.getElementById('reg-pass').value;if(!u||!email||!p){showRegError('err_invalid_input');return}document.getElementById('reg-error').classList.remove('show');document.getElementById('btn-register').disabled=true;callApi('register',srv,u,email,p)});
 document.getElementById('btn-anon').addEventListener('click',e=>{e.preventDefault();callApi('login_anon')});
 document.getElementById('btn-start').addEventListener('click',()=>{if(callApi('start')){document.getElementById('btn-start').disabled=true;document.getElementById('btn-stop').disabled=false}});
 document.getElementById('btn-stop').addEventListener('click',()=>{callApi('stop');document.getElementById('btn-start').disabled=false;document.getElementById('btn-stop').disabled=true});

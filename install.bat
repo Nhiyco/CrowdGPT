@@ -3,23 +3,27 @@ setlocal EnableExtensions EnableDelayedExpansion
 
 REM ============================================================
 REM CrowdGPT Universal Installer for Windows
-REM v10.0
-REM  - Windows strategy change: AMD on Windows uses DirectML.
-REM    ROCm on Windows was too fragile (three separate failure
-REM    modes in testing) and requires the AMD HIP SDK, which
-REM    most users don't have. If you want real ROCm on AMD,
-REM    use the Linux installer.
-REM  - Removed: HIP SDK detection, HSA_OVERRIDE_GFX_VERSION,
-REM    ROCm wheel index, ROCm matmul verify, HIP env vars in
-REM    launchers. All gone.
-REM  - transformers pin is now based on the installed torch
-REM    version (not the backend name). Any torch < 2.5 gets
-REM    transformers < 5.0.
-REM  - No more nested `if ... ( if ... ( ... ) )` blocks in
-REM    :do_integration. That entire class of CMD parser bug
-REM    is gone because we no longer branch on backend there.
-REM  - Kept: fresh-install wipe (preserves caches), uv/git
-REM    bootstrap, WebView2 check, desktop integration.
+REM v10.1
+REM  Changes vs v10.0:
+REM  - uv / Git no longer require a terminal restart. After any
+REM    install the PATH is re-read from the registry and merged
+REM    into the running session, and known install dirs are probed
+REM    as a fallback (winget Links, ~/.local/bin, etc).
+REM  - uv: official installer with a fixed install dir first,
+REM    winget as fallback (the old hardcoded paths missed winget).
+REM  - Git direct-download fallback was broken (404 on
+REM    latest/download/Git-64-bit.exe). Now resolves the real asset
+REM    through the GitHub API.
+REM  - DirectML verify snippets used Python %-formatting, which
+REM    cmd silently ate (%d / %s / %.4f). Rewritten without '%'.
+REM  - requirements filter regex lost its ^ anchor (cmd ate the
+REM    caret) and could drop unrelated lines such as pytorch-xxx.
+REM  - Uninstaller: PATH cleanup used a pipe that got mangled, and
+REM    the self-delete line had broken nested quotes. Both fixed.
+REM  - Non-integrated install: venv is now created inside the repo
+REM    instead of the directory the installer was launched from.
+REM  - Cosmetic: "^>" no longer printed literally in backend note.
+REM  - Start Menu icon: only .ico is used (.svg is not valid).
 REM ============================================================
 
 set "REPO_URL=https://github.com/Vxtzq/CrowdGPT.git"
@@ -91,7 +95,7 @@ exit /b 0
 
 echo.
 echo ============================================================
-echo                 CrowdGPT Installer  (v10.0)
+echo                 CrowdGPT Installer  (v10.1)
 echo ============================================================
 echo.
 
@@ -102,12 +106,12 @@ set "APP_DIR=%LOCALAPPDATA%\CrowdGPT"
 set "BIN_DIR=%APP_DIR%"
 set "START_MENU=%APPDATA%\Microsoft\Windows\Start Menu\Programs"
 
+REM VENV_DIR / APP_PY for the non-integrated case are set after
+REM the repo is located (see SRC_DIR below).
 if "!INTEGRATE!"=="1" (
     set "VENV_DIR=!APP_DIR!\.venv"
-) else (
-    set "VENV_DIR=%CD%\.venv"
+    set "APP_PY=!APP_DIR!\.venv\Scripts\python.exe"
 )
-set "APP_PY=!VENV_DIR!\Scripts\python.exe"
 
 REM ------------------------------------------------------------
 REM 0b. Wipe previous install (preserve caches)
@@ -145,64 +149,26 @@ if "!INTEGRATE!"=="1" if "!FRESH!"=="1" if exist "!APP_DIR!" (
 )
 
 REM ------------------------------------------------------------
-REM 1. Install uv
+REM 1. uv (no terminal restart needed)
 REM ------------------------------------------------------------
-where uv >nul 2>nul
+call :ensure_uv
 if errorlevel 1 (
-    echo [INFO] Installing uv...
-    where winget >nul 2>nul
-    if not errorlevel 1 (
-        winget install --id=astral-sh.uv -e --source winget --accept-source-agreements --accept-package-agreements
-    ) else (
-        echo [INFO] Installing uv via official installer...
-        powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://astral.sh/uv/install.ps1 | iex"
-    )
-    set "PATH=%USERPROFILE%\.local\bin;%LOCALAPPDATA%\uv;%PATH%"
-)
-
-where uv >nul 2>nul
-if errorlevel 1 (
-    echo [ERROR] uv installed but not on PATH. Restart terminal and rerun.
+    echo [ERROR] Could not install uv automatically.
+    echo         Install it manually from:
+    echo         https://docs.astral.sh/uv/getting-started/installation/
     goto :fatal
 )
 echo [OK] uv is ready.
 
 REM ------------------------------------------------------------
-REM 2. Locate / install Git
+REM 2. Git (no terminal restart needed)
 REM ------------------------------------------------------------
-where git >nul 2>nul
+call :ensure_git
 if errorlevel 1 (
-    echo [INFO] Git not found. Installing Git for Windows...
-    where winget >nul 2>nul
-    if not errorlevel 1 (
-        winget install --id Git.Git -e --source winget --accept-source-agreements --accept-package-agreements
-        if errorlevel 1 goto :git_fallback
-    ) else (
-        goto :git_fallback
-    )
-    set "PATH=%ProgramFiles%\Git\cmd;%ProgramFiles%\Git\bin;%PATH%"
+    echo [ERROR] Could not install Git automatically.
+    echo         Install it from https://git-scm.com/download/win and rerun.
+    goto :fatal
 )
-
-where git >nul 2>nul
-if errorlevel 1 goto :git_fallback
-goto :git_found
-
-:git_fallback
-echo [INFO] winget unavailable/failed. Downloading Git for Windows directly...
-set "GIT_INSTALLER=%TEMP%\Git-64-bit.exe"
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$u='https://github.com/git-for-windows/git/releases/latest/download/Git-64-bit.exe'; Invoke-WebRequest -Uri $u -OutFile '%GIT_INSTALLER%'"
-if errorlevel 1 goto :fatal
-
-echo [INFO] Installing Git silently...
-"%GIT_INSTALLER%" /VERYSILENT /NORESTART
-if errorlevel 1 goto :fatal
-del /q "%GIT_INSTALLER%" >nul 2>nul
-set "PATH=%ProgramFiles%\Git\cmd;%ProgramFiles%\Git\bin;%PATH%"
-
-where git >nul 2>nul
-if errorlevel 1 goto :fatal
-
-:git_found
 echo [OK] Git found.
 
 REM ------------------------------------------------------------
@@ -237,6 +203,11 @@ if not exist "client.py" (
     goto :fatal
 )
 set "SRC_DIR=%CD%"
+
+if not "!INTEGRATE!"=="1" (
+    set "VENV_DIR=!SRC_DIR!\.venv"
+    set "APP_PY=!SRC_DIR!\.venv\Scripts\python.exe"
+)
 
 REM ------------------------------------------------------------
 REM 4. Hardware detection
@@ -370,9 +341,10 @@ echo ============================================================
 set "TMP_REQ=%TEMP%\crowdgpt-req-%RANDOM%.txt"
 set "FILTER_PS=%TEMP%\crowdgpt-filter-%RANDOM%.ps1"
 
+REM Note: ^^ gives a literal caret, ^| a pipe, ^< ^> literal angle brackets.
 > "!FILTER_PS!"  echo $in  = '!SRC_DIR!\requirements.txt'
 >> "!FILTER_PS!" echo $out = '!TMP_REQ!'
->> "!FILTER_PS!" echo $rx  = '^\s*(torch^|torchvision^|torchaudio^|torch-directml)\b'
+>> "!FILTER_PS!" echo $rx  = '^^\s*(torch^|torchvision^|torchaudio^|torch-directml)\s*($^|[=^<^>~;#\[])'
 >> "!FILTER_PS!" echo Get-Content -LiteralPath $in ^| Where-Object { $_ -notmatch $rx } ^| Set-Content -LiteralPath $out -Encoding ASCII
 
 powershell -NoProfile -ExecutionPolicy Bypass -File "!FILTER_PS!"
@@ -498,12 +470,129 @@ if "!LAUNCH!"=="1" (
     exit /b !EXITCODE!
 ) else (
     if "!INTEGRATE!"=="1" (
-        echo To launch later:  crowdgpt
+        echo To launch later:  Start Menu ^> CrowdGPT   ^(or "crowdgpt" in a new terminal^)
     ) else (
         echo To launch later:  "!APP_PY!" "!SRC_DIR!\client.py"
     )
     exit /b 0
 )
+
+REM ============================================================
+REM Subroutine: refresh_path
+REM   Re-read Machine + User PATH from the registry and merge it
+REM   with the current session PATH (deduplicated). This is what
+REM   makes freshly installed tools usable without a new terminal.
+REM ============================================================
+:refresh_path
+set "RP_PS=%TEMP%\crowdgpt-path-%RANDOM%.ps1"
+set "NEW_PATH="
+> "!RP_PS!"  echo $m = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+>> "!RP_PS!" echo $u = [Environment]::GetEnvironmentVariable('Path', 'User')
+>> "!RP_PS!" echo $all = ($m + ';' + $u + ';' + $env:Path) -split ';' ^| Where-Object { $_ } ^| Select-Object -Unique
+>> "!RP_PS!" echo Write-Output ($all -join ';')
+for /f "usebackq delims=" %%P in (`powershell -NoProfile -ExecutionPolicy Bypass -File "!RP_PS!"`) do set "NEW_PATH=%%P"
+del "!RP_PS!" >nul 2>nul
+if defined NEW_PATH set "PATH=!NEW_PATH!"
+exit /b 0
+
+REM ============================================================
+REM Subroutine: probe_uv  /  probe_git
+REM   Fallback: if the exe exists in a well-known dir, prepend it
+REM   to the session PATH even if the registry was not updated.
+REM ============================================================
+:probe_uv
+for %%D in ("%LOCALAPPDATA%\uv\bin" "%USERPROFILE%\.local\bin" "%LOCALAPPDATA%\Microsoft\WinGet\Links" "%USERPROFILE%\.cargo\bin") do (
+    if exist "%%~D\uv.exe" set "PATH=%%~D;!PATH!"
+)
+exit /b 0
+
+:probe_git
+for %%D in ("%ProgramFiles%\Git\cmd" "%LOCALAPPDATA%\Programs\Git\cmd") do (
+    if exist "%%~D\git.exe" set "PATH=%%~D;!PATH!"
+)
+exit /b 0
+
+REM ============================================================
+REM Subroutine: ensure_uv
+REM   Returns 0 if uv is usable in THIS session afterwards.
+REM ============================================================
+:ensure_uv
+where uv >nul 2>nul
+if not errorlevel 1 exit /b 0
+
+call :probe_uv
+where uv >nul 2>nul
+if not errorlevel 1 exit /b 0
+
+echo [INFO] uv not found. Installing uv...
+
+REM Method 1: official installer into a known directory
+set "UV_INSTALL_DIR=%LOCALAPPDATA%\uv\bin"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; irm https://astral.sh/uv/install.ps1 | iex"
+set "UV_INSTALL_DIR="
+call :refresh_path
+call :probe_uv
+where uv >nul 2>nul
+if not errorlevel 1 exit /b 0
+
+REM Method 2: winget
+echo [WARN] Official installer did not make uv available. Trying winget...
+where winget >nul 2>nul
+if errorlevel 1 exit /b 1
+winget install --id=astral-sh.uv -e --source winget --accept-source-agreements --accept-package-agreements
+call :refresh_path
+call :probe_uv
+where uv >nul 2>nul
+if not errorlevel 1 exit /b 0
+exit /b 1
+
+REM ============================================================
+REM Subroutine: ensure_git
+REM   Returns 0 if git is usable in THIS session afterwards.
+REM ============================================================
+:ensure_git
+where git >nul 2>nul
+if not errorlevel 1 exit /b 0
+
+call :probe_git
+where git >nul 2>nul
+if not errorlevel 1 exit /b 0
+
+echo [INFO] Git not found. Installing Git for Windows...
+
+where winget >nul 2>nul
+if errorlevel 1 goto :git_direct
+winget install --id Git.Git -e --source winget --accept-source-agreements --accept-package-agreements
+call :refresh_path
+call :probe_git
+where git >nul 2>nul
+if not errorlevel 1 exit /b 0
+echo [WARN] winget did not make git available. Trying direct download...
+
+:git_direct
+set "GIT_PS=%TEMP%\crowdgpt-git-%RANDOM%.ps1"
+set "GIT_INSTALLER=%TEMP%\Git-64-bit-%RANDOM%.exe"
+> "!GIT_PS!"  echo [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+>> "!GIT_PS!" echo $ProgressPreference = 'SilentlyContinue'
+>> "!GIT_PS!" echo $r = Invoke-RestMethod -Uri 'https://api.github.com/repos/git-for-windows/git/releases/latest' -Headers @{ 'User-Agent' = 'CrowdGPT-Installer' }
+>> "!GIT_PS!" echo $a = $r.assets ^| Where-Object { $_.name -like 'Git-*-64-bit.exe' } ^| Select-Object -First 1
+>> "!GIT_PS!" echo if (-not $a) { exit 1 }
+>> "!GIT_PS!" echo Invoke-WebRequest -Uri $a.browser_download_url -OutFile '!GIT_INSTALLER!'
+powershell -NoProfile -ExecutionPolicy Bypass -File "!GIT_PS!"
+set "GIT_DL_RC=!ERRORLEVEL!"
+del "!GIT_PS!" >nul 2>nul
+if not "!GIT_DL_RC!"=="0" exit /b 1
+if not exist "!GIT_INSTALLER!" exit /b 1
+
+echo [INFO] Installing Git silently...
+start "" /wait "!GIT_INSTALLER!" /VERYSILENT /NORESTART /SP- /SUPPRESSMSGBOXES
+del /q "!GIT_INSTALLER!" >nul 2>nul
+
+call :refresh_path
+call :probe_git
+where git >nul 2>nul
+if not errorlevel 1 exit /b 0
+exit /b 1
 
 REM ============================================================
 REM Subroutine: note_amd
@@ -518,20 +607,22 @@ echo [NOTE] If your system has both an iGPU and a dGPU, the client
 echo        prefers the device whose name contains a model number
 echo        (e.g. "RX 7800 XT" over "Radeon(TM) Graphics").
 echo        To list DirectML devices:
-echo          .venv\Scripts\python.exe -c "import torch_directml as d; print([d.device_name(i) for i in range(8)])"
+echo          .venv\Scripts\python.exe -c "import torch_directml as d; print([d.device_name(i) for i in range(d.device_count())])"
 echo.
 exit /b 0
 
 REM ============================================================
 REM Subroutine: verify_directml
+REM   NOTE: no '%' characters in the python snippets - cmd would
+REM   treat them as variable expansions and corrupt the code.
 REM ============================================================
 :verify_directml
-"!APP_PY!" -c "import torch_directml as d; names = [d.device_name(i) for i in range(8) if d.device_name(i)]; [print('  DirectML[%d]: %s' % (i, n)) for i, n in enumerate(names)]" 2>nul
+"!APP_PY!" -c "import torch_directml as d; [print('  DirectML[' + str(i) + ']: ' + str(d.device_name(i))) for i in range(d.device_count())]" 2>nul
 if errorlevel 1 (
     echo [WARN] Could not enumerate DirectML devices.
     exit /b 0
 )
-"!APP_PY!" -c "import torch; import torch_directml as d; assert d.is_available(), 'no DirectML device'; dev = d.device(0); a = torch.randn(64, 64).to(dev); b = torch.randn(64, 64).to(dev); c = (a @ b).sum().cpu().item(); print('  DirectML[0] matmul OK (sum=%.4f)' % c)" 2>nul
+"!APP_PY!" -c "import torch; import torch_directml as d; assert d.is_available(), 'no DirectML device'; dev = d.device(0); a = torch.randn(64, 64).to(dev); b = torch.randn(64, 64).to(dev); c = (a @ b).sum().cpu().item(); print('  DirectML[0] matmul OK, sum =', round(c, 4))" 2>nul
 if errorlevel 1 echo [WARN] DirectML device present but matmul failed. Some ops may be unsupported.
 exit /b 0
 
@@ -568,7 +659,7 @@ set "GUI_VBS=!BIN_DIR!\crowdgpt-gui.vbs"
 > "!GUI_VBS!"  echo Set WshShell = CreateObject("WScript.Shell")
 >> "!GUI_VBS!" echo WshShell.Run """!APP_PY!"" ""!APP_DIR!\client.py""", 0, False
 
-REM ---- Add to user PATH ----
+REM ---- Add to user PATH (persistent, for future terminals) ----
 set "ENV_PS=%TEMP%\crowdgpt-env-%RANDOM%.ps1"
 > "!ENV_PS!"  echo $p = [Environment]::GetEnvironmentVariable('Path', 'User')
 >> "!ENV_PS!" echo if ($null -eq $p) { $p = '' }
@@ -580,10 +671,9 @@ set "ENV_PS=%TEMP%\crowdgpt-env-%RANDOM%.ps1"
 powershell -NoProfile -ExecutionPolicy Bypass -File "!ENV_PS!"
 del "!ENV_PS!" >nul 2>nul
 
-REM ---- Icon ----
+REM ---- Icon (.ico only; .lnk cannot use .svg) ----
 set "APP_ICON="
 if exist "!APP_DIR!\docs\logo-app.ico" set "APP_ICON=!APP_DIR!\docs\logo-app.ico"
-if not defined APP_ICON if exist "!APP_DIR!\docs\logo-app.svg" set "APP_ICON=!APP_DIR!\docs\logo-app.svg"
 
 REM ---- Start Menu shortcut ----
 set "SC_PS=%TEMP%\crowdgpt-sc-%RANDOM%.ps1"
@@ -602,7 +692,7 @@ set "REG_PS=%TEMP%\crowdgpt-reg-%RANDOM%.ps1"
 > "!REG_PS!"  echo $k = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\CrowdGPT'
 >> "!REG_PS!" echo New-Item -Path $k -Force ^| Out-Null
 >> "!REG_PS!" echo Set-ItemProperty -Path $k -Name 'DisplayName'     -Value 'CrowdGPT'
->> "!REG_PS!" echo Set-ItemProperty -Path $k -Name 'DisplayVersion'  -Value '0.10.0'
+>> "!REG_PS!" echo Set-ItemProperty -Path $k -Name 'DisplayVersion'  -Value '0.10.1'
 >> "!REG_PS!" echo Set-ItemProperty -Path $k -Name 'Publisher'       -Value 'CrowdGPT Project'
 >> "!REG_PS!" echo Set-ItemProperty -Path $k -Name 'InstallLocation' -Value '!APP_DIR!'
 >> "!REG_PS!" echo Set-ItemProperty -Path $k -Name 'UninstallString' -Value ('"' + '!APP_DIR!\uninstall.bat' + '"')
@@ -612,23 +702,28 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "!REG_PS!"
 del "!REG_PS!" >nul 2>nul
 
 REM ---- Uninstaller ----
-> "!APP_DIR!\uninstall.bat"  echo @echo off
->> "!APP_DIR!\uninstall.bat" echo setlocal
->> "!APP_DIR!\uninstall.bat" echo echo Uninstalling CrowdGPT...
->> "!APP_DIR!\uninstall.bat" echo del /q "!START_MENU!\CrowdGPT.lnk" 2^>nul
->> "!APP_DIR!\uninstall.bat" echo reg delete "HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\CrowdGPT" /f ^>nul 2^>nul
->> "!APP_DIR!\uninstall.bat" echo powershell -NoProfile -Command "$p = [Environment]::GetEnvironmentVariable('Path','User'); if ($p) { $p = ($p -split ';' ^| Where-Object { $_ -ne '!BIN_DIR!' }) -join ';'; [Environment]::SetEnvironmentVariable('Path', $p, 'User') }"
->> "!APP_DIR!\uninstall.bat" echo cd /d "%TEMP%"
->> "!APP_DIR!\uninstall.bat" echo start "" /min cmd /c "timeout /t 2 /nobreak ^>nul ^& rmdir /s /q "!APP_DIR!""
->> "!APP_DIR!\uninstall.bat" echo echo Done. Log out and back in for PATH changes to take effect.
->> "!APP_DIR!\uninstall.bat" echo pause
+REM The PATH cleanup avoids pipes/carets (they get mangled by echo inside
+REM quotes), and the last line is the "(goto) 2>nul" self-delete trick:
+REM the batch context ends, releasing the file, then rmdir runs.
+set "UNINST=!APP_DIR!\uninstall.bat"
+> "!UNINST!"  echo @echo off
+>> "!UNINST!" echo setlocal
+>> "!UNINST!" echo echo Uninstalling CrowdGPT...
+>> "!UNINST!" echo del /q "!START_MENU!\CrowdGPT.lnk" 2^>nul
+>> "!UNINST!" echo reg delete "HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\CrowdGPT" /f ^>nul 2^>nul
+>> "!UNINST!" echo powershell -NoProfile -Command "$p = [Environment]::GetEnvironmentVariable('Path','User'); if ($p) { $p = [string]::Join(';', @($p.Split(';') -ne '!BIN_DIR!')); [Environment]::SetEnvironmentVariable('Path', $p, 'User') }"
+>> "!UNINST!" echo echo Done. Log out and back in for PATH changes to take effect.
+>> "!UNINST!" echo pause
+>> "!UNINST!" echo cd /d "%TEMP%"
+>> "!UNINST!" echo ^(goto^) 2^>nul ^& rmdir /s /q "!APP_DIR!"
 
 echo.
 echo [OK] Installed command: crowdgpt
-echo [OK] Start Menu shortcut: CrowdGPT
+echo [OK] Start Menu shortcut: CrowdGPT  ^(works immediately^)
 echo [OK] Uninstall via: Settings ^> Apps ^> CrowdGPT
 echo.
-echo [NOTE] A new terminal is required for the "crowdgpt" command to work.
+echo [NOTE] The "crowdgpt" command is only available in NEW terminals
+echo        ^(Windows limitation for permanent PATH changes^).
 exit /b 0
 
 REM ============================================================
@@ -700,13 +795,13 @@ if not defined DRIVER_MAJOR (
 if !DRIVER_MAJOR! GEQ 525 (
     set "BACKEND=nvidia"
     set "TORCH_INDEX=https://download.pytorch.org/whl/cu121"
-    set "WHEEL_NOTE=NVIDIA driver !NVIDIA_DRIVER! -^> CUDA 12.1 wheel"
+    set "WHEEL_NOTE=NVIDIA driver !NVIDIA_DRIVER! -> CUDA 12.1 wheel"
     exit /b 0
 )
 if !DRIVER_MAJOR! GEQ 470 (
     set "BACKEND=nvidia"
     set "TORCH_INDEX=https://download.pytorch.org/whl/cu118"
-    set "WHEEL_NOTE=NVIDIA driver !NVIDIA_DRIVER! -^> CUDA 11.8 wheel - older driver"
+    set "WHEEL_NOTE=NVIDIA driver !NVIDIA_DRIVER! -> CUDA 11.8 wheel - older driver"
     exit /b 0
 )
 echo [ERROR] NVIDIA driver !NVIDIA_DRIVER! is too old for any PyTorch wheel.
@@ -720,7 +815,7 @@ powershell -NoProfile -Command "try { $g = Get-CimInstance Win32_VideoController
 if not errorlevel 1 (
     set "BACKEND=intel"
     set "TORCH_INDEX=https://download.pytorch.org/whl/xpu"
-    set "WHEEL_NOTE=Intel Arc detected -^> XPU wheel"
+    set "WHEEL_NOTE=Intel Arc detected -> XPU wheel"
     exit /b 0
 )
 
@@ -739,13 +834,13 @@ if not defined AMD_GPU_NAME goto :detect_cpu
 
 set "BACKEND=amd"
 set "TORCH_INDEX="
-set "WHEEL_NOTE=!AMD_GPU_NAME! -^> DirectML (torch-directml)"
+set "WHEEL_NOTE=!AMD_GPU_NAME! -> DirectML (torch-directml)"
 exit /b 0
 
 :detect_cpu
 set "BACKEND=cpu"
 set "TORCH_INDEX=https://download.pytorch.org/whl/cpu"
-set "WHEEL_NOTE=No usable GPU detected -^> CPU wheel"
+set "WHEEL_NOTE=No usable GPU detected -> CPU wheel"
 exit /b 0
 
 :fatal

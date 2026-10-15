@@ -628,7 +628,15 @@ class SotaGPT(nn.Module):
 
     def forward_features(self, idx, use_chunked=True, use_ckpt=True):
         """Runs embeddings + all blocks + final LN. Returns [B, T, DIM]."""
+        # wte can be on CPU while idx arrives on DirectML. torch-directml
+        # can't mix CPU weight + DML index, so normalise devices first.
+        wte_dev = self.wte.weight.device
+        if idx.device != wte_dev:
+            idx = idx.to(wte_dev)
         x = self.wte(idx)
+        first_dev = self._block_device(0) if len(self.blocks) else self.cpu_device
+        if x.device != first_dev:
+            x = x.to(first_dev)
         cur_dev = x.device
 
         for i, block in enumerate(self.blocks):

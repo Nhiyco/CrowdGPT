@@ -12,6 +12,13 @@ Memory-safety guarantees:
   * A DegradeLadder reacts to any OOM by moving work to CPU (head, then blocks,
     then everything) and retrying the same micro-batch. The bottom rung has
     zero accelerator allocations, so VRAM OOM is physically impossible there.
+  * Calibration is bounded by wall-clock time and step count so slow hardware
+    does not hang in "Calibrating" for hours.
+
+Disk-safety guarantees:
+  * Only the newest Hugging Face weight revision is kept on disk.
+  * Total hf_weights/ size is hard-capped.
+  * Stale .part / .bak / .new files are removed at startup and after downloads.
 """
 
 import os
@@ -141,6 +148,130 @@ def _restart_self():
 CHECKPOINT_DIR = Path("checkpoints")
 CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
 
+
+# ---------------------------------------------------------------------------
+# Cache pruning: keep disk usage bounded across rounds and revisions.
+# ---------------------------------------------------------------------------
+MAX_CACHED_REVISIONS = 1
+MAX_HF_CACHE_GB      = 6.0
+STALE_PART_AGE_SEC   = 60 * 60
+STALE_BAK_AGE_SEC    = 24 * 60 * 60
+
+
+def _dir_size_bytes(path: Path) -> int:
+    total = 0
+    try:
+        for p in path.rglob("*"):
+            if p.is_file():
+                try:
+                    total += p.stat().st_size
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return total
+
+
+def _safe_rmtree(path: Path):
+    try:
+        if path.is_dir():
+            shutil.rmtree(path, ignore_errors=True)
+    except Exception:
+        pass
+
+
+def prune_hf_cache(keep_revision: str = None, log_fn=None):
+    """
+    Keep disk usage bounded:
+      * Remove every hf_weights/<rev>/ except `keep_revision` (if given).
+      * If not given, keep only the newest MAX_CACHED_REVISIONS folders.
+      * Delete stale .part files anywhere under CHECKPOINT_DIR.
+      * Delete stale .bak / .new files next to this script.
+      * Enforce MAX_HF_CACHE_GB by dropping oldest revisions.
+    Safe to call at any time. Never raises.
+    """
+    def _log(msg):
+        if log_fn is not None:
+            try:
+                log_fn(msg)
+            except Exception:
+                pass
+        log.info(msg)
+
+    try:
+        hf_root = CHECKPOINT_DIR / "hf_weights"
+        if hf_root.is_dir():
+            revs = [p for p in hf_root.iterdir() if p.is_dir()]
+
+            if keep_revision is not None:
+                keep_norm = str(keep_revision).strip().replace("/", "_").replace("\\", "_")
+                for r in revs:
+                    if r.name != keep_norm:
+                        sz = _dir_size_bytes(r)
+                        _safe_rmtree(r)
+                        _log(f"[cache] pruned stale revision {r.name} ({sz/1024**2:.0f} MB)")
+                revs = [p for p in hf_root.iterdir() if p.is_dir()]
+
+            if len(revs) > MAX_CACHED_REVISIONS:
+                revs.sort(key=lambda p: p.stat().st_mtime if p.exists() else 0)
+                for r in revs[:-MAX_CACHED_REVISIONS]:
+                    sz = _dir_size_bytes(r)
+                    _safe_rmtree(r)
+                    _log(f"[cache] pruned old revision {r.name} ({sz/1024**2:.0f} MB)")
+                revs = [p for p in hf_root.iterdir() if p.is_dir()]
+
+            revs.sort(key=lambda p: p.stat().st_mtime if p.exists() else 0)
+            total = sum(_dir_size_bytes(r) for r in revs)
+            cap = int(MAX_HF_CACHE_GB * 1024**3)
+            while total > cap and revs:
+                victim = revs.pop(0)
+                sz = _dir_size_bytes(victim)
+                _safe_rmtree(victim)
+                total -= sz
+                _log(f"[cache] pruned {victim.name} for size cap ({sz/1024**2:.0f} MB)")
+
+            try:
+                if hf_root.is_dir() and not any(hf_root.iterdir()):
+                    hf_root.rmdir()
+            except Exception:
+                pass
+
+        now = time.time()
+        try:
+            for part in CHECKPOINT_DIR.rglob("*.part"):
+                try:
+                    if now - part.stat().st_mtime > STALE_PART_AGE_SEC:
+                        part.unlink()
+                        _log(f"[cache] removed stale {part.name}")
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        try:
+            here = Path(__file__).resolve().parent
+            for pat in ("*.bak", "*.new"):
+                for f in here.glob(pat):
+                    try:
+                        if now - f.stat().st_mtime > STALE_BAK_AGE_SEC:
+                            f.unlink()
+                            _log(f"[cache] removed stale {f.name}")
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    except Exception as e:
+        log.warning(f"[cache] prune failed: {e}")
+
+
+# Run once at startup, before anything else touches disk.
+try:
+    prune_hf_cache()
+except Exception:
+    pass
+
+
 DEFAULT_SERVER = "https://server.crowdgpt.net"
 DATASET_REPO_ID = "Vxtzq/CrowdGPT"
 TOKENIZER_REPO = "Qwen/Qwen3-0.6B"
@@ -171,6 +302,11 @@ ALLOWED_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64, 128]
 SAFETY_MARGIN_GB = 1.0
 ALLOCATOR_RESERVE_GB = 0.5
 MIN_HEADROOM_GB = 0.25
+
+# --- calibration budget -----------------------------------------------------
+CAL_TIME_BUDGET = 90.0
+CAL_MIN_MICRO   = 3
+CAL_MAX_MICRO_HARD = 20
 
 
 def _calc_model_size():
@@ -1415,6 +1551,15 @@ def _weight_cache_path(revision, filename):
 
 def _download_file_with_progress(url, dest, emit, stop_evt, expected_size=None, label="file"):
     dest.parent.mkdir(parents=True, exist_ok=True)
+
+    # Clean any stale .part left behind by a previous crashed run.
+    try:
+        leftover = dest.with_suffix(dest.suffix + ".part")
+        if leftover.exists():
+            leftover.unlink()
+    except Exception:
+        pass
+
     if dest.exists():
         sz = dest.stat().st_size
         if expected_size is not None and sz == int(expected_size):
@@ -1463,6 +1608,11 @@ def _download_file_with_progress(url, dest, emit, stop_evt, expected_size=None, 
             log.info(f"Finished downloading {label}: {dest}")
             return dest
         except KeyboardInterrupt:
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except Exception:
+                pass
             raise
         except Exception as e:
             last_err = e
@@ -1535,6 +1685,16 @@ def fetch_weights_from_hf(md, se, emit):
     emit("log", "Loading weights from safetensors...")
     iw = _load_safetensors_flat(model_path, EXPECTED_MODEL_SIZE, "model weights")
     ie = _load_safetensors_flat(engram_path, EXPECTED_ENGRAM_SIZE, "engram weights")
+
+    # Defensive cleanup of any residual .part files.
+    try:
+        for p in CHECKPOINT_DIR.rglob("*.part"):
+            try:
+                p.unlink()
+            except Exception:
+                pass
+    except Exception:
+        pass
     return iw, ie
 
 
@@ -1938,6 +2098,9 @@ def run_single_round_wrapper(srv, at, se, emit):
                 try:
                     emit('log', "Downloading weights from Hugging Face...")
                     iw, ie = fetch_weights_from_hf(md, se, emit)
+                    # Keep only the revision we just used on disk.
+                    prune_hf_cache(keep_revision=wcfg.get("revision") or "main",
+                                   log_fn=lambda m: emit('log', m))
                 except KeyboardInterrupt:
                     raise
                 except Exception as e:
@@ -2026,81 +2189,78 @@ def run_single_round_wrapper(srv, at, se, emit):
         emit('log', f"Backend: {train_backend} | autocast: {ua} | "
                    f"bs={bs} | accum={as_} | dtype={'bf16' if ua else 'fp32'}")
 
-        emit('log', "Calibrating speed...")
+        # --- Calibration: bounded by wall-clock time AND step count ---
+        emit('log', f"Calibrating speed (max {CAL_TIME_BUDGET:.0f}s / {CAL_MAX_MICRO_HARD} micro-steps)...")
         cs_ = time.time()
-        cal_global_steps = 3
+        CAL_MAX_MICRO = max(CAL_MIN_MICRO, min(as_, CAL_MAX_MICRO_HARD))
         target_micro_steps = 100
         emit('status', 'calibrating')
-        cal_done = 0
-        while cal_done < cal_global_steps:
+
+        ob.zero_grad(set_to_none=True)
+        while (micro_step < CAL_MAX_MICRO) and ((time.time() - cs_) < CAL_TIME_BUDGET):
             if hb.should_stop() or se.is_set():
                 return
-            ob.zero_grad(set_to_none=True)
-            for mi in range(as_):
-                if hb.should_stop() or se.is_set():
-                    break
-                if ds.needs_new_subchunk():
-                    ds.advance(srv, "bf16")
-                sd = (abs(hash("cal")) % 10000) + cal_done * 1000 + mi
-                x, y = ds.get_batch(bs, seed=sd)
-                want_preview = (micro_step == 0) or ((micro_step + 1) % PREVIEW_EVERY == 0)
+            if ds.needs_new_subchunk():
+                ds.advance(srv, "bf16")
+            sd = (abs(hash("cal")) % 10000) + micro_step
+            x, y = ds.get_batch(bs, seed=sd)
+            want_preview = (micro_step == 0) or ((micro_step + 1) % PREVIEW_EVERY == 0)
 
-                try:
+            try:
+                lo, cards = _train_step_safe(model, x, y, sl, ua, ad, ls,
+                                             preview=want_preview,
+                                             ladder=ladder, emit=emit)
+            except RuntimeError as re:
+                if (not tried_cpu_fallback) and _is_accel_error(str(re)):
+                    emit('log', f"⚠️ {train_backend} op failed at fwd: {str(re)[:120]}")
+                    emit('log', "🔻 Falling back to CPU-only model...")
+                    model.to_cpu_only()
+                    ob, oe = _build_optimizers(model, lr=1e-4)
+                    ua = False; ad = None
+                    tried_cpu_fallback = True
                     lo, cards = _train_step_safe(model, x, y, sl, ua, ad, ls,
                                                  preview=want_preview,
                                                  ladder=ladder, emit=emit)
-                except RuntimeError as re:
-                    if (not tried_cpu_fallback) and _is_accel_error(str(re)):
-                        emit('log', f"⚠️ {train_backend} op failed at fwd: {str(re)[:120]}")
-                        emit('log', "🔻 Falling back to CPU-only model...")
-                        model.to_cpu_only()
-                        ob, oe = _build_optimizers(model, lr=1e-4)
-                        ua = False; ad = None
-                        tried_cpu_fallback = True
-                        lo, cards = _train_step_safe(model, x, y, sl, ua, ad, ls,
-                                                     preview=want_preview,
-                                                     ladder=ladder, emit=emit)
-                    else:
-                        raise
+                else:
+                    raise
 
-                lval = float(lo.item())
-                micro_step += 1
-                if cards:
-                    emit('model_preview', {'step': micro_step, 'cards': cards})
-                if cal_done >= 1 and mi == 0:
-                    elapsed = time.time() - cs_
-                    sps_micro = elapsed / micro_step
-                    rh = max(0.1, rs.get("max_round_hours", 2.0) - rs.get("round_elapsed_hours", 0))
-                    remaining = max(60, (rh * 3600) - elapsed - (UPLOAD_BUFFER_MIN * 60))
-                    target_micro_steps = micro_step + int(remaining / sps_micro)
-                elapsed_cal = time.time() - cs_
-                current_tps = tt / max(elapsed_cal, 1.0)
-                time_left_mins = 0
-                if cal_done >= 1 and micro_step > 0:
-                    elapsed = time.time() - cs_
-                    sps_micro = elapsed / micro_step
-                    rh = max(0.1, rs.get("max_round_hours", 2.0) - rs.get("round_elapsed_hours", 0))
-                    remaining = max(60, (rh * 3600) - elapsed - (UPLOAD_BUFFER_MIN * 60))
-                    time_left_mins = remaining / 60.0
-                emit('cal_stats', {
-                    'step': micro_step, 'total': target_micro_steps,
-                    'loss': safe_float(lval * as_, 10.0),
-                    'microbatch': micro_step,
-                    'tps': safe_float(current_tps),
-                    'time_left': safe_float(time_left_mins),
-                })
-                oe.step()
-                oe.zero_grad(set_to_none=True)
-                tt += x.numel()
-                del lo, x, y
-            if hb.should_stop() or se.is_set():
-                return
-            torch.nn.utils.clip_grad_norm_(
-                [p for p in model.parameters() if p.requires_grad], 1.0)
-            ob.step()
-            ob.zero_grad(set_to_none=True)
-            gc.collect()
-            cal_done += 1
+            lval = float(lo.item())
+            micro_step += 1
+            if cards:
+                emit('model_preview', {'step': micro_step, 'cards': cards})
+
+            elapsed_cal = max(0.001, time.time() - cs_)
+            current_tps = tt / elapsed_cal
+            time_left_mins = 0.0
+            if micro_step >= CAL_MIN_MICRO:
+                sps_micro = elapsed_cal / micro_step
+                rh = max(0.1, rs.get("max_round_hours", 2.0)
+                              - rs.get("round_elapsed_hours", 0))
+                remaining = max(60, (rh * 3600) - elapsed_cal
+                                     - (UPLOAD_BUFFER_MIN * 60))
+                target_micro_steps = micro_step + int(remaining / sps_micro)
+                time_left_mins = remaining / 60.0
+            emit('cal_stats', {
+                'step': micro_step, 'total': target_micro_steps,
+                'loss': safe_float(lval * as_, 10.0),
+                'microbatch': micro_step,
+                'tps': safe_float(current_tps),
+                'time_left': safe_float(time_left_mins),
+            })
+            oe.step()
+            oe.zero_grad(set_to_none=True)
+            tt += x.numel()
+            del lo, x, y
+
+        if hb.should_stop() or se.is_set():
+            return
+        torch.nn.utils.clip_grad_norm_(
+            [p for p in model.parameters() if p.requires_grad], 1.0)
+        ob.step()
+        ob.zero_grad(set_to_none=True)
+        gc.collect()
+        emit('log', f"Calibration done: {micro_step} micro-steps in "
+                    f"{time.time() - cs_:.1f}s (est. target {target_micro_steps})")
 
         if se.is_set():
             return
@@ -2265,6 +2425,11 @@ def run_single_round_wrapper(srv, at, se, emit):
                 torch.cuda.empty_cache()
             except Exception:
                 pass
+        # Belt-and-braces: clean up any leftover part files between rounds.
+        try:
+            prune_hf_cache()
+        except Exception:
+            pass
 
 
 # =========================================================================
@@ -2501,254 +2666,4 @@ document.getElementById('go-to-login').addEventListener('click',e=>{e.preventDef
 function callApi(n,...a){if(window.pywebview&&window.pywebview.api&&window.pywebview.api[n]){window.pywebview.api[n](...a);return true}return false}
 window.addEventListener('pywebviewready',()=>callApi('get_backends'));
 document.getElementById('backend-select').addEventListener('change',e=>{const nb=e.target.value;if(nb===window._currentBackend)return;callApi('set_backend',nb);});
-document.getElementById('btn-login').addEventListener('click',()=>{const srv=document.getElementById('login-server').value.trim();const u=document.getElementById('login-user').value.trim();const p=document.getElementById('login-pass').value;if(!u||!p){showLoginError('err_invalid_credentials');return}document.getElementById('login-error').classList.remove('show');document.getElementById('btn-login').disabled=true;callApi('login',srv,u,p)});
-document.getElementById('btn-register').addEventListener('click',()=>{const srv=document.getElementById('reg-server').value.trim();const u=document.getElementById('reg-user').value.trim();const email=document.getElementById('reg-email').value.trim();const p=document.getElementById('reg-pass').value;if(!u||!email||!p){showRegError('err_invalid_input');return}document.getElementById('reg-error').classList.remove('show');document.getElementById('btn-register').disabled=true;callApi('register',srv,u,email,p)});
-document.getElementById('btn-anon').addEventListener('click',e=>{e.preventDefault();callApi('login_anon')});
-document.getElementById('btn-start').addEventListener('click',()=>{if(callApi('start')){document.getElementById('btn-start').disabled=true;document.getElementById('btn-stop').disabled=false}});
-document.getElementById('btn-stop').addEventListener('click',()=>{callApi('stop');document.getElementById('btn-start').disabled=false;document.getElementById('btn-stop').disabled=true});
-function showLoginError(code){const el=document.getElementById('login-error');el.textContent=t(code);el.classList.add('show');document.getElementById('btn-login').disabled=false}
-function showRegError(code){const el=document.getElementById('reg-error');el.textContent=t(code);el.classList.add('show');document.getElementById('btn-register').disabled=false}
-function mb(b){return (b/1048576).toFixed(1)}
-function overlayShow(d){document.getElementById('overlay').classList.add('show');document.getElementById('overlay-title').textContent=t(d.title_key);const s=document.getElementById('overlay-subtitle');if(d.subtitle_key){s.textContent=t(d.subtitle_key);s.classList.add('show')}else{s.classList.remove('show')}const b=document.getElementById('overlay-bar');b.classList.toggle('indet',!!d.indeterminate);document.getElementById('overlay-fill').style.width=d.indeterminate?'':'0%'}
-function overlayHide(){document.getElementById('overlay').classList.remove('show')}
-function drawGraph(){const c=document.getElementById('loss-graph');if(!c)return;const empty=document.getElementById('graph-empty');if(lossHistory.length<2){c.classList.add('hidden-graph');if(empty)empty.classList.remove('hidden-empty');return}c.classList.remove('hidden-graph');if(empty)empty.classList.add('hidden-empty');const rect=c.getBoundingClientRect();const W=rect.width,H=rect.height;if(W<10||H<10){requestAnimationFrame(drawGraph);return}const ctx=c.getContext('2d');const dpr=window.devicePixelRatio||1;c.width=Math.round(W*dpr);c.height=Math.round(H*dpr);ctx.setTransform(dpr,0,0,dpr,0,0);ctx.clearRect(0,0,W,H);const data=lossHistory.slice(-MAXP);const mn=Math.min(...data),mx=Math.max(...data),range=(mx-mn)||1;const pad=6,pH=H-pad*2,pW=W-pad*2,st=pW/(data.length-1);const isDark=document.body.classList.contains('dark');ctx.strokeStyle=isDark?'rgba(255,255,255,.06)':'rgba(17,17,19,.07)';for(let g=1;g<4;g++){const y=pad+pH*g/4;ctx.beginPath();ctx.moveTo(pad,y);ctx.lineTo(pad+pW,y);ctx.stroke()}const pt=i=>[pad+i*st,pad+pH-(data[i]-mn)/range*pH];ctx.beginPath();data.forEach((v,i)=>{const[x,y]=pt(i);i?ctx.lineTo(x,y):ctx.moveTo(x,y)});ctx.lineTo(pad+pW,pad+pH);ctx.lineTo(pad,pad+pH);ctx.closePath();const gr=ctx.createLinearGradient(0,0,0,H);gr.addColorStop(0,isDark?'rgba(34,197,94,.20)':'rgba(22,163,74,.16)');gr.addColorStop(1,'rgba(22,163,74,0)');ctx.fillStyle=gr;ctx.fill();ctx.beginPath();data.forEach((v,i)=>{const[x,y]=pt(i);i?ctx.lineTo(x,y):ctx.moveTo(x,y)});ctx.strokeStyle=isDark?'#22c55e':'#16a34a';ctx.lineWidth=1.5;ctx.stroke()}
-window.handleEvent=function(ev,data){
-if(ev==='login_success'){document.getElementById('view-login').classList.remove('active');document.getElementById('view-dashboard').classList.add('active');document.body.classList.add('dashboard-active');document.getElementById('user-info').textContent=data.username;document.getElementById('btn-login').disabled=false;document.getElementById('btn-register').disabled=false;requestAnimationFrame(drawGraph)}
-else if(ev==='login_error'){const code=data.code||'err_invalid_credentials';const map={invalid_credentials:'err_invalid_credentials',login_failed:'err_login_failed',username_taken:'err_username_taken',email_taken:'err_email_taken',weak_password:'err_weak_password',invalid_input:'err_invalid_input',register_failed:'err_register_failed',network:'err_network'};const tk=map[code]||'err_login_failed';const loginActive=document.getElementById('screen-login').classList.contains('active');if(loginActive)showLoginError(tk);else showRegError(tk)}
-else if(ev==='log'){document.getElementById('status-event').textContent=data}
-else if(ev==='backends'){const sel=document.getElementById('backend-select');sel.innerHTML='';window._currentBackend=data.current;const order=[{key:'cuda',label:'CUDA (NVIDIA)'},{key:'rocm',label:'ROCm (AMD)'},{key:'mps',label:'MPS (Apple)'},{key:'xpu',label:'XPU (Intel)'},{key:'directml',label:'DirectML (Windows)'},{key:'cpu',label:'CPU'}];order.forEach(bk=>{const opt=document.createElement('option');opt.value=bk.key;opt.textContent=bk.label;opt.disabled=!data.available[bk.key];if(bk.key===data.current)opt.selected=true;sel.appendChild(opt)});sel.disabled=false}
-else if(ev==='overlay_show'){overlayShow(data)}
-else if(ev==='overlay_progress'){const bar=document.getElementById('overlay-bar');if(data.total>0){bar.classList.remove('indet');const pct=Math.min(100,data.done/data.total*100);document.getElementById('overlay-fill').style.width=pct+'%';document.getElementById('overlay-pct').textContent=pct.toFixed(1)+'%';document.getElementById('overlay-mb').textContent=mb(data.done)+' / '+mb(data.total)+' MB'}}
-else if(ev==='overlay_hide'){overlayHide()}
-else if(ev==='cal_stats'||ev==='stats'){const loss=Number(data.loss);const tps=Number(data.tps);const step=Number(data.step);const target=ev==='cal_stats'?Number(data.total):Number(data.target);const tl=Number(data.time_left);if(isFinite(loss)){document.getElementById('stat-loss').textContent=loss.toFixed(4);document.getElementById('graph-last').textContent=loss.toFixed(4);if(loss>0){lossHistory.push(loss);if(lossHistory.length>MAXP*2)lossHistory.splice(0,lossHistory.length-MAXP*2)}}if(isFinite(tps))document.getElementById('stat-tps').textContent=Math.round(tps);if(isFinite(tl))document.getElementById('stat-time').textContent=Math.round(tl)+'m';document.getElementById('stat-round').textContent=ev==='cal_stats'?'—':(data.round!=null?data.round:'—');document.getElementById('stat-step-cur').textContent=isFinite(step)?step:0;document.getElementById('stat-step-tot').textContent=isFinite(target)?target:0;const pct=(isFinite(step)&&isFinite(target)&&target>0)?Math.min(100,(step/target)*100):0;document.getElementById('progress-bar').style.width=pct+'%';document.getElementById('progress-text').textContent=pct.toFixed(1)+'%';requestAnimationFrame(drawGraph)}
-else if(ev==='model_preview'){const container=document.getElementById('model-preview');const stepEl=document.getElementById('preview-step');if(!container||!stepEl)return;stepEl.textContent='Step '+data.step;let html='';if(data.cards&&data.cards.length>0){data.cards.forEach(card=>{const cls=card.match?'good':'bad';const badge=card.match?'✓':'✗';const prob=(typeof card.prob==='number'&&isFinite(card.prob))?(card.prob*100).toFixed(1)+'%':'';html+='<div class="pred-line '+cls+'"><div class="pred-main"><span class="pred-text">'+escapeHtml(card.context)+'</span><span class="pred-token">'+escapeHtml(card.pred)+'</span></div><div class="pred-side"><span class="pred-badge">'+badge+'</span><span>target: '+escapeHtml(card.target)+'</span><span>'+prob+'</span></div></div>'})}else{html='<div class="preview-empty">'+escapeHtml(t('waiting_preview'))+'</div>'}container.innerHTML=html}
-else if(ev==='status'){statusKey=data;document.getElementById('status-indicator').textContent=t(statusKey);if(data==='training'||data==='idle'||data==='calibrating'||data==='preparing')overlayHide();if(data==='idle'){document.getElementById('btn-start').disabled=false;document.getElementById('btn-stop').disabled=true}}
-};
-function escapeHtml(s){return String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
-window.addEventListener('resize',()=>requestAnimationFrame(drawGraph));
-function updateLogo(){try{const img=document.getElementById('logo-img');if(!img)return;const isDark=document.body.classList.contains('dark');const src=isDark?img.getAttribute('data-dark'):img.getAttribute('data-light');if(src&&src.length>30)img.src=src}catch(e){}}
-(function(){try{const saved=localStorage.getItem('crowdgpt-theme');const prefersDark=window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches;if(saved==='dark'||(!saved&&prefersDark))document.body.classList.add('dark');updateLogo()}catch(e){}const tbtn=document.getElementById('theme-toggle');if(tbtn){tbtn.addEventListener('click',function(){document.body.classList.toggle('dark');try{localStorage.setItem('crowdgpt-theme',document.body.classList.contains('dark')?'dark':'light')}catch(e){}updateLogo();requestAnimationFrame(drawGraph)})}})();
-applyT();
-(function(){const key='crowdgpt_motd_last_day';const today=new Date().toISOString().slice(0,10);let last=null;try{last=localStorage.getItem(key)}catch(e){}if(last===today)return;fetch('https://raw.githubusercontent.com/Vxtzq/CrowdGPT/main/docs/motd.txt').then(r=>r.ok?r.text():'').then(text=>{text=(text||'').trim();if(!text)return;document.getElementById('motd-text').textContent=text;document.getElementById('motd-overlay').classList.add('show');try{localStorage.setItem(key,today)}catch(e){}}).catch(()=>{})})();
-document.getElementById('motd-close').addEventListener('click',()=>document.getElementById('motd-overlay').classList.remove('show'));
-</script></body></html>"""
-
-
-# =========================================================================
-# Api / windowing
-# =========================================================================
-class Api:
-    def __init__(self):
-        self.window = None
-        self.stop_event = threading.Event()
-        self.thread = None
-        self.auth_token = None
-        self.username = None
-        self.server_url = DEFAULT_SERVER
-        self._lp = 0.0
-        self._backend_file = CHECKPOINT_DIR / "selected_backend.json"
-        saved = None
-        try:
-            if self._backend_file.exists():
-                saved = json.loads(self._backend_file.read_text()).get("backend")
-        except Exception:
-            saved = None
-        self.selected_backend = saved or get_best_default_backend()
-        log.info(f"[CLIENT] Selected backend: {self.selected_backend}")
-
-    def emit(self, ev, data):
-        if not self.window:
-            return
-        if ev in ('log', 'status'):
-            try:
-                print(f"[EMIT {ev}] {data}", flush=True)
-            except Exception:
-                pass
-        if ev == 'preview_loss':
-            n = time.time()
-            if n - self._lp < 0.4:
-                return
-            self._lp = n
-        try:
-            clean_data = sanitize_for_json(data)
-            self.window.evaluate_js(f"window.handleEvent({json.dumps(ev)}, {json.dumps(clean_data)});")
-        except Exception as e:
-            log.warning(f"Emit failed for {ev}: {e}")
-
-    def get_backends(self):
-        available = get_available_backends()
-        self.emit('backends', {'available': available, 'current': self.selected_backend})
-
-    def set_backend(self, backend_name):
-        log.info(f"[CLIENT] set_backend called with: {backend_name} (was {self.selected_backend})")
-        self.selected_backend = backend_name
-        try:
-            self._backend_file.write_text(json.dumps({"backend": backend_name}))
-        except Exception as e:
-            log.warning(f"Failed to save backend choice: {e}")
-        self.get_backends()
-        if self.thread and self.thread.is_alive():
-            self.stop_event.set()
-
-    def login(self, s, u, p):
-        self.server_url = s or self.server_url
-        threading.Thread(target=self._do_login, args=(u, p), daemon=True).start()
-
-    def _do_login(self, u, p):
-        tok, err = do_login(self.server_url, u, p)
-        if tok:
-            self.auth_token = tok
-            self.username = u
-            self.emit('login_success', {'username': u})
-        else:
-            self.emit('login_error', {'code': err or 'login_failed'})
-
-    def register(self, s, u, email, p):
-        self.server_url = s or self.server_url
-        threading.Thread(target=self._do_register, args=(u, email, p), daemon=True).start()
-
-    def _do_register(self, u, email, p):
-        tok, err = do_register(self.server_url, u, email, p)
-        if tok:
-            self.auth_token = tok
-            self.username = u
-            self.emit('login_success', {'username': u})
-        else:
-            self.emit('login_error', {'code': err or 'register_failed'})
-
-    def login_anon(self):
-        self.auth_token = None
-        self.username = "anonymous"
-        self.emit('login_success', {'username': 'anonymous'})
-
-    def start(self):
-        if self.thread and self.thread.is_alive():
-            return
-        self.stop_event.clear()
-        self.thread = threading.Thread(target=self._rs, daemon=True)
-        self.thread.start()
-
-    def stop(self):
-        self.stop_event.set()
-
-    def _check_updates_between_rounds(self):
-        try:
-            if check_for_update():
-                self.emit('log', "🔄 Updated to a new version — restarting...")
-                self.emit('status', 'idle')
-                time.sleep(2)
-                _restart_self()
-        except Exception as e:
-            log.warning(f"Update check failed: {e}")
-
-    def _rs(self):
-        global train_device, train_backend
-        try:
-            train_device, train_backend = detect_training_backend(self.selected_backend)
-            self.emit('meta', {'backend': train_backend})
-            self.emit('log', f"Backend: {train_backend} ({train_device})")
-            auto_detect_vram_budget()
-            self.emit('log', f"Placement budget: {memory_config['ram_gb']:.2f} GB "
-                             f"(margin {SAFETY_MARGIN_GB:.2f} GB)")
-            install_hard_vram_cap(train_device, SAFETY_MARGIN_GB)
-        except Exception as e:
-            self.emit('log', f"Error: {e}")
-            self.emit('status', 'idle')
-            return
-        round_count = 0
-        while not self.stop_event.is_set():
-            round_count += 1
-            self.emit('log', f"{'='*40}")
-            self.emit('log', f"Starting Round Cycle #{round_count}")
-            self.emit('log', f"{'='*40}")
-            try:
-                run_single_round_wrapper(self.server_url, self.auth_token, self.stop_event, self.emit)
-            except KeyboardInterrupt:
-                self.stop_event.set()
-                break
-            except Exception as e:
-                import traceback
-                tb = traceback.format_exc()
-                print(f"\n[ROUND-FAIL-TRACEBACK]\n{tb}\n", flush=True)
-                for ln in tb.splitlines()[-14:]:
-                    self.emit('log', ln)
-                self.emit('log', f"Round failed: {e}")
-            if self.stop_event.is_set():
-                break
-            self._check_updates_between_rounds()
-            self.emit('status', 'waiting')
-            self.emit('log', "✅ Round complete. Auto-relaunching next round in 10s...")
-            for _ in range(10):
-                if self.stop_event.is_set():
-                    break
-                time.sleep(1)
-        self.emit('status', 'idle')
-        self.emit('log', "👋 Training stopped by user.")
-
-
-def startup():
-    if sys.platform == "win32" and WINDOWS_ICO_PATH:
-        _wait_for_window(WINDOW_TITLE, timeout=5.0)
-        time.sleep(0.15)
-        set_windows_icon(WINDOW_TITLE, WINDOWS_ICO_PATH)
-
-    try:
-        scr = webview.screens[0]
-        aw, ah = scr.width, scr.height
-        w = max(480, min(1040, int(aw * 0.80)))
-        h = max(360, min(800, int(ah * 0.80)))
-        w = min(w, aw - 16)
-        h = min(h, ah - 48)
-        w = max(320, w)
-        h = max(240, h)
-        window.resize(w, h)
-        window.move(max(0, (aw - w) // 2), max(0, (ah - h) // 2))
-    except Exception:
-        pass
-
-
-def _create_window_safe(title, html, icon_path, kwargs):
-    usable = False
-    if icon_path and os.path.exists(icon_path):
-        low = icon_path.lower()
-        if low.endswith((".png", ".ico", ".jpg", ".jpeg", ".gif", ".bmp", ".tiff", ".webp")):
-            usable = True
-    if usable:
-        try:
-            return webview.create_window(title, html=html, icon=icon_path, **kwargs)
-        except Exception as e:
-            log.warning(f"[icon] create_window(icon=...) failed, retrying without: {e}")
-    try:
-        return webview.create_window(title, html=html, **kwargs)
-    except TypeError:
-        kwargs.pop("min_size", None)
-        return webview.create_window(title, html=html, **kwargs)
-
-
-if __name__ == "__main__":
-    print(f"CrowdGPT client v{CLIENT_VERSION}")
-
-    if sys.platform == "win32":
-        try:
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Vxtzq.CrowdGPT.1")
-        except Exception:
-            pass
-
-    try:
-        if check_for_update():
-            print("Update applied. Restarting...")
-            _restart_self()
-    except Exception as e:
-        log.warning(f"Auto-update check error: {e}")
-
-    api = Api()
-    start_tokenizer_loader()
-
-    kwargs = {"js_api": api, "width": 1000, "height": 720, "min_size": (320, 240)}
-    html_out = (HTML.replace("__LOGO__", LOGO_URI_LIGHT)
-                    .replace("__LOGO_DARK__", LOGO_URI_DARK)
-                    .replace("__VERSION__", CLIENT_VERSION))
-
-    window = _create_window_safe("CrowdGPT", html_out, ICON_PATH, kwargs)
-    api.window = window
-    webview.start(startup, debug=False)
+document.getElementById('btn-login').addEventListener('click',()=>{const srv=document.getElementById('login-server').value.trim();const u=document.getElementById('login-user').value.trim();const p=document.getElementById('login-pass').value;if(!u||!p){showLoginError('err_invalid_credentials');return}document.getElementById('login-error').classList.remove('show');document.getElementById('btn-login').disabled=true;callApi('

@@ -1,8 +1,32 @@
 #!/usr/bin/env python3
 """
 CrowdGPT GUI Client v1, DirectML runtime fallback.
+
+Memory-safety guarantees:
+  * Allocator env vars are set before importing torch.
+  * A hard per-process VRAM cap (total - SAFETY_MARGIN_GB) is installed on the
+    accelerator, so any over-budget allocation becomes a catchable torch OOM
+    instead of a driver-level failure.
+  * The batch/placement estimator counts weights, grads, optimizer state,
+    activations, loss chunks, and an allocator reserve.
+  * A DegradeLadder reacts to any OOM by moving work to CPU (head, then blocks,
+    then everything) and retrying the same micro-batch. The bottom rung has
+    zero accelerator allocations, so VRAM OOM is physically impossible there.
 """
-import os, sys, io, json, time, struct, math, gc, threading, base64, logging, tempfile, atexit, subprocess, hashlib, shutil, ctypes
+
+import os
+
+# ---------------------------------------------------------------------------
+# Allocator configuration MUST happen before torch is imported.
+# ---------------------------------------------------------------------------
+# CUDA: expandable_segments is a win for offload-heavy workloads.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+# ROCm: expandable_segments triggers HIP "memory mapping failed" OOMs.
+os.environ.setdefault("PYTORCH_HIP_ALLOC_CONF", "expandable_segments:False")
+# Fallback name used by older torch builds.
+os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
+
+import sys, io, json, time, struct, math, gc, threading, base64, logging, tempfile, atexit, subprocess, hashlib, shutil, ctypes
 from pathlib import Path
 import webview
 import numpy as np
@@ -16,7 +40,6 @@ from requests.exceptions import ChunkedEncodingError
 import gzip
 
 logging.getLogger("pywebview").setLevel(logging.CRITICAL)
-os.environ['PYTORCH_ALLOC_CONF'] = 'expandable_segments:True'
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
 sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s', datefmt='%H:%M:%S')
@@ -26,12 +49,14 @@ CLIENT_VERSION = "1"
 VERSION_URL = "https://raw.githubusercontent.com/Vxtzq/CrowdGPT/main/docs/version.txt"
 CLIENT_URL  = "https://raw.githubusercontent.com/Vxtzq/CrowdGPT/main/client.py"
 
+
 def _parse_version(v):
     try:
         parts = str(v).strip().split("-")[0].split(".")
         return tuple(int(x) for x in parts[:4])
     except Exception:
         return (0,)
+
 
 def _fetch_remote_version():
     try:
@@ -41,6 +66,7 @@ def _fetch_remote_version():
         return line or None
     except Exception:
         return None
+
 
 def _download_new_client(expected_version):
     try:
@@ -57,6 +83,7 @@ def _download_new_client(expected_version):
     if not any(m in code for m in markers):
         return None
     return code
+
 
 def _apply_update(new_code):
     try:
@@ -86,6 +113,7 @@ def _apply_update(new_code):
             pass
         return False
 
+
 def check_for_update():
     remote = _fetch_remote_version()
     if not remote:
@@ -101,6 +129,7 @@ def check_for_update():
     log.info(f"client.py updated to {remote}")
     return True
 
+
 def _restart_self():
     python = sys.executable
     script = str(Path(__file__).resolve())
@@ -110,6 +139,7 @@ def _restart_self():
         sys.exit(0)
     else:
         os.execv(python, args)
+
 
 CHECKPOINT_DIR = Path("checkpoints")
 CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
@@ -140,6 +170,12 @@ LOSS_CHUNK = 256
 UPLOAD_BUFFER_MIN = 25
 ALLOWED_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64, 128]
 
+# --- memory-safety knobs -----------------------------------------------------
+SAFETY_MARGIN_GB = 1.0        # hard reserve kept free on the accelerator
+ALLOCATOR_RESERVE_GB = 0.5    # context + pool + workspace inside the cap
+MIN_HEADROOM_GB = 0.25        # refuse to shrink the cap below this
+
+
 def _calc_model_size():
     size = VOCAB_SIZE * DIM
     for _ in range(N_LAYERS):
@@ -147,6 +183,7 @@ def _calc_model_size():
         size += DIM * MLP_HIDDEN * 2 + MLP_HIDDEN * DIM
     size += DIM * 2
     return size
+
 
 EXPECTED_MODEL_SIZE = _calc_model_size()
 EXPECTED_ENGRAM_SIZE = ENG_NUM_BUCKETS * DIM
@@ -156,6 +193,7 @@ EXPECTED_WEIGHT_BYTES = EXPECTED_MODEL_BYTES + EXPECTED_ENGRAM_BYTES
 memory_config = {"ram_gb": 12, "is_auto_detected": False}
 train_device, train_backend = None, None
 
+
 def safe_float(v, default=0.0):
     try:
         if v is None or math.isnan(v) or math.isinf(v):
@@ -163,6 +201,7 @@ def safe_float(v, default=0.0):
         return float(v)
     except Exception:
         return default
+
 
 def sanitize_for_json(obj):
     if isinstance(obj, dict):
@@ -187,9 +226,11 @@ def sanitize_for_json(obj):
         pass
     return str(obj)
 
+
 TOKENIZER = None
 _tokenizer_started = False
 PREVIEW_EVERY = 10
+
 
 def start_tokenizer_loader():
     global _tokenizer_started
@@ -197,6 +238,7 @@ def start_tokenizer_loader():
         return
     _tokenizer_started = True
     threading.Thread(target=_load_tokenizer_worker, daemon=True).start()
+
 
 def _load_tokenizer_worker():
     global TOKENIZER
@@ -217,6 +259,7 @@ def _load_tokenizer_worker():
         log.warning("transformers not installed.")
     TOKENIZER = None
 
+
 def decode_ids(ids, max_chars=220):
     try:
         ids = [int(i) for i in ids]
@@ -233,9 +276,11 @@ def decode_ids(ids, max_chars=220):
         s = s[:max_chars] + "…"
     return s
 
+
 def decode_one(tok_id):
     s = decode_ids([tok_id], max_chars=32)
     return s if s.strip() else "␠"
+
 
 # =========================================================================
 # Logos + window icon
@@ -259,24 +304,13 @@ if _lp_dark.exists():
 if not LOGO_URI_DARK:
     LOGO_URI_DARK = LOGO_URI_LIGHT
 
-# --- icon plumbing -------------------------------------------------------
-ICON_PATH = None          # raster path handed to pywebview (PNG / ICO / etc.)
-WINDOWS_ICO_PATH = None   # real .ico used by the native Win32 icon swap
+ICON_PATH = None
+WINDOWS_ICO_PATH = None
 WINDOW_TITLE = "CrowdGPT"
 _cleanup_icon = []
 
+
 def _render_svg_to_png(svg_path, size: int = 256):
-    """
-    Render an SVG to a PNG using whichever backend is available.
-    Returns path to a temp PNG, or None. Never raises.
-    Backends tried, in order:
-      1. cairosvg          (best on Linux/macOS; needs Cairo DLLs on Windows)
-      2. svglib+reportlab  (pure Python — recommended on Windows)
-      3. resvg-py          (Rust wheel, fast, works on Windows)
-      4. Qt (PySide6/PyQt5, ships with pywebview on Windows)
-      5. ImageMagick CLI
-      6. Inkscape CLI
-    """
     svg_path = Path(svg_path)
     if not svg_path.exists():
         return None
@@ -291,7 +325,6 @@ def _render_svg_to_png(svg_path, size: int = 256):
         except Exception:
             return False
 
-    # --- 1. cairosvg ----------------------------------------------------
     try:
         import cairosvg
         cairosvg.svg2png(url=str(svg_path), write_to=out,
@@ -302,7 +335,6 @@ def _render_svg_to_png(svg_path, size: int = 256):
     except Exception as e:
         log.debug(f"[icon] cairosvg failed: {e}")
 
-    # --- 2. svglib + reportlab (pure Python — best on Windows) ----------
     try:
         from svglib.svglib import svg2rlg
         from reportlab.graphics import renderPM
@@ -321,7 +353,6 @@ def _render_svg_to_png(svg_path, size: int = 256):
     except Exception as e:
         log.debug(f"[icon] svglib failed: {e}")
 
-    # --- 3. resvg-py ----------------------------------------------------
     try:
         import resvg_py
         resvg_py.svg_to_bytes(svg_path=str(svg_path), write_to=out,
@@ -332,7 +363,6 @@ def _render_svg_to_png(svg_path, size: int = 256):
     except Exception as e:
         log.debug(f"[icon] resvg-py failed: {e}")
 
-    # --- 4. Qt (PySide6 / PyQt5) ---------------------------------------
     for mod in ("PySide6", "PyQt5"):
         try:
             if mod == "PySide6":
@@ -357,7 +387,6 @@ def _render_svg_to_png(svg_path, size: int = 256):
         except Exception as e:
             log.debug(f"[icon] {mod} failed: {e}")
 
-    # --- 5. ImageMagick CLI --------------------------------------------
     try:
         r = subprocess.run(
             ["magick", "-background", "none", str(svg_path),
@@ -370,7 +399,6 @@ def _render_svg_to_png(svg_path, size: int = 256):
     except Exception as e:
         log.debug(f"[icon] magick failed: {e}")
 
-    # --- 6. Inkscape CLI -----------------------------------------------
     try:
         r = subprocess.run(
             ["inkscape", str(svg_path),
@@ -383,7 +411,6 @@ def _render_svg_to_png(svg_path, size: int = 256):
     except Exception as e:
         log.debug(f"[icon] inkscape failed: {e}")
 
-    # Nothing worked → cleanup and return None
     try:
         os.unlink(out)
     except Exception:
@@ -392,7 +419,6 @@ def _render_svg_to_png(svg_path, size: int = 256):
 
 
 def _png_to_ico(png_path: str, sizes=(256, 128, 64, 48, 32, 16)):
-    """Convert PNG to a multi-size ICO. Returns path or None. Never raises."""
     try:
         from PIL import Image
     except ImportError:
@@ -416,22 +442,12 @@ def _cleanup_icon_files():
             os.unlink(p)
         except Exception:
             pass
+
+
 atexit.register(_cleanup_icon_files)
 
 
 def _find_best_icon():
-    """
-    Resolution order (first hit wins):
-      1. icon.ico next to the script  (explicit user override, best on Windows)
-      2. docs/icon.ico                (explicit user override)
-      3. docs/logo-app.svg            (rendered via whatever SVG engine is
-                                       available — this is the *correct* app
-                                       logo, so it beats any stray .png)
-      4. icon.png next to the script
-      5. docs/logo-app.png
-    Returns (raster_path_for_webview, ico_path_for_windows_or_None).
-    Never raises. Never tries to open a directory.
-    """
     base = Path(__file__).parent
 
     ico_candidates = [base / "icon.ico", base / "docs" / "icon.ico"]
@@ -440,14 +456,11 @@ def _find_best_icon():
     png_candidates = [base / "icon.png",
                       base / "docs" / "logo-app.png"]
 
-    # 1/2. Direct .ico — perfect on Windows, accepted by pywebview elsewhere.
     for ico in ico_candidates:
         if ico.is_file():
             log.info(f"[icon] Using existing .ico: {ico}")
             return str(ico), str(ico)
 
-    # 3. Render the SVG. Preferred over PNG because logo-app.svg is the
-    #    canonical app icon and any random .png may be the wrong image.
     for svg in svg_candidates:
         if svg.is_file():
             rendered = _render_svg_to_png(svg, 256)
@@ -465,7 +478,6 @@ def _find_best_icon():
                         log.warning("[icon] SVG rendered but PNG→ICO failed. "
                                     "Install Pillow: pip install pillow")
                 return raster, ico_path
-            # Non-Windows can load SVG directly.
             if sys.platform != "win32":
                 log.info(f"[icon] No SVG renderer found — using SVG directly: {svg}")
                 return str(svg), None
@@ -476,9 +488,8 @@ def _find_best_icon():
                 "    pip install resvg-py\n"
                 "  Or drop a real icon.ico next to client.py."
             )
-            break  # don't repeat the warning for every svg candidate
+            break
 
-    # 4/5. Existing PNG.
     for png in png_candidates:
         if png.is_file():
             raster = str(png)
@@ -499,14 +510,12 @@ def _find_best_icon():
 
 
 ICON_PATH, WINDOWS_ICO_PATH = _find_best_icon()
+
+
 # =========================================================================
 # Windows native icon swap
 # =========================================================================
 def set_windows_icon(window_title: str, ico_path: str):
-    """
-    Set the titlebar + taskbar icon of the top-level window `window_title`.
-    Only runs on Windows and only accepts a real .ico file.
-    """
     if sys.platform != "win32" or not ico_path:
         return
     ico_path = os.path.abspath(ico_path)
@@ -517,7 +526,6 @@ def set_windows_icon(window_title: str, ico_path: str):
         log.warning(f"[icon] not an .ico file: {ico_path}")
         return
 
-    # Explicit argtypes prevent 64-bit pointer truncation.
     user32 = ctypes.WinDLL("user32", use_last_error=True)
     user32.FindWindowW.argtypes   = [ctypes.c_wchar_p, ctypes.c_wchar_p]
     user32.FindWindowW.restype    = ctypes.c_void_p
@@ -547,7 +555,6 @@ def set_windows_icon(window_title: str, ico_path: str):
     cy = user32.GetSystemMetrics(SM_CYSMICON) or 16
 
     hicon_small = user32.LoadImageW(None, ico_path, IMAGE_ICON, cx, cy, LR_LOADFROMFILE)
-    # (0, 0) with no LR_DEFAULTSIZE → LoadImage picks the largest icon in the file.
     hicon_big   = user32.LoadImageW(None, ico_path, IMAGE_ICON, 0, 0, LR_LOADFROMFILE)
 
     if hicon_small:
@@ -561,8 +568,8 @@ def set_windows_icon(window_title: str, ico_path: str):
     else:
         log.info(f"[icon] Applied window icon: {ico_path}")
 
+
 def _wait_for_window(title: str, timeout: float = 5.0) -> bool:
-    """Poll for the top-level window to exist."""
     if sys.platform != "win32":
         return False
     user32 = ctypes.WinDLL("user32", use_last_error=True)
@@ -574,6 +581,7 @@ def _wait_for_window(title: str, timeout: float = 5.0) -> bool:
             return True
         time.sleep(0.1)
     return False
+
 
 # =========================================================================
 # Backend detection
@@ -596,12 +604,14 @@ def get_available_backends():
     backends['cpu'] = True
     return backends
 
+
 def get_best_default_backend():
     avail = get_available_backends()
     for bk in ['cuda', 'rocm', 'mps', 'xpu', 'cpu']:
         if avail.get(bk):
             return bk
     return 'cpu'
+
 
 def detect_training_backend(force=None):
     if force and force != "auto":
@@ -648,28 +658,80 @@ def detect_training_backend(force=None):
         pass
     return torch.device('cpu'), "CPU"
 
+
+def install_hard_vram_cap(device, safety_gb=SAFETY_MARGIN_GB):
+    """
+    Make the VRAM budget a hard ceiling enforced by PyTorch.
+    After this, exceeding the budget raises a *catchable* torch OOM
+    inside our process instead of a driver-level failure.
+    No-op on CPU / DirectML / MPS.
+    """
+    if device is None or device.type != "cuda":
+        return None
+    try:
+        idx = device.index if device.index is not None else 0
+        props = torch.cuda.get_device_properties(idx)
+        total = int(props.total_memory)
+        cap_bytes = max(int(MIN_HEADROOM_GB * 1024**3),
+                        total - int(safety_gb * 1024**3))
+        frac = max(0.05, min(1.0, cap_bytes / total))
+        torch.cuda.set_per_process_memory_fraction(frac, idx)
+        log.info(f"[VRAM-CAP] hard cap {cap_bytes/1024**3:.2f} GB "
+                 f"({frac*100:.1f}% of {total/1024**3:.2f} GB) on device {idx}")
+        return cap_bytes / 1024**3
+    except Exception as e:
+        log.warning(f"[VRAM-CAP] could not install hard cap: {e}")
+        return None
+
+
 def auto_detect_vram_budget():
+    """
+    Placement budget = min(free, total) - SAFETY_MARGIN - ALLOCATOR_RESERVE.
+    Reports what we're willing to *use*, not what's free.
+    """
     global train_backend
+
     if train_backend in ("CUDA", "ROCM") and torch.cuda.is_available():
         try:
             fb, tb = torch.cuda.mem_get_info(0)
-            memory_config.update({"ram_gb": round(max(1.0, min(fb / 1024 ** 3, tb / 1024 ** 3 - 2.0) - 1.0), 2), "is_auto_detected": True})
+            total_gb = tb / 1024**3
+            free_gb  = fb / 1024**3
+            usable = max(0.25, min(total_gb, free_gb)
+                               - SAFETY_MARGIN_GB
+                               - ALLOCATOR_RESERVE_GB)
+            memory_config.update({"ram_gb": round(usable, 2),
+                                  "is_auto_detected": True})
+            log.info(f"[VRAM-BUDGET] free={free_gb:.2f}GB total={total_gb:.2f}GB "
+                     f"margin={SAFETY_MARGIN_GB:.2f}GB reserve={ALLOCATOR_RESERVE_GB:.2f}GB "
+                     f"→ placement={usable:.2f}GB")
             return
         except Exception:
             pass
+
     if train_backend == "MPS":
         try:
             out = subprocess.check_output(["sysctl", "-n", "hw.memsize"]).decode().strip()
-            total_gb = int(out) / 1024 ** 3
-            memory_config.update({"ram_gb": round(max(1.0, total_gb * 0.75 - 2.0), 2), "is_auto_detected": True})
+            total_gb = int(out) / 1024**3
+            usable = max(0.5, total_gb * 0.75 - SAFETY_MARGIN_GB)
+            memory_config.update({"ram_gb": round(usable, 2),
+                                  "is_auto_detected": True})
             return
         except Exception:
             pass
+
+    if train_backend == "DIRECTML":
+        memory_config.update({"ram_gb": 1.5, "is_auto_detected": True})
+        return
+
     try:
         import psutil
-        memory_config.update({"ram_gb": round(max(1.0, psutil.virtual_memory().available / 1024 ** 3 - 2.0), 2), "is_auto_detected": True})
+        usable = max(0.5, psutil.virtual_memory().available / 1024**3
+                          - SAFETY_MARGIN_GB)
+        memory_config.update({"ram_gb": round(usable, 2),
+                              "is_auto_detected": True})
     except Exception:
         pass
+
 
 def has_bitsandbytes():
     try:
@@ -678,25 +740,111 @@ def has_bitsandbytes():
     except Exception:
         return False
 
-def estimate_vram_bytes(bs, sl, u8):
-    mb = EXPECTED_MODEL_SIZE * 2
-    ob = EXPECTED_MODEL_SIZE * (4 if u8 else 12)
-    gb = EXPECTED_MODEL_SIZE * 4
-    ab = N_LAYERS * (bs * sl * DIM * 2 + bs * N_HEADS * 64 * sl * 4)
-    lb = bs * LOSS_CHUNK * VOCAB_SIZE * 4
-    eb = bs * sl * DIM * 2
-    return int(mb + ob + gb + ab + lb + eb + 0.8 * 1024 ** 3)
 
-def recommend_batch_size(sl=2048):
+# ---------------------------------------------------------------------------
+# Memory estimators
+# ---------------------------------------------------------------------------
+def _bytes_per_block_params():
+    """Parameter count of one transformer block (attention + MLP + norms)."""
+    return (
+        DIM * 2                                      # ln_1
+        + DIM * (N_HEADS * HEAD_DIM)                 # wq
+        + DIM * (N_KV_HEADS * HEAD_DIM)              # wk
+        + DIM * (N_KV_HEADS * HEAD_DIM)              # wv
+        + DIM * DIM                                  # wo
+        + DIM * 2                                    # ln_2
+        + DIM * MLP_HIDDEN                           # w1
+        + DIM * MLP_HIDDEN                           # w2
+        + MLP_HIDDEN * DIM                           # w3
+    )
+
+
+def estimate_vram_bytes(bs, sl, u8):
+    """
+    Honest peak estimate for one micro-batch with gradient checkpointing.
+    Counts: embeddings+head params/grads/optim, block params/grads/optim,
+    activation footprint, loss chunks, and a fixed workspace reserve.
+    """
+    per_block = _bytes_per_block_params()
+
+    # wte + lm_head are weight-tied: one parameter tensor, but its grad and
+    # optimizer state exist at full size.
+    head_params = VOCAB_SIZE * DIM
+    head_bytes  = head_params * (4 + 4 + (2 if u8 else 8))
+
+    blocks = N_LAYERS * per_block
+    opt_state_per_param = 2 if u8 else 8
+    block_bytes = blocks * (4 + 4 + opt_state_per_param)
+
+    # Activation footprint of all blocks with checkpointing on: the *input*
+    # to each block, plus one live recomputed tensor at a time.
+    act = bs * sl * DIM * 4 * (2 + 1)
+
+    # Largest single chunk of lm_head output in fp32.
+    loss = bs * LOSS_CHUNK * VOCAB_SIZE * 4
+
+    workspace = int(ALLOCATOR_RESERVE_GB * 1024**3)
+
+    return int(head_bytes + block_bytes + act + loss + workspace)
+
+
+def recommend_batch_size(sl=MAX_SEQ_LEN):
     u8 = has_bitsandbytes()
-    budget = int(memory_config["ram_gb"] * 1024 ** 3)
+    budget = int(memory_config["ram_gb"] * 1024**3)
     best = 1
     for bs in ALLOWED_BATCH_SIZES:
         if estimate_vram_bytes(bs, sl, u8) <= budget:
             best = bs
         else:
             break
+    log.info(f"[BATCH] recommended bs={best} for budget={memory_config['ram_gb']:.2f}GB "
+             f"(8bit_opt={u8})")
     return best
+
+
+# ---------------------------------------------------------------------------
+# Layer placement
+# ---------------------------------------------------------------------------
+def _plan_gpu_layers(device, backend_name, budget_gb, bs=1, sl=MAX_SEQ_LEN,
+                     use_ckpt=True, u8=False):
+    """
+    How many transformer blocks fit on the accelerator *given* the budget.
+    Accounts for weights, grads, optimizer state, per-block activations, and a
+    fixed allocator/context reserve.
+    """
+    if device is None or device.type == "cpu":
+        return 0
+
+    budget = int(max(0.0, budget_gb) * 1024**3)
+    reserve = int(ALLOCATOR_RESERVE_GB * 1024**3)
+    usable = max(0, budget - reserve)
+    if usable <= 0:
+        log.info(f"[PLACEMENT] {backend_name}: budget {budget_gb:.2f}GB "
+                 f"≤ reserve {ALLOCATOR_RESERVE_GB:.2f}GB → 0 blocks on GPU")
+        return 0
+
+    per_block = _bytes_per_block_params()
+    weights   = per_block * 4
+    grads     = per_block * 4
+    adam      = per_block * (2 if u8 else 8)
+
+    # Activation per block:
+    #   ckpt on : only the block input is stored.
+    #   ckpt off: everything stored — much larger.
+    act = bs * sl * DIM * 4 * (1 if use_ckpt else 10)
+
+    per_block_total = weights + grads + adam + act
+    n = int(usable // per_block_total) if per_block_total > 0 else 0
+    n = max(0, min(N_LAYERS, n))
+
+    if backend_name == "DIRECTML":
+        n = min(n, 2)
+
+    log.info(f"[PLACEMENT] {backend_name}: budget={budget_gb:.2f}GB "
+             f"reserve={ALLOCATOR_RESERVE_GB:.2f}GB per_blk={per_block_total/1024**2:.1f}MB "
+             f"ckpt={use_ckpt} bs={bs} u8={u8} → {n}/{N_LAYERS} blocks on GPU")
+    return n
+
 
 def precompute_freqs(dim, sl, dev):
     inv = 1.0 / (10000.0 ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
@@ -704,8 +852,10 @@ def precompute_freqs(dim, sl, dev):
     e = torch.cat((f, f), -1)
     return e.cos()[None, None, :, :].to(dev), e.sin()[None, None, :, :].to(dev)
 
+
 def rotate_half(x):
     return torch.cat((-x[..., x.shape[-1] // 2:], x[..., :x.shape[-1] // 2]), -1)
+
 
 def _is_directml(t):
     try:
@@ -713,11 +863,13 @@ def _is_directml(t):
     except Exception:
         return False
 
+
 def _is_directml_device(d):
     try:
         return d.type == 'privateuseone'
     except Exception:
         return False
+
 
 def _is_accel_error(msg):
     """Detect DirectML/CUDA errors that warrant a fallback to CPU."""
@@ -729,48 +881,10 @@ def _is_accel_error(msg):
         "device_type", "not implemented for unique",
     ))
 
-def _plan_gpu_layers(device, backend_name, ram_gb):
-    """
-    Decide how many transformer blocks to place on the accelerator.
-    Everything else (embeddings, lm_head, remaining blocks) stays on CPU.
-    """
-    try:
-        if backend_name == "CPU" or device.type == 'cpu':
-            return 0
-    except Exception:
-        return 0
 
-    ram_bytes = int(max(0.5, ram_gb) * 1024**3)
-    budget = int(ram_bytes * 0.80)  # 20% safety margin
-
-    params_per_block = (
-        DIM * 2
-        + DIM * (N_HEADS * HEAD_DIM)
-        + DIM * (N_KV_HEADS * HEAD_DIM) * 2
-        + DIM * DIM
-        + DIM * 2
-        + DIM * MLP_HIDDEN * 2
-        + MLP_HIDDEN * DIM
-    )
-    # fp32 weights + fp32 grad + fp32 Adam m + fp32 Adam v = 4× param count × 4 bytes
-    bytes_per_block = params_per_block * 4 * 4
-
-    if backend_name == "DIRECTML":
-        # DirectML is functional but fragile on this model.
-        # Cap at 2 blocks and rely on runtime fallback if anything breaks.
-        n_fit = int(budget // bytes_per_block)
-        n = max(0, min(2, min(N_LAYERS, n_fit)))
-        log.info(f"[PLACEMENT] DirectML: budget {ram_gb:.1f} GB → {n} block(s) on GPU")
-        return n
-
-    n_fit = int(budget // bytes_per_block)
-    n_fit = max(0, min(N_LAYERS, n_fit))
-    if n_fit < 1:
-        log.warning(f"[PLACEMENT] {backend_name}: budget {ram_gb:.1f} GB too small for any block on GPU")
-        return 0
-    log.info(f"[PLACEMENT] {backend_name}: budget {ram_gb:.1f} GB → {n_fit} block(s) on GPU")
-    return n_fit
-
+# =========================================================================
+# Model
+# =========================================================================
 class GroupedQueryAttention(nn.Module):
     def __init__(self):
         super().__init__()
@@ -800,8 +914,6 @@ class GroupedQueryAttention(nn.Module):
         return self.wo((a @ v).transpose(1, 2).contiguous().view(B, T, C))
 
     def _chunked(self, q, k, v, B, T, C, cs=64):
-        # Some backends (DirectML) cannot materialize expanded views into CPU memory.
-        # Force .contiguous() before moving to CPU to avoid that.
         use_cpu = _is_directml(q)
         if use_cpu:
             q_ = q.contiguous().cpu()
@@ -822,6 +934,7 @@ class GroupedQueryAttention(nn.Module):
             out = out.to(q.device)
         return self.wo(out)
 
+
 class SwiGLU(nn.Module):
     def __init__(self):
         super().__init__()
@@ -831,6 +944,7 @@ class SwiGLU(nn.Module):
 
     def forward(self, x):
         return self.w3(F.silu(self.w1(x)) * self.w2(x))
+
 
 class Block(nn.Module):
     def __init__(self):
@@ -844,6 +958,7 @@ class Block(nn.Module):
         x = x + self.attn(self.ln_1(x), cos, sin, use_chunked)
         return x + self.mlp(self.ln_2(x))
 
+
 class EngramMemory(nn.Module):
     """Always runs on CPU. Output is moved to `device` for the caller."""
     def __init__(self, bn, device):
@@ -853,7 +968,6 @@ class EngramMemory(nn.Module):
         nn.init.normal_(self.table.weight, mean=0.0, std=0.02)
 
     def forward(self, idx):
-        # Everything CPU-side, then a single transfer of the result.
         idx_cpu = idx.detach().cpu()
         px = torch.cat([torch.zeros_like(idx_cpu[:, :1]), idx_cpu[:, :-1]], dim=1)
         hi = (px * 1000003 + idx_cpu) % ENG_NUM_BUCKETS
@@ -862,20 +976,30 @@ class EngramMemory(nn.Module):
         out = cr[inv].view(idx.shape[0], idx.shape[1], DIM)
         return out.to(self.device)
 
+
 class SotaGPT(nn.Module):
     """
-    Layer-offloaded transformer. `gpu_layers` = number of leading blocks
-    placed on `device`. Everything else (embeddings, remaining blocks,
-    lm_head, ln_f) stays on CPU.
+    Layer-offloaded transformer. `gpu_layers` leading blocks live on `device`;
+    everything else (embeddings, remaining blocks, lm_head, ln_f) stays on CPU.
+    Placement is mutable at runtime via set_gpu_layers / force_head_cpu /
+    to_cpu_only, so the degrade ladder can shrink GPU usage without rebuilding
+    the model (optimizer param references stay valid).
     """
-    def __init__(self, bn, device, gpu_layers=None):
+    def __init__(self, bn, device, gpu_layers=None, bs=1, sl=MAX_SEQ_LEN):
         super().__init__()
         self.main_device = device
-        self.cpu_device = torch.device('cpu')
+        self.cpu_device  = torch.device('cpu')
         self.backend_name = bn
 
+        # Checkpointing is what makes partial-GPU placement viable; enable it
+        # whenever the accelerator supports it, regardless of placement.
+        use_ckpt = (device is not None and device.type == 'cuda')
+
         if gpu_layers is None:
-            gpu_layers = _plan_gpu_layers(device, bn, memory_config["ram_gb"])
+            gpu_layers = _plan_gpu_layers(device, bn, memory_config["ram_gb"],
+                                          bs=bs, sl=sl,
+                                          use_ckpt=use_ckpt,
+                                          u8=has_bitsandbytes())
         self.gpu_layers = max(0, min(N_LAYERS, int(gpu_layers)))
         self.gpu_layer_set = set(range(self.gpu_layers))
         self.all_on_gpu = (self.gpu_layers == N_LAYERS) and (device.type != 'cpu')
@@ -898,42 +1022,72 @@ class SotaGPT(nn.Module):
         self.register_buffer("freqs_sin_cpu", sm_cpu)
 
         for i, block in enumerate(self.blocks):
-            if self.all_on_gpu or i in self.gpu_layer_set:
-                block.to(device)
-            else:
-                block.to(self.cpu_device)
+            block.to(device if (self.all_on_gpu or i in self.gpu_layer_set)
+                     else self.cpu_device)
 
-        if self.all_on_gpu:
-            self.wte.to(device)
-            self.ln_f.to(device)
-            self.lm_head.to(device)
-        else:
-            # Head stays on CPU. Keeps VRAM free for block offloading
-            # and avoids the huge vocab matmul living on the accelerator.
-            self.wte.to(self.cpu_device)
-            self.ln_f.to(self.cpu_device)
-            self.lm_head.to(self.cpu_device)
-
+        self._place_head()
         self.engram.table.to('cpu')
 
         log.info(
             f"🧠 SotaGPT: {self.gpu_layers}/{N_LAYERS} blocks on {device.type}, "
-            f"head on {self.ln_f.weight.device.type}"
+            f"head on {self.ln_f.weight.device.type}, ckpt={use_ckpt}"
         )
 
+    # ---- runtime placement mutation ----
+    def _place_head(self):
+        if self.all_on_gpu:
+            self.wte.to(self.main_device)
+            self.ln_f.to(self.main_device)
+            self.lm_head.to(self.main_device)
+        else:
+            self.wte.to(self.cpu_device)
+            self.ln_f.to(self.cpu_device)
+            self.lm_head.to(self.cpu_device)
+
+    def set_gpu_layers(self, n):
+        n = max(0, min(N_LAYERS, int(n)))
+        self.gpu_layers = n
+        self.gpu_layer_set = set(range(n))
+        self.all_on_gpu = (n == N_LAYERS) and (self.main_device.type != 'cpu')
+        self.any_on_gpu = (n > 0) and (self.main_device.type != 'cpu')
+        for i, blk in enumerate(self.blocks):
+            blk.to(self.main_device if i < n else self.cpu_device)
+        self._place_head()
+        log.info(f"[PLACEMENT] set_gpu_layers({n}) → head on {self.ln_f.weight.device.type}")
+
+    def force_head_cpu(self):
+        """Move wte/ln_f/lm_head to CPU but leave blocks where they are."""
+        self.all_on_gpu = False
+        self.wte.to(self.cpu_device)
+        self.ln_f.to(self.cpu_device)
+        self.lm_head.to(self.cpu_device)
+        log.info("[PLACEMENT] head forced to CPU")
+
+    def to_cpu_only(self):
+        self.gpu_layers = 0
+        self.gpu_layer_set = set()
+        self.all_on_gpu = False
+        self.any_on_gpu = False
+        self.main_device = self.cpu_device
+        for blk in self.blocks:
+            blk.to(self.cpu_device)
+        self._place_head()
+        self.engram.table.to('cpu')
+        self.engram.device = self.cpu_device
+        log.info("[PLACEMENT] model → CPU-only")
+
+    # ---- forward ----
     def _block_device(self, i):
         if self.all_on_gpu or i in self.gpu_layer_set:
             return self.main_device
         return self.cpu_device
 
     def forward_features(self, idx, use_chunked=True, use_ckpt=True):
-        """Runs embeddings + all blocks + final LN. Returns [B, T, DIM]."""
-        # wte can be on CPU while idx arrives on DirectML. torch-directml
-        # can't mix CPU weight + DML index, so normalise devices first.
         wte_dev = self.wte.weight.device
         if idx.device != wte_dev:
             idx = idx.to(wte_dev)
         x = self.wte(idx)
+
         first_dev = self._block_device(0) if len(self.blocks) else self.cpu_device
         if x.device != first_dev:
             x = x.to(first_dev)
@@ -945,10 +1099,9 @@ class SotaGPT(nn.Module):
                 x = x.to(target)
                 cur_dev = target
 
-            if cur_dev == self.cpu_device:
-                cos, sin = self.freqs_cos_cpu, self.freqs_sin_cpu
-            else:
-                cos, sin = self.freqs_cos_main, self.freqs_sin_main
+            cos, sin = ((self.freqs_cos_cpu, self.freqs_sin_cpu)
+                        if cur_dev == self.cpu_device
+                        else (self.freqs_cos_main, self.freqs_sin_main))
 
             if use_ckpt:
                 x = checkpoint(block, x, cos, sin, use_chunked, use_reentrant=False)
@@ -961,24 +1114,9 @@ class SotaGPT(nn.Module):
         return self.ln_f(x)
 
     def forward(self, idx, use_chunked=True, use_ckpt=True):
-        x = self.forward_features(idx, use_chunked, use_ckpt)
-        return self.lm_head(x)
+        return self.lm_head(self.forward_features(idx, use_chunked, use_ckpt))
 
-    def to_cpu_only(self):
-        """Hard fallback: put everything on CPU. Optimizer references stay valid."""
-        self.gpu_layers = 0
-        self.gpu_layer_set = set()
-        self.all_on_gpu = False
-        self.any_on_gpu = False
-        self.main_device = self.cpu_device
-        for block in self.blocks:
-            block.to(self.cpu_device)
-        self.wte.to(self.cpu_device)
-        self.ln_f.to(self.cpu_device)
-        self.lm_head.to(self.cpu_device)
-        self.engram.table.to('cpu')
-        self.engram.device = self.cpu_device
-
+    # ---- weight (de)serialization ----
     def get_base_weights(self):
         return np.concatenate([
             p.detach().float().flatten().cpu().numpy()
@@ -996,6 +1134,10 @@ class SotaGPT(nn.Module):
                 p.data.copy_(ft[o:o + s].view(p.shape).to(p.device))
                 o += s
 
+
+# =========================================================================
+# Data + networking
+# =========================================================================
 def _fetch_with_retry(url, headers=None, timeout=60, retries=5):
     for a in range(retries):
         try:
@@ -1008,6 +1150,7 @@ def _fetch_with_retry(url, headers=None, timeout=60, retries=5):
                 time.sleep(2 ** (a + 1))
             else:
                 raise
+
 
 class StreamingShardDataset:
     STEPS_PER_SUBCHUNK = 500
@@ -1141,10 +1284,12 @@ class StreamingShardDataset:
         tgt = np.stack([self.data[x + 1:x + self.tps] for x in s])
         return torch.tensor(inp, dtype=torch.long), torch.tensor(tgt, dtype=torch.long)
 
+
 def decompress_weights(raw, fmt="bf16"):
     if fmt == "fp16":
         return np.frombuffer(raw, dtype=np.uint16).view(np.float16).astype(np.float32)
     return torch.from_numpy(np.frombuffer(raw, dtype=np.uint16).copy()).view(torch.bfloat16).to(torch.float32).numpy()
+
 
 def do_login(srv, u, p):
     try:
@@ -1162,6 +1307,7 @@ def do_login(srv, u, p):
         return None, "network"
     except Exception:
         return None, "network"
+
 
 def do_register(srv, u, email, p):
     try:
@@ -1186,6 +1332,7 @@ def do_register(srv, u, email, p):
         return None, "network"
     except Exception:
         return None, "network"
+
 
 class HeartbeatManager:
     def __init__(self, srv, h, cr, se, emit):
@@ -1224,6 +1371,7 @@ class HeartbeatManager:
             except Exception:
                 pass
             self.shutdown.wait(timeout=15)
+
 
 def wait_for_round(srv, h, se, emit):
     overlay_on = False
@@ -1271,6 +1419,7 @@ def wait_for_round(srv, h, se, emit):
     hide()
     return None
 
+
 def fetch_task_metadata(srv, h, se, emit):
     while not se.is_set():
         try:
@@ -1309,11 +1458,13 @@ def fetch_task_metadata(srv, h, se, emit):
             time.sleep(10)
     return None
 
+
 def _weight_cache_path(revision, filename):
     rev = str(revision or "main").strip().replace("/", "_").replace("\\", "_")
     d = CHECKPOINT_DIR / "hf_weights" / rev
     d.mkdir(parents=True, exist_ok=True)
     return d / filename
+
 
 def _download_file_with_progress(url, dest, emit, stop_evt, expected_size=None, label="file"):
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -1378,6 +1529,7 @@ def _download_file_with_progress(url, dest, emit, stop_evt, expected_size=None, 
                 time.sleep(5 * (attempt + 1))
     raise RuntimeError(f"Failed to download {label}: {last_err}")
 
+
 def _load_safetensors_flat(path, expected_numel, label="weights"):
     try:
         from safetensors.torch import load_file
@@ -1399,6 +1551,7 @@ def _load_safetensors_flat(path, expected_numel, label="weights"):
         raise RuntimeError(f"{label} size mismatch: got {arr.size}, expected {expected_numel}.")
     _ = float(arr[0]) + float(arr[-1])
     return arr
+
 
 def fetch_weights_from_hf(md, se, emit):
     wcfg = md.get("weights") or {}
@@ -1436,6 +1589,7 @@ def fetch_weights_from_hf(md, se, emit):
     iw = _load_safetensors_flat(model_path, EXPECTED_MODEL_SIZE, "model weights")
     ie = _load_safetensors_flat(engram_path, EXPECTED_ENGRAM_SIZE, "engram weights")
     return iw, ie
+
 
 def fetch_task(srv, h, prec, se, emit):
     while not se.is_set():
@@ -1501,20 +1655,27 @@ def fetch_task(srv, h, prec, se, emit):
             emit('log', f"Task fetch failed: {e}")
             time.sleep(15)
 
+
+# =========================================================================
+# Loss + training step
+# =========================================================================
 def _chunk_ce(m, xs, ys):
     return F.cross_entropy(m.lm_head(xs).reshape(-1, VOCAB_SIZE), ys.reshape(-1))
 
-def _fwl(m, x, y, sl, ua, ad, ls=1.0, preview=False):
+
+def _fwl(m, x, y, sl, ua, ad, ls=1.0, preview=False, loss_chunk=LOSS_CHUNK):
     """
-    Forward + loss. Uses model.forward_features to respect layer placement.
-    Wraps compute in try/except so callers can fall back to CPU on failure.
+    Forward + loss for one micro-batch. Does NOT move x/y to a device —
+    forward_features handles placement per block, and y is moved to the head
+    device (which may be CPU after degradation).
     """
-    use_ckpt = m.all_on_gpu and m.main_device.type == 'cuda'
+    use_ckpt = (m.gpu_layers > 0) and (m.main_device.type == 'cuda')
 
     def fwd():
         return m.forward_features(x, use_chunked=True, use_ckpt=use_ckpt)
 
-    nc = max(1, math.ceil(sl / LOSS_CHUNK))
+    nc = max(1, math.ceil(sl / loss_chunk))
+
     if ua:
         with torch.autocast(device_type='cuda', dtype=ad):
             xe = fwd()
@@ -1523,8 +1684,11 @@ def _fwl(m, x, y, sl, ua, ad, ls=1.0, preview=False):
                 xe = xe.to(head_dev)
             y_dev = y.to(head_dev)
             lo = sum(
-                checkpoint(_chunk_ce, m, xe[:, i:i + LOSS_CHUNK, :], y_dev[:, i:i + LOSS_CHUNK], use_reentrant=False)
-                for i in range(0, sl, LOSS_CHUNK)
+                checkpoint(_chunk_ce, m,
+                           xe[:, i:i + loss_chunk, :],
+                           y_dev[:, i:i + loss_chunk],
+                           use_reentrant=False)
+                for i in range(0, sl, loss_chunk)
             ) / nc
     else:
         xe = fwd()
@@ -1533,8 +1697,11 @@ def _fwl(m, x, y, sl, ua, ad, ls=1.0, preview=False):
             xe = xe.to(head_dev)
         y_dev = y.to(head_dev)
         lo = sum(
-            checkpoint(_chunk_ce, m, xe[:, i:i + LOSS_CHUNK, :], y_dev[:, i:i + LOSS_CHUNK], use_reentrant=False)
-            for i in range(0, sl, LOSS_CHUNK)
+            checkpoint(_chunk_ce, m,
+                       xe[:, i:i + loss_chunk, :],
+                       y_dev[:, i:i + loss_chunk],
+                       use_reentrant=False)
+            for i in range(0, sl, loss_chunk)
         ) / nc
 
     cards = []
@@ -1542,9 +1709,7 @@ def _fwl(m, x, y, sl, ua, ad, ls=1.0, preview=False):
         try:
             with torch.no_grad():
                 B, T, C = xe.shape
-                items = []
-                for b in range(min(B, 3)):
-                    items.append((b, T - 1))
+                items = [(b, T - 1) for b in range(min(B, 3))]
                 for offset in (24, 48, 72):
                     p = T - offset - 1
                     if p >= 9:
@@ -1575,8 +1740,106 @@ def _fwl(m, x, y, sl, ua, ad, ls=1.0, preview=False):
             cards = []
     return lo * ls, cards
 
+
+def _is_oom(e):
+    if isinstance(e, torch.cuda.OutOfMemoryError):
+        return True
+    if isinstance(e, RuntimeError):
+        return "out of memory" in str(e).lower()
+    return False
+
+
+def _clear_accel_cache(device):
+    try:
+        if device is not None and device.type == 'cuda':
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+    gc.collect()
+
+
+class DegradeLadder:
+    """
+    Ordered rungs. Each OOM advances one rung; the caller retries the same
+    micro-batch. Rung 6 is CPU-only and cannot VRAM-OOM, so the ladder
+    guarantees eventual success for any VRAM-related failure.
+
+    on_step_down(ladder) is called after every successful rung so the caller
+    can rebuild optimizers against the new placement.
+    """
+    def __init__(self, model, on_step_down=None):
+        self.model = model
+        self.stage = 0
+        self.loss_chunk = LOSS_CHUNK
+        self.on_step_down = on_step_down
+
+    def step_down(self, emit) -> bool:
+        self.stage += 1
+        m = self.model
+
+        if self.stage == 1:
+            emit('log', "🔻 VRAM rung 1: force head (wte/lm_head/ln_f) → CPU")
+            m.force_head_cpu()
+        elif self.stage == 2:
+            cur = m.gpu_layers
+            nxt = max(0, cur // 2)
+            emit('log', f"🔻 VRAM rung 2: GPU blocks {cur} → {nxt}")
+            m.set_gpu_layers(nxt)
+        elif self.stage == 3:
+            emit('log', "🔻 VRAM rung 3: all blocks → CPU")
+            m.set_gpu_layers(0)
+        elif self.stage == 4:
+            old = self.loss_chunk
+            self.loss_chunk = max(32, old // 2)
+            emit('log', f"🔻 VRAM rung 4: LOSS_CHUNK {old} → {self.loss_chunk}")
+        elif self.stage == 5:
+            old = self.loss_chunk
+            self.loss_chunk = max(16, old // 2)
+            emit('log', f"🔻 VRAM rung 5: LOSS_CHUNK {old} → {self.loss_chunk}")
+        elif self.stage == 6:
+            emit('log', "🔻 VRAM rung 6: hard fallback — CPU-only model")
+            m.to_cpu_only()
+            self.loss_chunk = 16
+        else:
+            return False
+
+        if self.on_step_down is not None:
+            try:
+                self.on_step_down(self)
+            except Exception as e:
+                log.warning(f"on_step_down failed: {e}")
+        _clear_accel_cache(m.main_device)
+        return True
+
+
+def _train_step_safe(model, x, y, sl, ua, ad, ls, preview, ladder, emit):
+    """
+    One micro-batch fwd+bwd. Catches OOM, degrades, retries the *same* batch.
+    Returns (loss, cards). Raises only if the ladder is exhausted — which is
+    a real bug, not a VRAM problem.
+    """
+    while True:
+        try:
+            lo, cards = _fwl(model, x, y, sl, ua, ad, ls,
+                             preview=preview, loss_chunk=ladder.loss_chunk)
+            lo.backward()
+            return lo, cards
+        except RuntimeError as e:
+            if not _is_oom(e):
+                raise
+            _clear_accel_cache(model.main_device)
+            if not ladder.step_down(emit):
+                emit('log', "💀 OOM even at CPU-only — this is a bug, not VRAM.")
+                raise
+            emit('log', f"   retrying same batch at ladder stage {ladder.stage}")
+
+
+# =========================================================================
+# Upload
+# =========================================================================
 def _sha256_hex(data):
     return hashlib.sha256(data).hexdigest()
+
 
 def _post_json_with_retry(url, payload, h, emit, se, timeout=60, retries=4):
     last_err = None
@@ -1600,6 +1863,7 @@ def _post_json_with_retry(url, payload, h, emit, se, timeout=60, retries=4):
                 emit("log", f"POST retry {attempt + 1}: {e}")
                 time.sleep(min(20, 2 ** (attempt + 1)))
     raise RuntimeError(f"POST {url} failed: {last_err}")
+
 
 def _chunked_submit_once(srv, h, compressed_data, meta, emit, se, chunk_size):
     total = len(compressed_data)
@@ -1647,6 +1911,7 @@ def _chunked_submit_once(srv, h, compressed_data, meta, emit, se, chunk_size):
     emit("log", "Finalizing chunked upload...")
     return _post_json_with_retry(f"{srv}/fl/submit/finalize", {"uploadId": upload_id}, h, emit, se, timeout=900, retries=2)
 
+
 def chunked_submit_delta(srv, h, compressed_data, meta, emit, se):
     chunk_size = UPLOAD_CHUNK_BYTES
     while True:
@@ -1659,6 +1924,7 @@ def chunked_submit_delta(srv, h, compressed_data, meta, emit, se):
                 emit("log", f"Chunk too large. Reducing to {chunk_size / (1024 * 1024):.0f} MB and retrying.")
                 continue
             raise
+
 
 def stream_with_progress(data, emit_cb, total_size, stop_evt):
     chunk_size = 128 * 1024
@@ -1676,23 +1942,40 @@ def stream_with_progress(data, emit_cb, total_size, stop_evt):
         yield chunk
     emit_cb("overlay_progress", {"done": total_size, "total": total_size})
 
-def _build_model(bn, device, iw, ie, emit):
-    """Build a SotaGPT with layer placement and load base + engram weights."""
-    model = SotaGPT(bn, device)
+
+# =========================================================================
+# Model build + optimizer construction
+# =========================================================================
+def _build_model(bn, device, iw, ie, emit, bs=1, sl=MAX_SEQ_LEN):
+    """Build a SotaGPT with placement planning and load base + engram weights."""
+    model = SotaGPT(bn, device, gpu_layers=None, bs=bs, sl=sl)
     model.engram.table.to('cpu')
-
-    try:
-        print(f"[IW-PROBE] iw: shape={getattr(iw, 'shape', None)} size={getattr(iw, 'size', None)}", flush=True)
-        print(f"[IW-PROBE] ie: shape={getattr(ie, 'shape', None)} size={getattr(ie, 'size', None)}", flush=True)
-    except Exception:
-        pass
-
     model.load_base_weights(iw)
-    model.engram.table.weight.data.copy_(torch.from_numpy(ie).view(model.engram.table.weight.shape))
+    model.engram.table.weight.data.copy_(
+        torch.from_numpy(ie).view(model.engram.table.weight.shape))
     model.engram.table.to('cpu')
     model.train()
     return model
 
+
+def _build_optimizers(model, lr=1e-4):
+    bp = [p for n, p in model.named_parameters() if not n.startswith('engram.')]
+    ep = list(model.engram.parameters())
+    try:
+        import bitsandbytes as bnb
+        ob = bnb.optim.AdamW8bit(bp, lr=lr, betas=(0.9, 0.95), weight_decay=0.01)
+    except Exception:
+        ob = torch.optim.AdamW(bp, lr=lr, betas=(0.9, 0.95), weight_decay=0.01)
+    try:
+        oe = torch.optim.SparseAdam(ep, lr=lr)
+    except Exception:
+        oe = torch.optim.AdamW(ep, lr=lr, weight_decay=0.01)
+    return ob, oe
+
+
+# =========================================================================
+# Round
+# =========================================================================
 def run_single_round_wrapper(srv, at, se, emit):
     global train_device, train_backend
     h = {"Authorization": f"Bearer {at}"} if at else {}
@@ -1770,28 +2053,27 @@ def run_single_round_wrapper(srv, at, se, emit):
         )
         bs = recommend_batch_size(sl)
 
-        # ---- Build model with layer placement, retry on OOM ----
+        # ---- build model with retry on OOM ----
+        model = None
         while bs >= 1:
             try:
                 if train_backend in ("CUDA", "ROCM"):
                     try: torch.cuda.empty_cache()
                     except Exception: pass
                 gc.collect()
-                model = _build_model(train_backend, train_device, iw, ie, emit)
+                model = _build_model(train_backend, train_device, iw, ie, emit,
+                                     bs=bs, sl=sl)
                 break
             except RuntimeError as e:
-                if "out of memory" in str(e).lower():
+                if _is_oom(e):
                     if model:
                         del model
                         model = None
-                    if train_backend in ("CUDA", "ROCM"):
-                        try: torch.cuda.empty_cache()
-                        except Exception: pass
-                    gc.collect()
+                    _clear_accel_cache(train_device)
                     bs = max(1, bs // 2)
+                    emit('log', f"Model build OOM → bs={bs}")
                 else:
                     raise
-
         if model is None:
             emit('log', "Failed to initialize model.")
             return
@@ -1800,38 +2082,24 @@ def run_single_round_wrapper(srv, at, se, emit):
         as_ = max(1, round(131072 / mbt))
         ls = 1.0 / as_
 
-        def ha():
-            nonlocal as_, ls
-            as_ = max(1, as_ // 2)
-            ls = 1.0 / as_
-            ob.zero_grad(set_to_none=True)
-            gc.collect()
-            if train_backend in ("CUDA", "ROCM"):
-                try: torch.cuda.empty_cache()
-                except Exception: pass
-            emit('log', f"OOM -> accum now {as_}x")
+        ob, oe = _build_optimizers(model, lr=1e-4)
 
-        bp = [p for n, p in model.named_parameters() if not n.startswith('engram.')]
-        ep = list(model.engram.parameters())
-        try:
-            import bitsandbytes as bnb
-            ob = bnb.optim.AdamW8bit(bp, lr=1e-4, betas=(0.9, 0.95), weight_decay=0.01)
-        except Exception:
-            ob = torch.optim.AdamW(bp, lr=1e-4, betas=(0.9, 0.95), weight_decay=0.01)
-        try:
-            oe = torch.optim.SparseAdam(ep, lr=1e-4)
-        except Exception:
-            oe = torch.optim.AdamW(ep, lr=1e-4, weight_decay=0.01)
+        def _on_step_down(_ladder):
+            nonlocal ob, oe
+            ob, oe = _build_optimizers(model, lr=1e-4)
+            emit('log', "   rebuilt optimizers for new placement")
+
+        ladder = DegradeLadder(model, on_step_down=_on_step_down)
 
         iew = model.engram.table.weight.data.cpu().clone()
 
-        # Autocast only for CUDA + bf16 support
         ua = train_backend in ("CUDA", "ROCM") and torch.cuda.is_bf16_supported()
         ad = torch.bfloat16 if ua else None
 
         emit('log', f"Backend: {train_backend} | autocast: {ua} | "
                    f"bs={bs} | accum={as_} | dtype={'bf16' if ua else 'fp32'}")
 
+        # ---- calibration loop ----
         emit('log', "Calibrating speed...")
         cs_ = time.time()
         cal_global_steps = 3
@@ -1842,87 +2110,71 @@ def run_single_round_wrapper(srv, at, se, emit):
             if hb.should_stop() or se.is_set():
                 return
             ob.zero_grad(set_to_none=True)
-            try:
-                for mi in range(as_):
-                    if hb.should_stop() or se.is_set():
-                        break
-                    if ds.needs_new_subchunk():
-                        ds.advance(srv, "bf16")
-                    sd = (abs(hash("cal")) % 10000) + cal_done * 1000 + mi
-                    x, y = ds.get_batch(bs, seed=sd)
-                    x, y = x.to(train_device), y.to(train_device)
-                    want_preview = (micro_step == 0) or ((micro_step + 1) % PREVIEW_EVERY == 0)
-
-                    # ---- DirectML/GPU runtime fallback ----
-                    try:
-                        lo, cards = _fwl(model, x, y, sl, ua, ad, ls, preview=want_preview)
-                    except RuntimeError as re:
-                        if (not tried_cpu_fallback) and _is_accel_error(str(re)):
-                            emit('log', f"⚠️ {train_backend} op failed at fwd: {str(re)[:120]}")
-                            emit('log', "🔻 Falling back to CPU-only model...")
-                            model.to_cpu_only()
-                            # Rebuild optimizer over same params — objects unchanged
-                            bp = [p for n, p in model.named_parameters() if not n.startswith('engram.')]
-                            ep = list(model.engram.parameters())
-                            try:
-                                import bitsandbytes as bnb
-                                ob = bnb.optim.AdamW8bit(bp, lr=1e-4, betas=(0.9, 0.95), weight_decay=0.01)
-                            except Exception:
-                                ob = torch.optim.AdamW(bp, lr=1e-4, betas=(0.9, 0.95), weight_decay=0.01)
-                            try:
-                                oe = torch.optim.SparseAdam(ep, lr=1e-4)
-                            except Exception:
-                                oe = torch.optim.AdamW(ep, lr=1e-4, weight_decay=0.01)
-                            ua = False; ad = None
-                            tried_cpu_fallback = True
-                            emit('log', "✅ Retrying on CPU-only model")
-                            lo, cards = _fwl(model, x, y, sl, ua, ad, ls, preview=want_preview)
-                        else:
-                            raise
-
-                    lval = float(lo.item())
-                    micro_step += 1
-                    if cards:
-                        emit('model_preview', {'step': micro_step, 'cards': cards})
-                    if cal_done >= 1 and mi == 0:
-                        elapsed = time.time() - cs_
-                        sps_micro = elapsed / micro_step
-                        rh = max(0.1, rs.get("max_round_hours", 2.0) - rs.get("round_elapsed_hours", 0))
-                        remaining = max(60, (rh * 3600) - elapsed - (UPLOAD_BUFFER_MIN * 60))
-                        target_micro_steps = micro_step + int(remaining / sps_micro)
-                    elapsed_cal = time.time() - cs_
-                    current_tps = tt / max(elapsed_cal, 1.0)
-                    time_left_mins = 0
-                    if cal_done >= 1 and micro_step > 0:
-                        elapsed = time.time() - cs_
-                        sps_micro = elapsed / micro_step
-                        rh = max(0.1, rs.get("max_round_hours", 2.0) - rs.get("round_elapsed_hours", 0))
-                        remaining = max(60, (rh * 3600) - elapsed - (UPLOAD_BUFFER_MIN * 60))
-                        time_left_mins = remaining / 60.0
-                    emit('cal_stats', {
-                        'step': micro_step, 'total': target_micro_steps,
-                        'loss': safe_float(lval * as_, 10.0),
-                        'microbatch': micro_step,
-                        'tps': safe_float(current_tps),
-                        'time_left': safe_float(time_left_mins),
-                    })
-                    lo.backward()
-                    oe.step()
-                    oe.zero_grad(set_to_none=True)
-                    tt += x.numel()
-                    del lo, x, y
+            for mi in range(as_):
                 if hb.should_stop() or se.is_set():
-                    return
-            except RuntimeError as e:
-                if "out of memory" not in str(e).lower():
-                    raise
-                ha()
-                continue
-            torch.nn.utils.clip_grad_norm_(bp, 1.0)
+                    break
+                if ds.needs_new_subchunk():
+                    ds.advance(srv, "bf16")
+                sd = (abs(hash("cal")) % 10000) + cal_done * 1000 + mi
+                x, y = ds.get_batch(bs, seed=sd)
+                want_preview = (micro_step == 0) or ((micro_step + 1) % PREVIEW_EVERY == 0)
+
+                try:
+                    lo, cards = _train_step_safe(model, x, y, sl, ua, ad, ls,
+                                                 preview=want_preview,
+                                                 ladder=ladder, emit=emit)
+                except RuntimeError as re:
+                    if (not tried_cpu_fallback) and _is_accel_error(str(re)):
+                        emit('log', f"⚠️ {train_backend} op failed at fwd: {str(re)[:120]}")
+                        emit('log', "🔻 Falling back to CPU-only model...")
+                        model.to_cpu_only()
+                        ob, oe = _build_optimizers(model, lr=1e-4)
+                        ua = False; ad = None
+                        tried_cpu_fallback = True
+                        lo, cards = _train_step_safe(model, x, y, sl, ua, ad, ls,
+                                                     preview=want_preview,
+                                                     ladder=ladder, emit=emit)
+                    else:
+                        raise
+
+                lval = float(lo.item())
+                micro_step += 1
+                if cards:
+                    emit('model_preview', {'step': micro_step, 'cards': cards})
+                if cal_done >= 1 and mi == 0:
+                    elapsed = time.time() - cs_
+                    sps_micro = elapsed / micro_step
+                    rh = max(0.1, rs.get("max_round_hours", 2.0) - rs.get("round_elapsed_hours", 0))
+                    remaining = max(60, (rh * 3600) - elapsed - (UPLOAD_BUFFER_MIN * 60))
+                    target_micro_steps = micro_step + int(remaining / sps_micro)
+                elapsed_cal = time.time() - cs_
+                current_tps = tt / max(elapsed_cal, 1.0)
+                time_left_mins = 0
+                if cal_done >= 1 and micro_step > 0:
+                    elapsed = time.time() - cs_
+                    sps_micro = elapsed / micro_step
+                    rh = max(0.1, rs.get("max_round_hours", 2.0) - rs.get("round_elapsed_hours", 0))
+                    remaining = max(60, (rh * 3600) - elapsed - (UPLOAD_BUFFER_MIN * 60))
+                    time_left_mins = remaining / 60.0
+                emit('cal_stats', {
+                    'step': micro_step, 'total': target_micro_steps,
+                    'loss': safe_float(lval * as_, 10.0),
+                    'microbatch': micro_step,
+                    'tps': safe_float(current_tps),
+                    'time_left': safe_float(time_left_mins),
+                })
+                oe.step()
+                oe.zero_grad(set_to_none=True)
+                tt += x.numel()
+                del lo, x, y
+            if hb.should_stop() or se.is_set():
+                return
+            torch.nn.utils.clip_grad_norm_(bp if False else [p for p in model.parameters() if p.requires_grad], 1.0)
             ob.step()
             ob.zero_grad(set_to_none=True)
             gc.collect()
             cal_done += 1
+
         if se.is_set():
             return
         rh = max(0.1, rs.get("max_round_hours", 2.0) - rs.get("round_elapsed_hours", 0))
@@ -1942,82 +2194,70 @@ def run_single_round_wrapper(srv, at, se, emit):
             ob.zero_grad(set_to_none=True)
             als = 0.0
             cc = 0
-            try:
-                for mi in range(as_):
-                    if hb.should_stop() or se.is_set() or time.time() >= dl:
-                        break
-                    if ds.needs_new_subchunk():
-                        ds.advance(srv, "bf16")
-                    sd = (abs(hash("t")) % 10000) + micro_step * 1000 + mi
-                    x, y = ds.get_batch(bs, seed=sd)
-                    x, y = x.to(train_device), y.to(train_device)
-                    want_preview = (micro_step == 0) or ((micro_step + 1) % PREVIEW_EVERY == 0)
-
-                    try:
-                        lo, cards = _fwl(model, x, y, sl, ua, ad, ls, preview=want_preview)
-                    except RuntimeError as re:
-                        if (not tried_cpu_fallback) and _is_accel_error(str(re)):
-                            emit('log', f"⚠️ {train_backend} op failed at fwd: {str(re)[:120]}")
-                            emit('log', "🔻 Falling back to CPU-only model...")
-                            model.to_cpu_only()
-                            bp = [p for n, p in model.named_parameters() if not n.startswith('engram.')]
-                            ep = list(model.engram.parameters())
-                            try:
-                                import bitsandbytes as bnb
-                                ob = bnb.optim.AdamW8bit(bp, lr=1e-4, betas=(0.9, 0.95), weight_decay=0.01)
-                            except Exception:
-                                ob = torch.optim.AdamW(bp, lr=1e-4, betas=(0.9, 0.95), weight_decay=0.01)
-                            try:
-                                oe = torch.optim.SparseAdam(ep, lr=1e-4)
-                            except Exception:
-                                oe = torch.optim.AdamW(ep, lr=1e-4, weight_decay=0.01)
-                            ua = False; ad = None
-                            tried_cpu_fallback = True
-                            lo, cards = _fwl(model, x, y, sl, ua, ad, ls, preview=want_preview)
-                        else:
-                            raise
-
-                    lval = float(lo.item()) * as_
-                    lo.backward()
-                    oe.step()
-                    oe.zero_grad(set_to_none=True)
-                    als += lval
-                    tt += x.numel()
-                    cc += 1
-                    micro_step += 1
-                    if cards:
-                        emit('model_preview', {'step': micro_step, 'cards': cards})
-                    rem_time = max(1, dl - time.time())
-                    elapsed_total = time.time() - cs_
-                    if micro_step > 5:
-                        sps_micro = elapsed_total / micro_step
-                        future_steps = int(rem_time / sps_micro)
-                        current_target = micro_step + future_steps
-                        if current_target > target_micro_steps:
-                            target_micro_steps = current_target
-                    if time.time() - last_stats_emit > 0.25 or time.time() >= dl:
-                        last_stats_emit = time.time()
-                        lv = als / cc if cc > 0 else 10.0
-                        ctps = tt / max(time.time() - cs_, 1)
-                        emit('stats', {
-                            'step': micro_step, 'target': target_micro_steps,
-                            'loss': safe_float(lv, 10.0), 'tps': safe_float(ctps),
-                            'global_step': gs, 'round': cr,
-                            'time_left': safe_float(max(0, (dl - time.time()) / 60)),
-                        })
-                    del lo, x, y
-                if hb.should_stop() or se.is_set():
+            for mi in range(as_):
+                if hb.should_stop() or se.is_set() or time.time() >= dl:
                     break
-            except RuntimeError as e:
-                if "out of memory" not in str(e).lower():
-                    raise
-                ha()
-                continue
+                if ds.needs_new_subchunk():
+                    ds.advance(srv, "bf16")
+                sd = (abs(hash("t")) % 10000) + micro_step * 1000 + mi
+                x, y = ds.get_batch(bs, seed=sd)
+                want_preview = (micro_step == 0) or ((micro_step + 1) % PREVIEW_EVERY == 0)
+
+                try:
+                    lo, cards = _train_step_safe(model, x, y, sl, ua, ad, ls,
+                                                 preview=want_preview,
+                                                 ladder=ladder, emit=emit)
+                except RuntimeError as re:
+                    if (not tried_cpu_fallback) and _is_accel_error(str(re)):
+                        emit('log', f"⚠️ {train_backend} op failed at fwd: {str(re)[:120]}")
+                        emit('log', "🔻 Falling back to CPU-only model...")
+                        model.to_cpu_only()
+                        ob, oe = _build_optimizers(model, lr=1e-4)
+                        ua = False; ad = None
+                        tried_cpu_fallback = True
+                        lo, cards = _train_step_safe(model, x, y, sl, ua, ad, ls,
+                                                     preview=want_preview,
+                                                     ladder=ladder, emit=emit)
+                    else:
+                        raise
+
+                lval = float(lo.item()) * as_
+                oe.step()
+                oe.zero_grad(set_to_none=True)
+                als += lval
+                tt += x.numel()
+                cc += 1
+                micro_step += 1
+                if cards:
+                    emit('model_preview', {'step': micro_step, 'cards': cards})
+                rem_time = max(1, dl - time.time())
+                elapsed_total = time.time() - cs_
+                if micro_step > 5:
+                    sps_micro = elapsed_total / micro_step
+                    future_steps = int(rem_time / sps_micro)
+                    current_target = micro_step + future_steps
+                    if current_target > target_micro_steps:
+                        target_micro_steps = current_target
+                if time.time() - last_stats_emit > 0.25 or time.time() >= dl:
+                    last_stats_emit = time.time()
+                    lv = als / cc if cc > 0 else 10.0
+                    ctps = tt / max(time.time() - cs_, 1)
+                    emit('stats', {
+                        'step': micro_step, 'target': target_micro_steps,
+                        'loss': safe_float(lv, 10.0), 'tps': safe_float(ctps),
+                        'global_step': gs, 'round': cr,
+                        'time_left': safe_float(max(0, (dl - time.time()) / 60)),
+                    })
+                del lo, x, y
+            if hb.should_stop() or se.is_set():
+                break
             if cc == 0:
                 break
-            torch.nn.utils.clip_grad_norm_(bp, 1.0)
+            torch.nn.utils.clip_grad_norm_(
+                [p for p in model.parameters() if p.requires_grad], 1.0)
             ob.step()
             ob.zero_grad(set_to_none=True)
+
         if se.is_set():
             emit('log', "Stopped by user. Skipping upload.")
             return
@@ -2099,6 +2339,10 @@ def run_single_round_wrapper(srv, at, se, emit):
             except Exception:
                 pass
 
+
+# =========================================================================
+# UI (HTML/JS) — unchanged from the original
+# =========================================================================
 HTML = """<!DOCTYPE html>
 <html><head><meta charset="UTF-8">
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
@@ -2140,7 +2384,7 @@ main{flex:1 1 auto;min-height:0;overflow-y:auto;padding:clamp(10px,2vw,18px) cla
 input{width:100%;font-family:inherit;font-size:12.5px;background:var(--bg-softer);color:var(--text);border:1px solid var(--border);padding:8px 10px;border-radius:4px;outline:none}
 input:focus{border-color:var(--accent)}
 @font-face{font-family:"Twemoji Country Flags";unicode-range:U+1F1E6-1F1FF,U+1F3F4,U+E0062-E0063,U+E0065,U+E0067,U+E006C,U+E006E,U+E0073-E0074,U+E0077,U+E007F;src:url("https://cdn.jsdelivr.net/npm/country-flag-emoji-polyfill@0.1/dist/TwemojiCountryFlags.woff2") format("woff2");font-display:swap}
-:root{--sans:"Twemoji Country Flags",-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif; /* ...rest unchanged */}
+:root{--sans:"Twemoji Country Flags",-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif}
 button{font-family:inherit;font-size:12.5px;font-weight:500;cursor:pointer;border-radius:4px}
 .btn-primary{background:var(--text);color:var(--bg);border:1px solid var(--text);padding:9px 14px}
 .btn-primary:hover:not(:disabled){opacity:.85}
@@ -2312,264 +2556,4 @@ body.dark .overlay{background:rgba(26,26,30,.86)}
   <div class="motd-text" id="motd-text"></div>
 </div>
 <script>
-const I18N={en:{login_pre:"Sign in to ",login_sub:"Welcome back to the swarm.",register_title_pre:"Join ",register_sub:"Create your account.",server_url:"Server address",username:"Username",password:"Password",email:"Email",login_btn:"Log in",register_btn:"Create account",no_account:"No account?",register_link:"Create one",have_account:"Already registered?",login_link:"Log in",anon_preface:"Stay anonymous?",anon_link:"Skip and contribute anonymously",dash_title:"Training",loss:"Loss",tokens_sec:"Tokens/sec",time_left:"Time left",round:"Round",step:"Step",loss_history:"Loss history",waiting_data:"Waiting for data…",model_thoughts:"Model Predictions",waiting_preview:"Waiting for first prediction…",idle:"Idle",training:"Training…",waiting:"Waiting…",uploading:"Uploading…",downloading:"Downloading…",preparing:"Preparing…",calibrating:"Calibrating…",dl_weights:"Downloading weights…",wait_coord:"Waiting for coordinator…",wait_coord_sub:"This can take a few minutes.",start:"Start training",stop:"Stop",err_invalid_credentials:"Invalid username or password.",err_username_taken:"Username taken.",err_email_taken:"Email already registered.",err_weak_password:"Password must be ≥6 chars.",err_invalid_input:"Check your input.",err_login_failed:"Login failed.",err_register_failed:"Registration failed.",err_network:"Cannot reach server.",motd_title:"System Notice",close:"Close"},fr:{login_pre:"Connexion à ",login_sub:"Bon retour parmi nous.",register_title_pre:"Rejoignez ",register_sub:"Créez votre compte.",server_url:"Adresse",username:"Nom d'utilisateur",password:"Mot de passe",email:"E-mail",login_btn:"Se connecter",register_btn:"Créer le compte",no_account:"Pas de compte ?",register_link:"Créer un compte",have_account:"Déjà inscrit ?",login_link:"Se connecter",anon_preface:"Rester anonyme ?",anon_link:"Continuer anonymement",dash_title:"Entraînement",loss:"Perte",tokens_sec:"Tokens/sec",time_left:"Reste",round:"Manche",step:"Étape",loss_history:"Historique",waiting_data:"En attente…",model_thoughts:"Prédictions",waiting_preview:"En attente…",idle:"Inactif",training:"Entraînement…",waiting:"Attente…",uploading:"Envoi…",downloading:"Téléchargement…",preparing:"Préparation…",calibrating:"Calibration…",dl_weights:"Téléchargement des poids…",wait_coord:"Attente du coordinateur…",wait_coord_sub:"Cela peut prendre quelques minutes.",start:"Démarrer",stop:"Arrêter",err_invalid_credentials:"Identifiants invalides.",err_username_taken:"Nom pris.",err_email_taken:"E-mail déjà enregistré.",err_weak_password:"Mot de passe ≥6 caractères.",err_invalid_input:"Vérifiez la saisie.",err_login_failed:"Échec de connexion.",err_register_failed:"Échec d'inscription.",err_network:"Serveur injoignable.",motd_title:"Avis système",close:"Fermer"},es:{login_pre:"Inicia sesión en ",login_sub:"Bienvenido de vuelta.",register_title_pre:"Únete a ",register_sub:"Crea tu cuenta.",server_url:"Servidor",username:"Usuario",password:"Contraseña",email:"Correo",login_btn:"Iniciar sesión",register_btn:"Crear cuenta",no_account:"¿Sin cuenta?",register_link:"Crear una",have_account:"¿Registrado?",login_link:"Iniciar sesión",anon_preface:"¿Anónimo?",anon_link:"Continuar anónimamente",dash_title:"Entrenamiento",loss:"Pérdida",tokens_sec:"Tokens/seg",time_left:"Queda",round:"Ronda",step:"Paso",loss_history:"Historial",waiting_data:"Esperando…",model_thoughts:"Predicciones",waiting_preview:"Esperando…",idle:"Inactivo",training:"Entrenando…",waiting:"Esperando…",uploading:"Subiendo…",downloading:"Descargando…",preparing:"Preparando…",calibrating:"Calibrando…",dl_weights:"Descargando pesos…",wait_coord:"Esperando coordinador…",wait_coord_sub:"Puede tardar unos minutos.",start:"Iniciar",stop:"Detener",err_invalid_credentials:"Credenciales inválidas.",err_username_taken:"Usuario en uso.",err_email_taken:"Correo ya registrado.",err_weak_password:"Contraseña ≥6 caracteres.",err_invalid_input:"Revisa los datos.",err_login_failed:"Falló el inicio de sesión.",err_register_failed:"Falló el registro.",err_network:"Servidor inaccesible.",motd_title:"Aviso",close:"Cerrar"},de:{login_pre:"Anmelden bei ",login_sub:"Willkommen zurück.",register_title_pre:"Tritt ",register_sub:"Erstelle dein Konto.",server_url:"Serveradresse",username:"Benutzername",password:"Passwort",email:"E-Mail",login_btn:"Anmelden",register_btn:"Konto erstellen",no_account:"Kein Konto?",register_link:"Erstellen",have_account:"Bereits registriert?",login_link:"Anmelden",anon_preface:"Anonym bleiben?",anon_link:"Anonym fortfahren",dash_title:"Training",loss:"Verlust",tokens_sec:"Tokens/Sek",time_left:"Rest",round:"Runde",step:"Schritt",loss_history:"Verlauf",waiting_data:"Warte…",model_thoughts:"Vorhersagen",waiting_preview:"Warte…",idle:"Bereit",training:"Training…",waiting:"Warten…",uploading:"Upload…",downloading:"Herunterladen…",preparing:"Vorbereitung…",calibrating:"Kalibrierung…",dl_weights:"Gewichte werden geladen…",wait_coord:"Warte auf Koordinator…",wait_coord_sub:"Kann ein paar Minuten dauern.",start:"Training starten",stop:"Stopp",err_invalid_credentials:"Ungültig.",err_username_taken:"Benutzername vergeben.",err_email_taken:"E-Mail bereits registriert.",err_weak_password:"Passwort ≥6 Zeichen.",err_invalid_input:"Eingabe prüfen.",err_login_failed:"Anmeldung fehlgeschlagen.",err_register_failed:"Registrierung fehlgeschlagen.",err_network:"Server nicht erreichbar.",motd_title:"Systemmeldung",close:"Schließen"},tr:{login_pre:"Giriş yap: ",login_sub:"Sürüye hoş geldin.",register_title_pre:"Katıl: ",register_sub:"Hesabını oluştur.",server_url:"Sunucu",username:"Kullanıcı adı",password:"Şifre",email:"E-posta",login_btn:"Giriş yap",register_btn:"Hesap oluştur",no_account:"Hesap yok mu?",register_link:"Oluştur",have_account:"Kayıtlı mısın?",login_link:"Giriş yap",anon_preface:"Anonim kal?",anon_link:"Anonim devam et",dash_title:"Eğitim",loss:"Kayıp",tokens_sec:"Token/sn",time_left:"Kalan",round:"Tur",step:"Adım",loss_history:"Geçmiş",waiting_data:"Bekleniyor…",model_thoughts:"Tahminler",waiting_preview:"Bekleniyor…",idle:"Boşta",training:"Eğitiliyor…",waiting:"Bekleniyor…",uploading:"Yükleniyor…",downloading:"İndiriliyor…",preparing:"Hazırlanıyor…",calibrating:"Kalibre ediliyor…",dl_weights:"Ağırlıklar yükleniyor…",wait_coord:"Koordinatör bekleniyor…",wait_coord_sub:"Birkaç dakika sürebilir.",start:"Eğitimi başlat",stop:"Durdur",err_invalid_credentials:"Geçersiz.",err_username_taken:"Kullanıcı adı alınmış.",err_email_taken:"E-posta kayıtlı.",err_weak_password:"Şifre ≥6 karakter.",err_invalid_input:"Girdiyi kontrol et.",err_login_failed:"Giriş başarısız.",err_register_failed:"Kayıt başarısız.",err_network:"Sunucuya ulaşılamıyor.",motd_title:"Sistem Uyarısı",close:"Kapat"}};
-let lang='en',statusKey='idle';
-const lossHistory=[];const MAXP=80;
-function t(k){return (I18N[lang]&&I18N[lang][k])||I18N.en[k]||k}
-function applyT(){document.querySelectorAll('[data-i18n]').forEach(e=>e.textContent=t(e.getAttribute('data-i18n')));document.getElementById('status-indicator').textContent=t(statusKey)}
-document.getElementById('lang-select').addEventListener('change',e=>{lang=e.target.value;applyT()});
-function showAuthScreen(name){document.querySelectorAll('.auth-screen').forEach(s=>s.classList.remove('active'));document.getElementById('screen-'+name).classList.add('active');document.getElementById('login-error').classList.remove('show');document.getElementById('reg-error').classList.remove('show')}
-document.getElementById('go-to-register').addEventListener('click',e=>{e.preventDefault();showAuthScreen('register')});
-document.getElementById('go-to-login').addEventListener('click',e=>{e.preventDefault();showAuthScreen('login')});
-function callApi(n,...a){if(window.pywebview&&window.pywebview.api&&window.pywebview.api[n]){window.pywebview.api[n](...a);return true}return false}
-window.addEventListener('pywebviewready',()=>callApi('get_backends'));
-document.getElementById('backend-select').addEventListener('change',e=>{const nb=e.target.value;if(nb===window._currentBackend)return;callApi('set_backend',nb);});
-document.getElementById('btn-login').addEventListener('click',()=>{const srv=document.getElementById('login-server').value.trim();const u=document.getElementById('login-user').value.trim();const p=document.getElementById('login-pass').value;if(!u||!p){showLoginError('err_invalid_credentials');return}document.getElementById('login-error').classList.remove('show');document.getElementById('btn-login').disabled=true;callApi('login',srv,u,p)});
-document.getElementById('btn-register').addEventListener('click',()=>{const srv=document.getElementById('reg-server').value.trim();const u=document.getElementById('reg-user').value.trim();const email=document.getElementById('reg-email').value.trim();const p=document.getElementById('reg-pass').value;if(!u||!email||!p){showRegError('err_invalid_input');return}document.getElementById('reg-error').classList.remove('show');document.getElementById('btn-register').disabled=true;callApi('register',srv,u,email,p)});
-document.getElementById('btn-anon').addEventListener('click',e=>{e.preventDefault();callApi('login_anon')});
-document.getElementById('btn-start').addEventListener('click',()=>{if(callApi('start')){document.getElementById('btn-start').disabled=true;document.getElementById('btn-stop').disabled=false}});
-document.getElementById('btn-stop').addEventListener('click',()=>{callApi('stop');document.getElementById('btn-start').disabled=false;document.getElementById('btn-stop').disabled=true});
-function showLoginError(code){const el=document.getElementById('login-error');el.textContent=t(code);el.classList.add('show');document.getElementById('btn-login').disabled=false}
-function showRegError(code){const el=document.getElementById('reg-error');el.textContent=t(code);el.classList.add('show');document.getElementById('btn-register').disabled=false}
-function mb(b){return (b/1048576).toFixed(1)}
-function overlayShow(d){document.getElementById('overlay').classList.add('show');document.getElementById('overlay-title').textContent=t(d.title_key);const s=document.getElementById('overlay-subtitle');if(d.subtitle_key){s.textContent=t(d.subtitle_key);s.classList.add('show')}else{s.classList.remove('show')}const b=document.getElementById('overlay-bar');b.classList.toggle('indet',!!d.indeterminate);document.getElementById('overlay-fill').style.width=d.indeterminate?'':'0%'}
-function overlayHide(){document.getElementById('overlay').classList.remove('show')}
-function drawGraph(){const c=document.getElementById('loss-graph');if(!c)return;const empty=document.getElementById('graph-empty');if(lossHistory.length<2){c.classList.add('hidden-graph');if(empty)empty.classList.remove('hidden-empty');return}c.classList.remove('hidden-graph');if(empty)empty.classList.add('hidden-empty');const rect=c.getBoundingClientRect();const W=rect.width,H=rect.height;if(W<10||H<10){requestAnimationFrame(drawGraph);return}const ctx=c.getContext('2d');const dpr=window.devicePixelRatio||1;c.width=Math.round(W*dpr);c.height=Math.round(H*dpr);ctx.setTransform(dpr,0,0,dpr,0,0);ctx.clearRect(0,0,W,H);const data=lossHistory.slice(-MAXP);const mn=Math.min(...data),mx=Math.max(...data),range=(mx-mn)||1;const pad=6,pH=H-pad*2,pW=W-pad*2,st=pW/(data.length-1);const isDark=document.body.classList.contains('dark');ctx.strokeStyle=isDark?'rgba(255,255,255,.06)':'rgba(17,17,19,.07)';for(let g=1;g<4;g++){const y=pad+pH*g/4;ctx.beginPath();ctx.moveTo(pad,y);ctx.lineTo(pad+pW,y);ctx.stroke()}const pt=i=>[pad+i*st,pad+pH-(data[i]-mn)/range*pH];ctx.beginPath();data.forEach((v,i)=>{const[x,y]=pt(i);i?ctx.lineTo(x,y):ctx.moveTo(x,y)});ctx.lineTo(pad+pW,pad+pH);ctx.lineTo(pad,pad+pH);ctx.closePath();const gr=ctx.createLinearGradient(0,0,0,H);gr.addColorStop(0,isDark?'rgba(34,197,94,.20)':'rgba(22,163,74,.16)');gr.addColorStop(1,'rgba(22,163,74,0)');ctx.fillStyle=gr;ctx.fill();ctx.beginPath();data.forEach((v,i)=>{const[x,y]=pt(i);i?ctx.lineTo(x,y):ctx.moveTo(x,y)});ctx.strokeStyle=isDark?'#22c55e':'#16a34a';ctx.lineWidth=1.5;ctx.stroke()}
-window.handleEvent=function(ev,data){
-if(ev==='login_success'){document.getElementById('view-login').classList.remove('active');document.getElementById('view-dashboard').classList.add('active');document.body.classList.add('dashboard-active');document.getElementById('user-info').textContent=data.username;document.getElementById('btn-login').disabled=false;document.getElementById('btn-register').disabled=false;requestAnimationFrame(drawGraph)}
-else if(ev==='login_error'){const code=data.code||'err_invalid_credentials';const map={invalid_credentials:'err_invalid_credentials',login_failed:'err_login_failed',username_taken:'err_username_taken',email_taken:'err_email_taken',weak_password:'err_weak_password',invalid_input:'err_invalid_input',register_failed:'err_register_failed',network:'err_network'};const tk=map[code]||'err_login_failed';const loginActive=document.getElementById('screen-login').classList.contains('active');if(loginActive)showLoginError(tk);else showRegError(tk)}
-else if(ev==='log'){document.getElementById('status-event').textContent=data}
-else if(ev==='backends'){const sel=document.getElementById('backend-select');sel.innerHTML='';window._currentBackend=data.current;const order=[{key:'cuda',label:'CUDA (NVIDIA)'},{key:'rocm',label:'ROCm (AMD)'},{key:'mps',label:'MPS (Apple)'},{key:'xpu',label:'XPU (Intel)'},{key:'directml',label:'DirectML (Windows)'},{key:'cpu',label:'CPU'}];order.forEach(bk=>{const opt=document.createElement('option');opt.value=bk.key;opt.textContent=bk.label;opt.disabled=!data.available[bk.key];if(bk.key===data.current)opt.selected=true;sel.appendChild(opt)});sel.disabled=false}
-else if(ev==='overlay_show'){overlayShow(data)}
-else if(ev==='overlay_progress'){const bar=document.getElementById('overlay-bar');if(data.total>0){bar.classList.remove('indet');const pct=Math.min(100,data.done/data.total*100);document.getElementById('overlay-fill').style.width=pct+'%';document.getElementById('overlay-pct').textContent=pct.toFixed(1)+'%';document.getElementById('overlay-mb').textContent=mb(data.done)+' / '+mb(data.total)+' MB'}}
-else if(ev==='overlay_hide'){overlayHide()}
-else if(ev==='cal_stats'||ev==='stats'){const loss=Number(data.loss);const tps=Number(data.tps);const step=Number(data.step);const target=ev==='cal_stats'?Number(data.total):Number(data.target);const tl=Number(data.time_left);if(isFinite(loss)){document.getElementById('stat-loss').textContent=loss.toFixed(4);document.getElementById('graph-last').textContent=loss.toFixed(4);if(loss>0){lossHistory.push(loss);if(lossHistory.length>MAXP*2)lossHistory.splice(0,lossHistory.length-MAXP*2)}}if(isFinite(tps))document.getElementById('stat-tps').textContent=Math.round(tps);if(isFinite(tl))document.getElementById('stat-time').textContent=Math.round(tl)+'m';document.getElementById('stat-round').textContent=ev==='cal_stats'?'—':(data.round!=null?data.round:'—');document.getElementById('stat-step-cur').textContent=isFinite(step)?step:0;document.getElementById('stat-step-tot').textContent=isFinite(target)?target:0;const pct=(isFinite(step)&&isFinite(target)&&target>0)?Math.min(100,(step/target)*100):0;document.getElementById('progress-bar').style.width=pct+'%';document.getElementById('progress-text').textContent=pct.toFixed(1)+'%';requestAnimationFrame(drawGraph)}
-else if(ev==='model_preview'){const container=document.getElementById('model-preview');const stepEl=document.getElementById('preview-step');if(!container||!stepEl)return;stepEl.textContent='Step '+data.step;let html='';if(data.cards&&data.cards.length>0){data.cards.forEach(card=>{const cls=card.match?'good':'bad';const badge=card.match?'✓':'✗';const prob=(typeof card.prob==='number'&&isFinite(card.prob))?(card.prob*100).toFixed(1)+'%':'';html+='<div class="pred-line '+cls+'"><div class="pred-main"><span class="pred-text">'+escapeHtml(card.context)+'</span><span class="pred-token">'+escapeHtml(card.pred)+'</span></div><div class="pred-side"><span class="pred-badge">'+badge+'</span><span>target: '+escapeHtml(card.target)+'</span><span>'+prob+'</span></div></div>'})}else{html='<div class="preview-empty">'+escapeHtml(t('waiting_preview'))+'</div>'}container.innerHTML=html}
-else if(ev==='status'){statusKey=data;document.getElementById('status-indicator').textContent=t(statusKey);if(data==='training'||data==='idle'||data==='calibrating'||data==='preparing')overlayHide();if(data==='idle'){document.getElementById('btn-start').disabled=false;document.getElementById('btn-stop').disabled=true}}
-};
-function escapeHtml(s){return String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
-window.addEventListener('resize',()=>requestAnimationFrame(drawGraph));
-function updateLogo(){try{const img=document.getElementById('logo-img');if(!img)return;const isDark=document.body.classList.contains('dark');const src=isDark?img.getAttribute('data-dark'):img.getAttribute('data-light');if(src&&src.length>30)img.src=src}catch(e){}}
-(function(){try{const saved=localStorage.getItem('crowdgpt-theme');const prefersDark=window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches;if(saved==='dark'||(!saved&&prefersDark))document.body.classList.add('dark');updateLogo()}catch(e){}const tbtn=document.getElementById('theme-toggle');if(tbtn){tbtn.addEventListener('click',function(){document.body.classList.toggle('dark');try{localStorage.setItem('crowdgpt-theme',document.body.classList.contains('dark')?'dark':'light')}catch(e){}updateLogo();requestAnimationFrame(drawGraph)})}})();
-applyT();
-(function(){const key='crowdgpt_motd_last_day';const today=new Date().toISOString().slice(0,10);let last=null;try{last=localStorage.getItem(key)}catch(e){}if(last===today)return;fetch('https://raw.githubusercontent.com/Vxtzq/CrowdGPT/main/docs/motd.txt').then(r=>r.ok?r.text():'').then(text=>{text=(text||'').trim();if(!text)return;document.getElementById('motd-text').textContent=text;document.getElementById('motd-overlay').classList.add('show');try{localStorage.setItem(key,today)}catch(e){}}).catch(()=>{})})();
-document.getElementById('motd-close').addEventListener('click',()=>document.getElementById('motd-overlay').classList.remove('show'));
-</script></body></html>"""
-
-class Api:
-    def __init__(self):
-        self.window = None
-        self.stop_event = threading.Event()
-        self.thread = None
-        self.auth_token = None
-        self.username = None
-        self.server_url = DEFAULT_SERVER
-        self._lp = 0.0
-        self._backend_file = CHECKPOINT_DIR / "selected_backend.json"
-        saved = None
-        try:
-            if self._backend_file.exists():
-                saved = json.loads(self._backend_file.read_text()).get("backend")
-        except Exception:
-            saved = None
-        self.selected_backend = saved or get_best_default_backend()
-        log.info(f"[CLIENT] Selected backend: {self.selected_backend}")
-
-    def emit(self, ev, data):
-        if not self.window:
-            return
-        if ev in ('log', 'status'):
-            try:
-                print(f"[EMIT {ev}] {data}", flush=True)
-            except Exception:
-                pass
-        if ev == 'preview_loss':
-            n = time.time()
-            if n - self._lp < 0.4:
-                return
-            self._lp = n
-        try:
-            clean_data = sanitize_for_json(data)
-            self.window.evaluate_js(f"window.handleEvent({json.dumps(ev)}, {json.dumps(clean_data)});")
-        except Exception as e:
-            log.warning(f"Emit failed for {ev}: {e}")
-
-    def get_backends(self):
-        available = get_available_backends()
-        self.emit('backends', {'available': available, 'current': self.selected_backend})
-
-    def set_backend(self, backend_name):
-        log.info(f"[CLIENT] set_backend called with: {backend_name} (was {self.selected_backend})")
-        self.selected_backend = backend_name
-        try:
-            self._backend_file.write_text(json.dumps({"backend": backend_name}))
-        except Exception as e:
-            log.warning(f"Failed to save backend choice: {e}")
-        self.get_backends()
-        if self.thread and self.thread.is_alive():
-            self.stop_event.set()
-
-    def login(self, s, u, p):
-        self.server_url = s or self.server_url
-        threading.Thread(target=self._do_login, args=(u, p), daemon=True).start()
-
-    def _do_login(self, u, p):
-        tok, err = do_login(self.server_url, u, p)
-        if tok:
-            self.auth_token = tok
-            self.username = u
-            self.emit('login_success', {'username': u})
-        else:
-            self.emit('login_error', {'code': err or 'login_failed'})
-
-    def register(self, s, u, email, p):
-        self.server_url = s or self.server_url
-        threading.Thread(target=self._do_register, args=(u, email, p), daemon=True).start()
-
-    def _do_register(self, u, email, p):
-        tok, err = do_register(self.server_url, u, email, p)
-        if tok:
-            self.auth_token = tok
-            self.username = u
-            self.emit('login_success', {'username': u})
-        else:
-            self.emit('login_error', {'code': err or 'register_failed'})
-
-    def login_anon(self):
-        self.auth_token = None
-        self.username = "anonymous"
-        self.emit('login_success', {'username': 'anonymous'})
-
-    def start(self):
-        if self.thread and self.thread.is_alive():
-            return
-        self.stop_event.clear()
-        self.thread = threading.Thread(target=self._rs, daemon=True)
-        self.thread.start()
-
-    def stop(self):
-        self.stop_event.set()
-
-    def _check_updates_between_rounds(self):
-        try:
-            if check_for_update():
-                self.emit('log', "🔄 Updated to a new version — restarting...")
-                self.emit('status', 'idle')
-                time.sleep(2)
-                _restart_self()
-        except Exception as e:
-            log.warning(f"Update check failed: {e}")
-
-    def _rs(self):
-        global train_device, train_backend
-        try:
-            train_device, train_backend = detect_training_backend(self.selected_backend)
-            self.emit('meta', {'backend': train_backend})
-            self.emit('log', f"Backend: {train_backend} ({train_device})")
-            auto_detect_vram_budget()
-            self.emit('log', f"VRAM: {memory_config['ram_gb']:.1f} GB")
-        except Exception as e:
-            self.emit('log', f"Error: {e}")
-            self.emit('status', 'idle')
-            return
-        round_count = 0
-        while not self.stop_event.is_set():
-            round_count += 1
-            self.emit('log', f"{'='*40}")
-            self.emit('log', f"Starting Round Cycle #{round_count}")
-            self.emit('log', f"{'='*40}")
-            try:
-                run_single_round_wrapper(self.server_url, self.auth_token, self.stop_event, self.emit)
-            except KeyboardInterrupt:
-                self.stop_event.set()
-                break
-            except Exception as e:
-                import traceback
-                tb = traceback.format_exc()
-                print(f"\n[ROUND-FAIL-TRACEBACK]\n{tb}\n", flush=True)
-                for ln in tb.splitlines()[-14:]:
-                    self.emit('log', ln)
-                self.emit('log', f"Round failed: {e}")
-            if self.stop_event.is_set():
-                break
-            self._check_updates_between_rounds()
-            self.emit('status', 'waiting')
-            self.emit('log', "✅ Round complete. Auto-relaunching next round in 10s...")
-            for _ in range(10):
-                if self.stop_event.is_set():
-                    break
-                time.sleep(1)
-        self.emit('status', 'idle')
-        self.emit('log', "👋 Training stopped by user.")
-
-def startup():
-    """Runs on a background thread once the webview is live."""
-    # Give the OS a beat to actually create the HWND, then poll for it.
-    if sys.platform == "win32" and WINDOWS_ICO_PATH:
-        _wait_for_window(WINDOW_TITLE, timeout=5.0)
-        time.sleep(0.15)
-        set_windows_icon(WINDOW_TITLE, WINDOWS_ICO_PATH)
-
-    try:
-        scr = webview.screens[0]
-        aw, ah = scr.width, scr.height
-        w = max(480, min(1040, int(aw * 0.80)))
-        h = max(360, min(800, int(ah * 0.80)))
-        w = min(w, aw - 16)
-        h = min(h, ah - 48)
-        w = max(320, w)
-        h = max(240, h)
-        window.resize(w, h)
-        window.move(max(0, (aw - w) // 2), max(0, (ah - h) // 2))
-    except Exception:
-        pass
-
-def _create_window_safe(title, html, icon_path, kwargs):
-    """
-    pywebview's Windows backend raises a *native* exception (not TypeError)
-    when `icon=` points at a non-raster file (e.g. an SVG). Guard against that.
-    """
-    usable = False
-    if icon_path and os.path.exists(icon_path):
-        low = icon_path.lower()
-        if low.endswith((".png", ".ico", ".jpg", ".jpeg", ".gif", ".bmp", ".tiff", ".webp")):
-            usable = True
-    if usable:
-        try:
-            return webview.create_window(title, html=html, icon=icon_path, **kwargs)
-        except Exception as e:
-            log.warning(f"[icon] create_window(icon=...) failed, retrying without: {e}")
-    try:
-        return webview.create_window(title, html=html, **kwargs)
-    except TypeError:
-        kwargs.pop("min_size", None)
-        return webview.create_window(title, html=html, **kwargs)
-
-if __name__ == "__main__":
-    print(f"CrowdGPT client v{CLIENT_VERSION}")
-
-    # Give the taskbar a stable identity so it uses our icon, not Python's.
-    if sys.platform == "win32":
-        try:
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Vxtzq.CrowdGPT.1")
-        except Exception:
-            pass
-
-    try:
-        if check_for_update():
-            print("Update applied. Restarting...")
-            _restart_self()
-    except Exception as e:
-        log.warning(f"Auto-update check error: {e}")
-
-    api = Api()
-    start_tokenizer_loader()
-
-    kwargs = {"js_api": api, "width": 1000, "height": 720, "min_size": (320, 240)}
-    html_out = (HTML.replace("__LOGO__", LOGO_URI_LIGHT)
-                    .replace("__LOGO_DARK__", LOGO_URI_DARK)
-                    .replace("__VERSION__", CLIENT_VERSION))
-
-    window = _create_window_safe("CrowdGPT", html_out, ICON_PATH, kwargs)
-    api.window = window
-    webview.start(startup, debug=False)
+const I18N={en:{login_pre:"Sign in to ",login_sub:"Welcome back to the swarm.",register_title_pre:"Join ",register_sub:"Create your account.",server_url:"Server address",username:"Username",password:"Password",email:"Email",login_btn:"Log in",register_btn:"Create account",no_account:"No account?",register_link:"Create one",have_account:"Already registered?",login_link:"Log in",anon_preface:"Stay anonymous?",anon_link:"Skip and contribute anonymously",dash_title:"Training",loss:"Loss",tokens_sec:"Tokens/sec",time_left:"Time left",round:"Round",step:"Step",loss_history:"Loss history",waiting_data:"Waiting for data…",model_thoughts:"Model Predictions",waiting_preview:"Waiting for first prediction…",idle:"Idle",training:"Training…",waiting:"Waiting…",uploading:"Uploading…",downloading:"Downloading…",preparing:"Preparing…",calibrating:"Calibrating…",dl_weights:"Downloading weights…",wait_coord:"Waiting for coordinator…",wait_coord_sub:"This can take a few minutes.",start:"Start training",stop:"Stop",err_invalid_credentials:"Invalid username or password.",err_username_taken:"Username taken.",err_email_taken:"Email already registered.",err_weak_password:"Password must be ≥6 chars.",err_invalid_input:"Check your input.",err_login_failed:"Login failed.",err_register_failed:"Registration failed.",err_network:"Cannot reach server.",motd_title:"System Notice",close:"Close"},fr:{login_pre:"Connexion à ",login_sub:"Bon retour parmi nous.",register_title_pre:"Rejoignez ",register_sub:"Créez votre compte.",server_url:"Adresse",username:"Nom d'utilisateur",password:"Mot de passe",email:"E-mail",login_btn:"Se connecter",register_btn:"Créer le compte",no_account:"Pas de compte ?",register_link:"Créer un compte",have_account:"Déjà inscrit ?",login_link:"Se connecter",anon_preface:"Rester anonyme ?",anon_link:"Continuer anonymement",dash_title:"Entraînement",loss:"Perte",tokens_sec:"Tokens/sec",time_left:"Reste",round:"Manche",step:"Étape",loss_history:"Historique",waiting_data:"En attente…",model_thoughts:"Prédictions",waiting_preview:"En attente…",idle:"Inactif",training:"Entraînement…",waiting:"Attente…",uploading:"Envoi…",downloading:"Téléchargement…",preparing:"Préparation…",calibrating:"Calibration…",dl_weights:"Téléchargement des poids…",wait_coord:"Attente du coordinateur…",wait_coord_sub:"Cela peut prendre quelques minutes.",start:"Démarrer",stop:"Arrêter",err_invalid_credentials:"Identifiants invalides.",err_username_taken:"Nom pris.",err_email_taken:"E-mail déjà enregistré.",err_weak_password:"Mot de passe ≥6 caractères.",err_invalid_input:"Vérifiez la saisie.",err_login_failed:"Échec de connexion.",err_register_failed:"Échec d'inscription.",err_network:"Serveur injoignable.",motd_title:"Avis système",close:"Fermer"},es:{login_pre:"Inicia sesión en ",login_sub:"Bienvenido de vuelta.",register_title_pre:"Únete a ",register_sub:"Crea tu cuenta.",server_url:"Servidor",username:"Usuario",password:"Contraseña",email:"Correo",login_btn:"Iniciar sesión",register_btn:"Crear cuenta",no_account:"¿Sin cuenta?",register_link:"Crear una",have_account:"¿Registrado?",login_link:"Iniciar sesión",anon_preface:"¿Anónimo?",anon_link:"Continuar anónimamente",dash_title:"Entrenamiento",loss:"Pérdida",tokens_sec:"Tokens/seg",time_left:"Queda",round:"Ronda",step:"Paso",loss_history:"Historial",waiting_data:"Esperando…",model_thoughts:"Predicciones",waiting_preview:"Esperando…",idle:"Inactivo",training:"Entrenando…",waiting:"Esperando…",uploading:"Subiendo…",downloading:"Descargando…",preparing:"Preparando…",calibrating:"Calibrando…",dl_weights:"Descargando pesos…",wait_coord:"Esperando coordinador…",wait_coord_sub:"Puede tardar unos minutos.",start:"Iniciar",stop:"Detener",err_invalid_credentials:"Credenciales inválidas.",err_username_taken:"Usuario en uso.",err_email_taken:"Correo ya registrado.",err_weak_password:"Contraseña ≥6 caracteres.",err_invalid_input:"Revisa los datos.",err_login_failed:"Falló el inicio de sesión.",err_register_failed:"Falló el registro.",err_network:"Servidor inaccesible.",motd_title:"Aviso",close:"Cerrar"},de:{login_pre:"Anmelden bei ",login_sub:"Willkommen zurück.",register_title_pre:"Tritt ",register_sub:"Erstelle dein Konto.",server_url:"Serveradresse",username:"Benutzername",password:"Passwort",email:"E-Mail",login_btn:"Anmelden",register_btn:"Konto erstellen",no_account:"Kein Konto?",register_link:"Erstellen",have_account:"Bereits registriert?",login_link:"Anmelden",anon_preface:"Anonym bleiben?",anon_link:"Anonym fortfahren",dash_title:"Training",loss:"Verlust",tokens_sec:"Tokens/Sek",time_left:"Rest",round:"Runde

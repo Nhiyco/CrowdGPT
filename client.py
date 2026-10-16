@@ -19,11 +19,8 @@ import os
 # ---------------------------------------------------------------------------
 # Allocator configuration MUST happen before torch is imported.
 # ---------------------------------------------------------------------------
-# CUDA: expandable_segments is a win for offload-heavy workloads.
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-# ROCm: expandable_segments triggers HIP "memory mapping failed" OOMs.
 os.environ.setdefault("PYTORCH_HIP_ALLOC_CONF", "expandable_segments:False")
-# Fallback name used by older torch builds.
 os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
 
 import sys, io, json, time, struct, math, gc, threading, base64, logging, tempfile, atexit, subprocess, hashlib, shutil, ctypes
@@ -170,10 +167,10 @@ LOSS_CHUNK = 256
 UPLOAD_BUFFER_MIN = 25
 ALLOWED_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64, 128]
 
-# --- memory-safety knobs -----------------------------------------------------
-SAFETY_MARGIN_GB = 1.0        # hard reserve kept free on the accelerator
-ALLOCATOR_RESERVE_GB = 0.5    # context + pool + workspace inside the cap
-MIN_HEADROOM_GB = 0.25        # refuse to shrink the cap below this
+# --- memory-safety knobs ----------------------------------------------------
+SAFETY_MARGIN_GB = 1.0
+ALLOCATOR_RESERVE_GB = 0.5
+MIN_HEADROOM_GB = 0.25
 
 
 def _calc_model_size():
@@ -660,12 +657,6 @@ def detect_training_backend(force=None):
 
 
 def install_hard_vram_cap(device, safety_gb=SAFETY_MARGIN_GB):
-    """
-    Make the VRAM budget a hard ceiling enforced by PyTorch.
-    After this, exceeding the budget raises a *catchable* torch OOM
-    inside our process instead of a driver-level failure.
-    No-op on CPU / DirectML / MPS.
-    """
     if device is None or device.type != "cuda":
         return None
     try:
@@ -685,10 +676,6 @@ def install_hard_vram_cap(device, safety_gb=SAFETY_MARGIN_GB):
 
 
 def auto_detect_vram_budget():
-    """
-    Placement budget = min(free, total) - SAFETY_MARGIN - ALLOCATOR_RESERVE.
-    Reports what we're willing to *use*, not what's free.
-    """
     global train_backend
 
     if train_backend in ("CUDA", "ROCM") and torch.cuda.is_available():
@@ -741,34 +728,23 @@ def has_bitsandbytes():
         return False
 
 
-# ---------------------------------------------------------------------------
-# Memory estimators
-# ---------------------------------------------------------------------------
 def _bytes_per_block_params():
-    """Parameter count of one transformer block (attention + MLP + norms)."""
     return (
-        DIM * 2                                      # ln_1
-        + DIM * (N_HEADS * HEAD_DIM)                 # wq
-        + DIM * (N_KV_HEADS * HEAD_DIM)              # wk
-        + DIM * (N_KV_HEADS * HEAD_DIM)              # wv
-        + DIM * DIM                                  # wo
-        + DIM * 2                                    # ln_2
-        + DIM * MLP_HIDDEN                           # w1
-        + DIM * MLP_HIDDEN                           # w2
-        + MLP_HIDDEN * DIM                           # w3
+        DIM * 2
+        + DIM * (N_HEADS * HEAD_DIM)
+        + DIM * (N_KV_HEADS * HEAD_DIM)
+        + DIM * (N_KV_HEADS * HEAD_DIM)
+        + DIM * DIM
+        + DIM * 2
+        + DIM * MLP_HIDDEN
+        + DIM * MLP_HIDDEN
+        + MLP_HIDDEN * DIM
     )
 
 
 def estimate_vram_bytes(bs, sl, u8):
-    """
-    Honest peak estimate for one micro-batch with gradient checkpointing.
-    Counts: embeddings+head params/grads/optim, block params/grads/optim,
-    activation footprint, loss chunks, and a fixed workspace reserve.
-    """
     per_block = _bytes_per_block_params()
 
-    # wte + lm_head are weight-tied: one parameter tensor, but its grad and
-    # optimizer state exist at full size.
     head_params = VOCAB_SIZE * DIM
     head_bytes  = head_params * (4 + 4 + (2 if u8 else 8))
 
@@ -776,11 +752,8 @@ def estimate_vram_bytes(bs, sl, u8):
     opt_state_per_param = 2 if u8 else 8
     block_bytes = blocks * (4 + 4 + opt_state_per_param)
 
-    # Activation footprint of all blocks with checkpointing on: the *input*
-    # to each block, plus one live recomputed tensor at a time.
     act = bs * sl * DIM * 4 * (2 + 1)
 
-    # Largest single chunk of lm_head output in fp32.
     loss = bs * LOSS_CHUNK * VOCAB_SIZE * 4
 
     workspace = int(ALLOCATOR_RESERVE_GB * 1024**3)
@@ -802,16 +775,8 @@ def recommend_batch_size(sl=MAX_SEQ_LEN):
     return best
 
 
-# ---------------------------------------------------------------------------
-# Layer placement
-# ---------------------------------------------------------------------------
 def _plan_gpu_layers(device, backend_name, budget_gb, bs=1, sl=MAX_SEQ_LEN,
                      use_ckpt=True, u8=False):
-    """
-    How many transformer blocks fit on the accelerator *given* the budget.
-    Accounts for weights, grads, optimizer state, per-block activations, and a
-    fixed allocator/context reserve.
-    """
     if device is None or device.type == "cpu":
         return 0
 
@@ -828,9 +793,6 @@ def _plan_gpu_layers(device, backend_name, budget_gb, bs=1, sl=MAX_SEQ_LEN,
     grads     = per_block * 4
     adam      = per_block * (2 if u8 else 8)
 
-    # Activation per block:
-    #   ckpt on : only the block input is stored.
-    #   ckpt off: everything stored — much larger.
     act = bs * sl * DIM * 4 * (1 if use_ckpt else 10)
 
     per_block_total = weights + grads + adam + act
@@ -872,7 +834,6 @@ def _is_directml_device(d):
 
 
 def _is_accel_error(msg):
-    """Detect DirectML/CUDA errors that warrant a fallback to CPU."""
     m = msg.lower()
     return any(k in m for k in (
         "privateuse1", "unbox expects", "not implemented for",
@@ -960,7 +921,6 @@ class Block(nn.Module):
 
 
 class EngramMemory(nn.Module):
-    """Always runs on CPU. Output is moved to `device` for the caller."""
     def __init__(self, bn, device):
         super().__init__()
         self.device = device
@@ -978,21 +938,12 @@ class EngramMemory(nn.Module):
 
 
 class SotaGPT(nn.Module):
-    """
-    Layer-offloaded transformer. `gpu_layers` leading blocks live on `device`;
-    everything else (embeddings, remaining blocks, lm_head, ln_f) stays on CPU.
-    Placement is mutable at runtime via set_gpu_layers / force_head_cpu /
-    to_cpu_only, so the degrade ladder can shrink GPU usage without rebuilding
-    the model (optimizer param references stay valid).
-    """
     def __init__(self, bn, device, gpu_layers=None, bs=1, sl=MAX_SEQ_LEN):
         super().__init__()
         self.main_device = device
         self.cpu_device  = torch.device('cpu')
         self.backend_name = bn
 
-        # Checkpointing is what makes partial-GPU placement viable; enable it
-        # whenever the accelerator supports it, regardless of placement.
         use_ckpt = (device is not None and device.type == 'cuda')
 
         if gpu_layers is None:
@@ -1033,7 +984,6 @@ class SotaGPT(nn.Module):
             f"head on {self.ln_f.weight.device.type}, ckpt={use_ckpt}"
         )
 
-    # ---- runtime placement mutation ----
     def _place_head(self):
         if self.all_on_gpu:
             self.wte.to(self.main_device)
@@ -1056,7 +1006,6 @@ class SotaGPT(nn.Module):
         log.info(f"[PLACEMENT] set_gpu_layers({n}) → head on {self.ln_f.weight.device.type}")
 
     def force_head_cpu(self):
-        """Move wte/ln_f/lm_head to CPU but leave blocks where they are."""
         self.all_on_gpu = False
         self.wte.to(self.cpu_device)
         self.ln_f.to(self.cpu_device)
@@ -1076,7 +1025,6 @@ class SotaGPT(nn.Module):
         self.engram.device = self.cpu_device
         log.info("[PLACEMENT] model → CPU-only")
 
-    # ---- forward ----
     def _block_device(self, i):
         if self.all_on_gpu or i in self.gpu_layer_set:
             return self.main_device
@@ -1116,7 +1064,6 @@ class SotaGPT(nn.Module):
     def forward(self, idx, use_chunked=True, use_ckpt=True):
         return self.lm_head(self.forward_features(idx, use_chunked, use_ckpt))
 
-    # ---- weight (de)serialization ----
     def get_base_weights(self):
         return np.concatenate([
             p.detach().float().flatten().cpu().numpy()
@@ -1657,18 +1604,13 @@ def fetch_task(srv, h, prec, se, emit):
 
 
 # =========================================================================
-# Loss + training step
+# Loss + training step + degrade ladder
 # =========================================================================
 def _chunk_ce(m, xs, ys):
     return F.cross_entropy(m.lm_head(xs).reshape(-1, VOCAB_SIZE), ys.reshape(-1))
 
 
 def _fwl(m, x, y, sl, ua, ad, ls=1.0, preview=False, loss_chunk=LOSS_CHUNK):
-    """
-    Forward + loss for one micro-batch. Does NOT move x/y to a device —
-    forward_features handles placement per block, and y is moved to the head
-    device (which may be CPU after degradation).
-    """
     use_ckpt = (m.gpu_layers > 0) and (m.main_device.type == 'cuda')
 
     def fwd():
@@ -1759,14 +1701,6 @@ def _clear_accel_cache(device):
 
 
 class DegradeLadder:
-    """
-    Ordered rungs. Each OOM advances one rung; the caller retries the same
-    micro-batch. Rung 6 is CPU-only and cannot VRAM-OOM, so the ladder
-    guarantees eventual success for any VRAM-related failure.
-
-    on_step_down(ladder) is called after every successful rung so the caller
-    can rebuild optimizers against the new placement.
-    """
     def __init__(self, model, on_step_down=None):
         self.model = model
         self.stage = 0
@@ -1813,11 +1747,6 @@ class DegradeLadder:
 
 
 def _train_step_safe(model, x, y, sl, ua, ad, ls, preview, ladder, emit):
-    """
-    One micro-batch fwd+bwd. Catches OOM, degrades, retries the *same* batch.
-    Returns (loss, cards). Raises only if the ladder is exhausted — which is
-    a real bug, not a VRAM problem.
-    """
     while True:
         try:
             lo, cards = _fwl(model, x, y, sl, ua, ad, ls,
@@ -1947,7 +1876,6 @@ def stream_with_progress(data, emit_cb, total_size, stop_evt):
 # Model build + optimizer construction
 # =========================================================================
 def _build_model(bn, device, iw, ie, emit, bs=1, sl=MAX_SEQ_LEN):
-    """Build a SotaGPT with placement planning and load base + engram weights."""
     model = SotaGPT(bn, device, gpu_layers=None, bs=bs, sl=sl)
     model.engram.table.to('cpu')
     model.load_base_weights(iw)
@@ -2053,7 +1981,6 @@ def run_single_round_wrapper(srv, at, se, emit):
         )
         bs = recommend_batch_size(sl)
 
-        # ---- build model with retry on OOM ----
         model = None
         while bs >= 1:
             try:
@@ -2099,7 +2026,6 @@ def run_single_round_wrapper(srv, at, se, emit):
         emit('log', f"Backend: {train_backend} | autocast: {ua} | "
                    f"bs={bs} | accum={as_} | dtype={'bf16' if ua else 'fp32'}")
 
-        # ---- calibration loop ----
         emit('log', "Calibrating speed...")
         cs_ = time.time()
         cal_global_steps = 3
@@ -2169,7 +2095,8 @@ def run_single_round_wrapper(srv, at, se, emit):
                 del lo, x, y
             if hb.should_stop() or se.is_set():
                 return
-            torch.nn.utils.clip_grad_norm_(bp if False else [p for p in model.parameters() if p.requires_grad], 1.0)
+            torch.nn.utils.clip_grad_norm_(
+                [p for p in model.parameters() if p.requires_grad], 1.0)
             ob.step()
             ob.zero_grad(set_to_none=True)
             gc.collect()
@@ -2341,7 +2268,7 @@ def run_single_round_wrapper(srv, at, se, emit):
 
 
 # =========================================================================
-# UI (HTML/JS) — unchanged from the original
+# UI (HTML/JS)
 # =========================================================================
 HTML = """<!DOCTYPE html>
 <html><head><meta charset="UTF-8">
@@ -2556,4 +2483,272 @@ body.dark .overlay{background:rgba(26,26,30,.86)}
   <div class="motd-text" id="motd-text"></div>
 </div>
 <script>
-const I18N={en:{login_pre:"Sign in to ",login_sub:"Welcome back to the swarm.",register_title_pre:"Join ",register_sub:"Create your account.",server_url:"Server address",username:"Username",password:"Password",email:"Email",login_btn:"Log in",register_btn:"Create account",no_account:"No account?",register_link:"Create one",have_account:"Already registered?",login_link:"Log in",anon_preface:"Stay anonymous?",anon_link:"Skip and contribute anonymously",dash_title:"Training",loss:"Loss",tokens_sec:"Tokens/sec",time_left:"Time left",round:"Round",step:"Step",loss_history:"Loss history",waiting_data:"Waiting for data…",model_thoughts:"Model Predictions",waiting_preview:"Waiting for first prediction…",idle:"Idle",training:"Training…",waiting:"Waiting…",uploading:"Uploading…",downloading:"Downloading…",preparing:"Preparing…",calibrating:"Calibrating…",dl_weights:"Downloading weights…",wait_coord:"Waiting for coordinator…",wait_coord_sub:"This can take a few minutes.",start:"Start training",stop:"Stop",err_invalid_credentials:"Invalid username or password.",err_username_taken:"Username taken.",err_email_taken:"Email already registered.",err_weak_password:"Password must be ≥6 chars.",err_invalid_input:"Check your input.",err_login_failed:"Login failed.",err_register_failed:"Registration failed.",err_network:"Cannot reach server.",motd_title:"System Notice",close:"Close"},fr:{login_pre:"Connexion à ",login_sub:"Bon retour parmi nous.",register_title_pre:"Rejoignez ",register_sub:"Créez votre compte.",server_url:"Adresse",username:"Nom d'utilisateur",password:"Mot de passe",email:"E-mail",login_btn:"Se connecter",register_btn:"Créer le compte",no_account:"Pas de compte ?",register_link:"Créer un compte",have_account:"Déjà inscrit ?",login_link:"Se connecter",anon_preface:"Rester anonyme ?",anon_link:"Continuer anonymement",dash_title:"Entraînement",loss:"Perte",tokens_sec:"Tokens/sec",time_left:"Reste",round:"Manche",step:"Étape",loss_history:"Historique",waiting_data:"En attente…",model_thoughts:"Prédictions",waiting_preview:"En attente…",idle:"Inactif",training:"Entraînement…",waiting:"Attente…",uploading:"Envoi…",downloading:"Téléchargement…",preparing:"Préparation…",calibrating:"Calibration…",dl_weights:"Téléchargement des poids…",wait_coord:"Attente du coordinateur…",wait_coord_sub:"Cela peut prendre quelques minutes.",start:"Démarrer",stop:"Arrêter",err_invalid_credentials:"Identifiants invalides.",err_username_taken:"Nom pris.",err_email_taken:"E-mail déjà enregistré.",err_weak_password:"Mot de passe ≥6 caractères.",err_invalid_input:"Vérifiez la saisie.",err_login_failed:"Échec de connexion.",err_register_failed:"Échec d'inscription.",err_network:"Serveur injoignable.",motd_title:"Avis système",close:"Fermer"},es:{login_pre:"Inicia sesión en ",login_sub:"Bienvenido de vuelta.",register_title_pre:"Únete a ",register_sub:"Crea tu cuenta.",server_url:"Servidor",username:"Usuario",password:"Contraseña",email:"Correo",login_btn:"Iniciar sesión",register_btn:"Crear cuenta",no_account:"¿Sin cuenta?",register_link:"Crear una",have_account:"¿Registrado?",login_link:"Iniciar sesión",anon_preface:"¿Anónimo?",anon_link:"Continuar anónimamente",dash_title:"Entrenamiento",loss:"Pérdida",tokens_sec:"Tokens/seg",time_left:"Queda",round:"Ronda",step:"Paso",loss_history:"Historial",waiting_data:"Esperando…",model_thoughts:"Predicciones",waiting_preview:"Esperando…",idle:"Inactivo",training:"Entrenando…",waiting:"Esperando…",uploading:"Subiendo…",downloading:"Descargando…",preparing:"Preparando…",calibrating:"Calibrando…",dl_weights:"Descargando pesos…",wait_coord:"Esperando coordinador…",wait_coord_sub:"Puede tardar unos minutos.",start:"Iniciar",stop:"Detener",err_invalid_credentials:"Credenciales inválidas.",err_username_taken:"Usuario en uso.",err_email_taken:"Correo ya registrado.",err_weak_password:"Contraseña ≥6 caracteres.",err_invalid_input:"Revisa los datos.",err_login_failed:"Falló el inicio de sesión.",err_register_failed:"Falló el registro.",err_network:"Servidor inaccesible.",motd_title:"Aviso",close:"Cerrar"},de:{login_pre:"Anmelden bei ",login_sub:"Willkommen zurück.",register_title_pre:"Tritt ",register_sub:"Erstelle dein Konto.",server_url:"Serveradresse",username:"Benutzername",password:"Passwort",email:"E-Mail",login_btn:"Anmelden",register_btn:"Konto erstellen",no_account:"Kein Konto?",register_link:"Erstellen",have_account:"Bereits registriert?",login_link:"Anmelden",anon_preface:"Anonym bleiben?",anon_link:"Anonym fortfahren",dash_title:"Training",loss:"Verlust",tokens_sec:"Tokens/Sek",time_left:"Rest",round:"Runde
+const I18N={
+en:{login_pre:"Sign in to ",login_sub:"Welcome back to the swarm.",register_title_pre:"Join ",register_sub:"Create your account.",server_url:"Server address",username:"Username",password:"Password",email:"Email",login_btn:"Log in",register_btn:"Create account",no_account:"No account?",register_link:"Create one",have_account:"Already registered?",login_link:"Log in",anon_preface:"Stay anonymous?",anon_link:"Skip and contribute anonymously",dash_title:"Training",loss:"Loss",tokens_sec:"Tokens/sec",time_left:"Time left",round:"Round",step:"Step",loss_history:"Loss history",waiting_data:"Waiting for data…",model_thoughts:"Model Predictions",waiting_preview:"Waiting for first prediction…",idle:"Idle",training:"Training…",waiting:"Waiting…",uploading:"Uploading…",downloading:"Downloading…",preparing:"Preparing…",calibrating:"Calibrating…",dl_weights:"Downloading weights…",wait_coord:"Waiting for coordinator…",wait_coord_sub:"This can take a few minutes.",start:"Start training",stop:"Stop",err_invalid_credentials:"Invalid username or password.",err_username_taken:"Username taken.",err_email_taken:"Email already registered.",err_weak_password:"Password must be ≥6 chars.",err_invalid_input:"Check your input.",err_login_failed:"Login failed.",err_register_failed:"Registration failed.",err_network:"Cannot reach server.",motd_title:"System Notice",close:"Close"},
+fr:{login_pre:"Connexion à ",login_sub:"Bon retour parmi nous.",register_title_pre:"Rejoignez ",register_sub:"Créez votre compte.",server_url:"Adresse",username:"Nom d'utilisateur",password:"Mot de passe",email:"E-mail",login_btn:"Se connecter",register_btn:"Créer le compte",no_account:"Pas de compte ?",register_link:"Créer un compte",have_account:"Déjà inscrit ?",login_link:"Se connecter",anon_preface:"Rester anonyme ?",anon_link:"Continuer anonymement",dash_title:"Entraînement",loss:"Perte",tokens_sec:"Tokens/sec",time_left:"Reste",round:"Manche",step:"Étape",loss_history:"Historique",waiting_data:"En attente…",model_thoughts:"Prédictions",waiting_preview:"En attente…",idle:"Inactif",training:"Entraînement…",waiting:"Attente…",uploading:"Envoi…",downloading:"Téléchargement…",preparing:"Préparation…",calibrating:"Calibration…",dl_weights:"Téléchargement des poids…",wait_coord:"Attente du coordinateur…",wait_coord_sub:"Cela peut prendre quelques minutes.",start:"Démarrer",stop:"Arrêter",err_invalid_credentials:"Identifiants invalides.",err_username_taken:"Nom pris.",err_email_taken:"E-mail déjà enregistré.",err_weak_password:"Mot de passe ≥6 caractères.",err_invalid_input:"Vérifiez la saisie.",err_login_failed:"Échec de connexion.",err_register_failed:"Échec d'inscription.",err_network:"Serveur injoignable.",motd_title:"Avis système",close:"Fermer"},
+es:{login_pre:"Inicia sesión en ",login_sub:"Bienvenido de vuelta.",register_title_pre:"Únete a ",register_sub:"Crea tu cuenta.",server_url:"Servidor",username:"Usuario",password:"Contraseña",email:"Correo",login_btn:"Iniciar sesión",register_btn:"Crear cuenta",no_account:"¿Sin cuenta?",register_link:"Crear una",have_account:"¿Registrado?",login_link:"Iniciar sesión",anon_preface:"¿Anónimo?",anon_link:"Continuar anónimamente",dash_title:"Entrenamiento",loss:"Pérdida",tokens_sec:"Tokens/seg",time_left:"Queda",round:"Ronda",step:"Paso",loss_history:"Historial",waiting_data:"Esperando…",model_thoughts:"Predicciones",waiting_preview:"Esperando…",idle:"Inactivo",training:"Entrenando…",waiting:"Esperando…",uploading:"Subiendo…",downloading:"Descargando…",preparing:"Preparando…",calibrating:"Calibrando…",dl_weights:"Descargando pesos…",wait_coord:"Esperando coordinador…",wait_coord_sub:"Puede tardar unos minutos.",start:"Iniciar",stop:"Detener",err_invalid_credentials:"Credenciales inválidas.",err_username_taken:"Usuario en uso.",err_email_taken:"Correo ya registrado.",err_weak_password:"Contraseña ≥6 caracteres.",err_invalid_input:"Revisa los datos.",err_login_failed:"Falló el inicio de sesión.",err_register_failed:"Falló el registro.",err_network:"Servidor inaccesible.",motd_title:"Aviso",close:"Cerrar"},
+de:{login_pre:"Anmelden bei ",login_sub:"Willkommen zurück.",register_title_pre:"Tritt ",register_sub:"Erstelle dein Konto.",server_url:"Serveradresse",username:"Benutzername",password:"Passwort",email:"E-Mail",login_btn:"Anmelden",register_btn:"Konto erstellen",no_account:"Kein Konto?",register_link:"Erstellen",have_account:"Bereits registriert?",login_link:"Anmelden",anon_preface:"Anonym bleiben?",anon_link:"Anonym fortfahren",dash_title:"Training",loss:"Verlust",tokens_sec:"Tokens/Sek",time_left:"Rest",round:"Runde",step:"Schritt",loss_history:"Verlauf",waiting_data:"Warte…",model_thoughts:"Vorhersagen",waiting_preview:"Warte…",idle:"Bereit",training:"Training…",waiting:"Warten…",uploading:"Upload…",downloading:"Herunterladen…",preparing:"Vorbereitung…",calibrating:"Kalibrierung…",dl_weights:"Gewichte werden geladen…",wait_coord:"Warte auf Koordinator…",wait_coord_sub:"Kann ein paar Minuten dauern.",start:"Training starten",stop:"Stopp",err_invalid_credentials:"Ungültig.",err_username_taken:"Benutzername vergeben.",err_email_taken:"E-Mail bereits registriert.",err_weak_password:"Passwort ≥6 Zeichen.",err_invalid_input:"Eingabe prüfen.",err_login_failed:"Anmeldung fehlgeschlagen.",err_register_failed:"Registrierung fehlgeschlagen.",err_network:"Server nicht erreichbar.",motd_title:"Systemmeldung",close:"Schließen"},
+tr:{login_pre:"Giriş yap: ",login_sub:"Sürüye hoş geldin.",register_title_pre:"Katıl: ",register_sub:"Hesabını oluştur.",server_url:"Sunucu",username:"Kullanıcı adı",password:"Şifre",email:"E-posta",login_btn:"Giriş yap",register_btn:"Hesap oluştur",no_account:"Hesap yok mu?",register_link:"Oluştur",have_account:"Kayıtlı mısın?",login_link:"Giriş yap",anon_preface:"Anonim kal?",anon_link:"Anonim devam et",dash_title:"Eğitim",loss:"Kayıp",tokens_sec:"Token/sn",time_left:"Kalan",round:"Tur",step:"Adım",loss_history:"Geçmiş",waiting_data:"Bekleniyor…",model_thoughts:"Tahminler",waiting_preview:"Bekleniyor…",idle:"Boşta",training:"Eğitiliyor…",waiting:"Bekleniyor…",uploading:"Yükleniyor…",downloading:"İndiriliyor…",preparing:"Hazırlanıyor…",calibrating:"Kalibre ediliyor…",dl_weights:"Ağırlıklar yükleniyor…",wait_coord:"Koordinatör bekleniyor…",wait_coord_sub:"Birkaç dakika sürebilir.",start:"Eğitimi başlat",stop:"Durdur",err_invalid_credentials:"Geçersiz.",err_username_taken:"Kullanıcı adı alınmış.",err_email_taken:"E-posta kayıtlı.",err_weak_password:"Şifre ≥6 karakter.",err_invalid_input:"Girdiyi kontrol et.",err_login_failed:"Giriş başarısız.",err_register_failed:"Kayıt başarısız.",err_network:"Sunucuya ulaşılamıyor.",motd_title:"Sistem Uyarısı",close:"Kapat"}
+};
+let lang='en',statusKey='idle';
+const lossHistory=[];const MAXP=80;
+function t(k){return (I18N[lang]&&I18N[lang][k])||I18N.en[k]||k}
+function applyT(){document.querySelectorAll('[data-i18n]').forEach(e=>e.textContent=t(e.getAttribute('data-i18n')));document.getElementById('status-indicator').textContent=t(statusKey)}
+document.getElementById('lang-select').addEventListener('change',e=>{lang=e.target.value;applyT()});
+function showAuthScreen(name){document.querySelectorAll('.auth-screen').forEach(s=>s.classList.remove('active'));document.getElementById('screen-'+name).classList.add('active');document.getElementById('login-error').classList.remove('show');document.getElementById('reg-error').classList.remove('show')}
+document.getElementById('go-to-register').addEventListener('click',e=>{e.preventDefault();showAuthScreen('register')});
+document.getElementById('go-to-login').addEventListener('click',e=>{e.preventDefault();showAuthScreen('login')});
+function callApi(n,...a){if(window.pywebview&&window.pywebview.api&&window.pywebview.api[n]){window.pywebview.api[n](...a);return true}return false}
+window.addEventListener('pywebviewready',()=>callApi('get_backends'));
+document.getElementById('backend-select').addEventListener('change',e=>{const nb=e.target.value;if(nb===window._currentBackend)return;callApi('set_backend',nb);});
+document.getElementById('btn-login').addEventListener('click',()=>{const srv=document.getElementById('login-server').value.trim();const u=document.getElementById('login-user').value.trim();const p=document.getElementById('login-pass').value;if(!u||!p){showLoginError('err_invalid_credentials');return}document.getElementById('login-error').classList.remove('show');document.getElementById('btn-login').disabled=true;callApi('login',srv,u,p)});
+document.getElementById('btn-register').addEventListener('click',()=>{const srv=document.getElementById('reg-server').value.trim();const u=document.getElementById('reg-user').value.trim();const email=document.getElementById('reg-email').value.trim();const p=document.getElementById('reg-pass').value;if(!u||!email||!p){showRegError('err_invalid_input');return}document.getElementById('reg-error').classList.remove('show');document.getElementById('btn-register').disabled=true;callApi('register',srv,u,email,p)});
+document.getElementById('btn-anon').addEventListener('click',e=>{e.preventDefault();callApi('login_anon')});
+document.getElementById('btn-start').addEventListener('click',()=>{if(callApi('start')){document.getElementById('btn-start').disabled=true;document.getElementById('btn-stop').disabled=false}});
+document.getElementById('btn-stop').addEventListener('click',()=>{callApi('stop');document.getElementById('btn-start').disabled=false;document.getElementById('btn-stop').disabled=true});
+function showLoginError(code){const el=document.getElementById('login-error');el.textContent=t(code);el.classList.add('show');document.getElementById('btn-login').disabled=false}
+function showRegError(code){const el=document.getElementById('reg-error');el.textContent=t(code);el.classList.add('show');document.getElementById('btn-register').disabled=false}
+function mb(b){return (b/1048576).toFixed(1)}
+function overlayShow(d){document.getElementById('overlay').classList.add('show');document.getElementById('overlay-title').textContent=t(d.title_key);const s=document.getElementById('overlay-subtitle');if(d.subtitle_key){s.textContent=t(d.subtitle_key);s.classList.add('show')}else{s.classList.remove('show')}const b=document.getElementById('overlay-bar');b.classList.toggle('indet',!!d.indeterminate);document.getElementById('overlay-fill').style.width=d.indeterminate?'':'0%'}
+function overlayHide(){document.getElementById('overlay').classList.remove('show')}
+function drawGraph(){const c=document.getElementById('loss-graph');if(!c)return;const empty=document.getElementById('graph-empty');if(lossHistory.length<2){c.classList.add('hidden-graph');if(empty)empty.classList.remove('hidden-empty');return}c.classList.remove('hidden-graph');if(empty)empty.classList.add('hidden-empty');const rect=c.getBoundingClientRect();const W=rect.width,H=rect.height;if(W<10||H<10){requestAnimationFrame(drawGraph);return}const ctx=c.getContext('2d');const dpr=window.devicePixelRatio||1;c.width=Math.round(W*dpr);c.height=Math.round(H*dpr);ctx.setTransform(dpr,0,0,dpr,0,0);ctx.clearRect(0,0,W,H);const data=lossHistory.slice(-MAXP);const mn=Math.min(...data),mx=Math.max(...data),range=(mx-mn)||1;const pad=6,pH=H-pad*2,pW=W-pad*2,st=pW/(data.length-1);const isDark=document.body.classList.contains('dark');ctx.strokeStyle=isDark?'rgba(255,255,255,.06)':'rgba(17,17,19,.07)';for(let g=1;g<4;g++){const y=pad+pH*g/4;ctx.beginPath();ctx.moveTo(pad,y);ctx.lineTo(pad+pW,y);ctx.stroke()}const pt=i=>[pad+i*st,pad+pH-(data[i]-mn)/range*pH];ctx.beginPath();data.forEach((v,i)=>{const[x,y]=pt(i);i?ctx.lineTo(x,y):ctx.moveTo(x,y)});ctx.lineTo(pad+pW,pad+pH);ctx.lineTo(pad,pad+pH);ctx.closePath();const gr=ctx.createLinearGradient(0,0,0,H);gr.addColorStop(0,isDark?'rgba(34,197,94,.20)':'rgba(22,163,74,.16)');gr.addColorStop(1,'rgba(22,163,74,0)');ctx.fillStyle=gr;ctx.fill();ctx.beginPath();data.forEach((v,i)=>{const[x,y]=pt(i);i?ctx.lineTo(x,y):ctx.moveTo(x,y)});ctx.strokeStyle=isDark?'#22c55e':'#16a34a';ctx.lineWidth=1.5;ctx.stroke()}
+window.handleEvent=function(ev,data){
+if(ev==='login_success'){document.getElementById('view-login').classList.remove('active');document.getElementById('view-dashboard').classList.add('active');document.body.classList.add('dashboard-active');document.getElementById('user-info').textContent=data.username;document.getElementById('btn-login').disabled=false;document.getElementById('btn-register').disabled=false;requestAnimationFrame(drawGraph)}
+else if(ev==='login_error'){const code=data.code||'err_invalid_credentials';const map={invalid_credentials:'err_invalid_credentials',login_failed:'err_login_failed',username_taken:'err_username_taken',email_taken:'err_email_taken',weak_password:'err_weak_password',invalid_input:'err_invalid_input',register_failed:'err_register_failed',network:'err_network'};const tk=map[code]||'err_login_failed';const loginActive=document.getElementById('screen-login').classList.contains('active');if(loginActive)showLoginError(tk);else showRegError(tk)}
+else if(ev==='log'){document.getElementById('status-event').textContent=data}
+else if(ev==='backends'){const sel=document.getElementById('backend-select');sel.innerHTML='';window._currentBackend=data.current;const order=[{key:'cuda',label:'CUDA (NVIDIA)'},{key:'rocm',label:'ROCm (AMD)'},{key:'mps',label:'MPS (Apple)'},{key:'xpu',label:'XPU (Intel)'},{key:'directml',label:'DirectML (Windows)'},{key:'cpu',label:'CPU'}];order.forEach(bk=>{const opt=document.createElement('option');opt.value=bk.key;opt.textContent=bk.label;opt.disabled=!data.available[bk.key];if(bk.key===data.current)opt.selected=true;sel.appendChild(opt)});sel.disabled=false}
+else if(ev==='overlay_show'){overlayShow(data)}
+else if(ev==='overlay_progress'){const bar=document.getElementById('overlay-bar');if(data.total>0){bar.classList.remove('indet');const pct=Math.min(100,data.done/data.total*100);document.getElementById('overlay-fill').style.width=pct+'%';document.getElementById('overlay-pct').textContent=pct.toFixed(1)+'%';document.getElementById('overlay-mb').textContent=mb(data.done)+' / '+mb(data.total)+' MB'}}
+else if(ev==='overlay_hide'){overlayHide()}
+else if(ev==='cal_stats'||ev==='stats'){const loss=Number(data.loss);const tps=Number(data.tps);const step=Number(data.step);const target=ev==='cal_stats'?Number(data.total):Number(data.target);const tl=Number(data.time_left);if(isFinite(loss)){document.getElementById('stat-loss').textContent=loss.toFixed(4);document.getElementById('graph-last').textContent=loss.toFixed(4);if(loss>0){lossHistory.push(loss);if(lossHistory.length>MAXP*2)lossHistory.splice(0,lossHistory.length-MAXP*2)}}if(isFinite(tps))document.getElementById('stat-tps').textContent=Math.round(tps);if(isFinite(tl))document.getElementById('stat-time').textContent=Math.round(tl)+'m';document.getElementById('stat-round').textContent=ev==='cal_stats'?'—':(data.round!=null?data.round:'—');document.getElementById('stat-step-cur').textContent=isFinite(step)?step:0;document.getElementById('stat-step-tot').textContent=isFinite(target)?target:0;const pct=(isFinite(step)&&isFinite(target)&&target>0)?Math.min(100,(step/target)*100):0;document.getElementById('progress-bar').style.width=pct+'%';document.getElementById('progress-text').textContent=pct.toFixed(1)+'%';requestAnimationFrame(drawGraph)}
+else if(ev==='model_preview'){const container=document.getElementById('model-preview');const stepEl=document.getElementById('preview-step');if(!container||!stepEl)return;stepEl.textContent='Step '+data.step;let html='';if(data.cards&&data.cards.length>0){data.cards.forEach(card=>{const cls=card.match?'good':'bad';const badge=card.match?'✓':'✗';const prob=(typeof card.prob==='number'&&isFinite(card.prob))?(card.prob*100).toFixed(1)+'%':'';html+='<div class="pred-line '+cls+'"><div class="pred-main"><span class="pred-text">'+escapeHtml(card.context)+'</span><span class="pred-token">'+escapeHtml(card.pred)+'</span></div><div class="pred-side"><span class="pred-badge">'+badge+'</span><span>target: '+escapeHtml(card.target)+'</span><span>'+prob+'</span></div></div>'})}else{html='<div class="preview-empty">'+escapeHtml(t('waiting_preview'))+'</div>'}container.innerHTML=html}
+else if(ev==='status'){statusKey=data;document.getElementById('status-indicator').textContent=t(statusKey);if(data==='training'||data==='idle'||data==='calibrating'||data==='preparing')overlayHide();if(data==='idle'){document.getElementById('btn-start').disabled=false;document.getElementById('btn-stop').disabled=true}}
+};
+function escapeHtml(s){return String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+window.addEventListener('resize',()=>requestAnimationFrame(drawGraph));
+function updateLogo(){try{const img=document.getElementById('logo-img');if(!img)return;const isDark=document.body.classList.contains('dark');const src=isDark?img.getAttribute('data-dark'):img.getAttribute('data-light');if(src&&src.length>30)img.src=src}catch(e){}}
+(function(){try{const saved=localStorage.getItem('crowdgpt-theme');const prefersDark=window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches;if(saved==='dark'||(!saved&&prefersDark))document.body.classList.add('dark');updateLogo()}catch(e){}const tbtn=document.getElementById('theme-toggle');if(tbtn){tbtn.addEventListener('click',function(){document.body.classList.toggle('dark');try{localStorage.setItem('crowdgpt-theme',document.body.classList.contains('dark')?'dark':'light')}catch(e){}updateLogo();requestAnimationFrame(drawGraph)})}})();
+applyT();
+(function(){const key='crowdgpt_motd_last_day';const today=new Date().toISOString().slice(0,10);let last=null;try{last=localStorage.getItem(key)}catch(e){}if(last===today)return;fetch('https://raw.githubusercontent.com/Vxtzq/CrowdGPT/main/docs/motd.txt').then(r=>r.ok?r.text():'').then(text=>{text=(text||'').trim();if(!text)return;document.getElementById('motd-text').textContent=text;document.getElementById('motd-overlay').classList.add('show');try{localStorage.setItem(key,today)}catch(e){}}).catch(()=>{})})();
+document.getElementById('motd-close').addEventListener('click',()=>document.getElementById('motd-overlay').classList.remove('show'));
+</script></body></html>"""
+
+
+# =========================================================================
+# Api / windowing
+# =========================================================================
+class Api:
+    def __init__(self):
+        self.window = None
+        self.stop_event = threading.Event()
+        self.thread = None
+        self.auth_token = None
+        self.username = None
+        self.server_url = DEFAULT_SERVER
+        self._lp = 0.0
+        self._backend_file = CHECKPOINT_DIR / "selected_backend.json"
+        saved = None
+        try:
+            if self._backend_file.exists():
+                saved = json.loads(self._backend_file.read_text()).get("backend")
+        except Exception:
+            saved = None
+        self.selected_backend = saved or get_best_default_backend()
+        log.info(f"[CLIENT] Selected backend: {self.selected_backend}")
+
+    def emit(self, ev, data):
+        if not self.window:
+            return
+        if ev in ('log', 'status'):
+            try:
+                print(f"[EMIT {ev}] {data}", flush=True)
+            except Exception:
+                pass
+        if ev == 'preview_loss':
+            n = time.time()
+            if n - self._lp < 0.4:
+                return
+            self._lp = n
+        try:
+            clean_data = sanitize_for_json(data)
+            self.window.evaluate_js(f"window.handleEvent({json.dumps(ev)}, {json.dumps(clean_data)});")
+        except Exception as e:
+            log.warning(f"Emit failed for {ev}: {e}")
+
+    def get_backends(self):
+        available = get_available_backends()
+        self.emit('backends', {'available': available, 'current': self.selected_backend})
+
+    def set_backend(self, backend_name):
+        log.info(f"[CLIENT] set_backend called with: {backend_name} (was {self.selected_backend})")
+        self.selected_backend = backend_name
+        try:
+            self._backend_file.write_text(json.dumps({"backend": backend_name}))
+        except Exception as e:
+            log.warning(f"Failed to save backend choice: {e}")
+        self.get_backends()
+        if self.thread and self.thread.is_alive():
+            self.stop_event.set()
+
+    def login(self, s, u, p):
+        self.server_url = s or self.server_url
+        threading.Thread(target=self._do_login, args=(u, p), daemon=True).start()
+
+    def _do_login(self, u, p):
+        tok, err = do_login(self.server_url, u, p)
+        if tok:
+            self.auth_token = tok
+            self.username = u
+            self.emit('login_success', {'username': u})
+        else:
+            self.emit('login_error', {'code': err or 'login_failed'})
+
+    def register(self, s, u, email, p):
+        self.server_url = s or self.server_url
+        threading.Thread(target=self._do_register, args=(u, email, p), daemon=True).start()
+
+    def _do_register(self, u, email, p):
+        tok, err = do_register(self.server_url, u, email, p)
+        if tok:
+            self.auth_token = tok
+            self.username = u
+            self.emit('login_success', {'username': u})
+        else:
+            self.emit('login_error', {'code': err or 'register_failed'})
+
+    def login_anon(self):
+        self.auth_token = None
+        self.username = "anonymous"
+        self.emit('login_success', {'username': 'anonymous'})
+
+    def start(self):
+        if self.thread and self.thread.is_alive():
+            return
+        self.stop_event.clear()
+        self.thread = threading.Thread(target=self._rs, daemon=True)
+        self.thread.start()
+
+    def stop(self):
+        self.stop_event.set()
+
+    def _check_updates_between_rounds(self):
+        try:
+            if check_for_update():
+                self.emit('log', "🔄 Updated to a new version — restarting...")
+                self.emit('status', 'idle')
+                time.sleep(2)
+                _restart_self()
+        except Exception as e:
+            log.warning(f"Update check failed: {e}")
+
+    def _rs(self):
+        global train_device, train_backend
+        try:
+            train_device, train_backend = detect_training_backend(self.selected_backend)
+            self.emit('meta', {'backend': train_backend})
+            self.emit('log', f"Backend: {train_backend} ({train_device})")
+            auto_detect_vram_budget()
+            self.emit('log', f"Placement budget: {memory_config['ram_gb']:.2f} GB "
+                             f"(margin {SAFETY_MARGIN_GB:.2f} GB)")
+            install_hard_vram_cap(train_device, SAFETY_MARGIN_GB)
+        except Exception as e:
+            self.emit('log', f"Error: {e}")
+            self.emit('status', 'idle')
+            return
+        round_count = 0
+        while not self.stop_event.is_set():
+            round_count += 1
+            self.emit('log', f"{'='*40}")
+            self.emit('log', f"Starting Round Cycle #{round_count}")
+            self.emit('log', f"{'='*40}")
+            try:
+                run_single_round_wrapper(self.server_url, self.auth_token, self.stop_event, self.emit)
+            except KeyboardInterrupt:
+                self.stop_event.set()
+                break
+            except Exception as e:
+                import traceback
+                tb = traceback.format_exc()
+                print(f"\n[ROUND-FAIL-TRACEBACK]\n{tb}\n", flush=True)
+                for ln in tb.splitlines()[-14:]:
+                    self.emit('log', ln)
+                self.emit('log', f"Round failed: {e}")
+            if self.stop_event.is_set():
+                break
+            self._check_updates_between_rounds()
+            self.emit('status', 'waiting')
+            self.emit('log', "✅ Round complete. Auto-relaunching next round in 10s...")
+            for _ in range(10):
+                if self.stop_event.is_set():
+                    break
+                time.sleep(1)
+        self.emit('status', 'idle')
+        self.emit('log', "👋 Training stopped by user.")
+
+
+def startup():
+    if sys.platform == "win32" and WINDOWS_ICO_PATH:
+        _wait_for_window(WINDOW_TITLE, timeout=5.0)
+        time.sleep(0.15)
+        set_windows_icon(WINDOW_TITLE, WINDOWS_ICO_PATH)
+
+    try:
+        scr = webview.screens[0]
+        aw, ah = scr.width, scr.height
+        w = max(480, min(1040, int(aw * 0.80)))
+        h = max(360, min(800, int(ah * 0.80)))
+        w = min(w, aw - 16)
+        h = min(h, ah - 48)
+        w = max(320, w)
+        h = max(240, h)
+        window.resize(w, h)
+        window.move(max(0, (aw - w) // 2), max(0, (ah - h) // 2))
+    except Exception:
+        pass
+
+
+def _create_window_safe(title, html, icon_path, kwargs):
+    usable = False
+    if icon_path and os.path.exists(icon_path):
+        low = icon_path.lower()
+        if low.endswith((".png", ".ico", ".jpg", ".jpeg", ".gif", ".bmp", ".tiff", ".webp")):
+            usable = True
+    if usable:
+        try:
+            return webview.create_window(title, html=html, icon=icon_path, **kwargs)
+        except Exception as e:
+            log.warning(f"[icon] create_window(icon=...) failed, retrying without: {e}")
+    try:
+        return webview.create_window(title, html=html, **kwargs)
+    except TypeError:
+        kwargs.pop("min_size", None)
+        return webview.create_window(title, html=html, **kwargs)
+
+
+if __name__ == "__main__":
+    print(f"CrowdGPT client v{CLIENT_VERSION}")
+
+    if sys.platform == "win32":
+        try:
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Vxtzq.CrowdGPT.1")
+        except Exception:
+            pass
+
+    try:
+        if check_for_update():
+            print("Update applied. Restarting...")
+            _restart_self()
+    except Exception as e:
+        log.warning(f"Auto-update check error: {e}")
+
+    api = Api()
+    start_tokenizer_loader()
+
+    kwargs = {"js_api": api, "width": 1000, "height": 720, "min_size": (320, 240)}
+    html_out = (HTML.replace("__LOGO__", LOGO_URI_LIGHT)
+                    .replace("__LOGO_DARK__", LOGO_URI_DARK)
+                    .replace("__VERSION__", CLIENT_VERSION))
+
+    window = _create_window_safe("CrowdGPT", html_out, ICON_PATH, kwargs)
+    api.window = window
+    webview.start(startup, debug=False)

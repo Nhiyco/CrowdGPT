@@ -2,7 +2,8 @@
 #  CrowdGPT.ai — CPU / default build
 # ────────────────────────────────────────────────────────────────
 
-torch>=2.0.0
+# transformers 5.x needs torch >= 2.6 (torch 2.5.x gets rejected)
+torch>=2.6.0
 numpy>=1.24.0
 requests>=2.28.0
 rich>=13.0.0

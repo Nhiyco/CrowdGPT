@@ -3,8 +3,18 @@ setlocal EnableExtensions EnableDelayedExpansion
 
 REM ============================================================
 REM CrowdGPT Universal Installer for Windows
-REM v10.2
-REM  Changes vs v10.1:
+REM v10.3
+REM  Changes vs v10.2:
+REM  - transformers 5.x needs torch >= 2.6, but the cu121 wheel index
+REM    stops at torch 2.5.1. NVIDIA now uses cu126 (torch 2.6+ up to
+REM    the newest release); the old-driver fallback stays cu118
+REM    (torch 2.7.1 max, still >= 2.6).
+REM  - Step 7b threshold raised from torch 2.5 to 2.6.
+REM  - DirectML: torch-directml pins torch 2.4.1, which cannot satisfy
+REM    torch>=2.6 in requirements.txt, so torch lines are left out of
+REM    the requirements install on the AMD backend only.
+REM
+REM  Changes in v10.2:
 REM  - Project requirements are now installed directly with
 REM    pip install -r requirements.txt. The PowerShell/regex torch
 REM    filter is gone (it could fail silently and skip ALL deps,
@@ -99,7 +109,7 @@ exit /b 0
 
 echo.
 echo ============================================================
-echo                 CrowdGPT Installer  (v10.2)
+echo                 CrowdGPT Installer  (v10.3)
 echo ============================================================
 echo.
 
@@ -289,11 +299,11 @@ if /I "!BACKEND!"=="intel"  goto :pytorch_intel
 goto :pytorch_cpu
 
 :pytorch_nvidia
-echo [INFO] Trying PyTorch CUDA 12.1 cu121...
-"!APP_PY!" -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+echo [INFO] Trying PyTorch CUDA 12.6 cu126...
+"!APP_PY!" -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126
 if not errorlevel 1 goto :pytorch_done
 echo.
-echo [WARN] cu121 failed. Trying CUDA 11.8 cu118...
+echo [WARN] cu126 failed. Trying CUDA 11.8 cu118...
 "!APP_PY!" -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
 if not errorlevel 1 goto :pytorch_done
 goto :pytorch_cpu
@@ -331,7 +341,7 @@ echo [INFO] Installed torch version:
 
 REM ------------------------------------------------------------
 REM 7. Install project requirements
-REM    torch is already installed above; "torch>=x" in
+REM    torch is already installed above; "torch>=2.6.0" in
 REM    requirements.txt is satisfied by it, so pip leaves it alone.
 REM    (If requirements.txt ever pins torch with "==", pip would
 REM    replace the GPU build - keep it as ">=".)
@@ -346,8 +356,19 @@ echo ============================================================
 echo               Installing project dependencies
 echo ============================================================
 
-"!APP_PY!" -m pip install -r "!SRC_DIR!\requirements.txt"
-if errorlevel 1 (
+set "REQ_FILE=!SRC_DIR!\requirements.txt"
+set "TMP_REQ="
+if /I "!BACKEND!"=="amd" (
+    echo [INFO] DirectML build: leaving torch lines out ^(torch-directml pins its own torch^).
+    set "TMP_REQ=%TEMP%\crowdgpt-req-%RANDOM%.txt"
+    findstr /V /B /I /C:"torch>" /C:"torch=" /C:"torch<" /C:"torch~" /C:"torch " /C:"torchvision" /C:"torchaudio" /C:"torch-directml" "!SRC_DIR!\requirements.txt" > "!TMP_REQ!"
+    set "REQ_FILE=!TMP_REQ!"
+)
+
+"!APP_PY!" -m pip install -r "!REQ_FILE!"
+set "PIP_RC=!ERRORLEVEL!"
+if defined TMP_REQ del "!TMP_REQ!" >nul 2>nul
+if not "!PIP_RC!"=="0" (
     echo [ERROR] pip failed to install project requirements.
     goto :fatal
 )
@@ -357,13 +378,13 @@ if errorlevel 1 (
 REM ------------------------------------------------------------
 REM 7b. transformers pin, based on installed torch version
 REM     DirectML ships torch 2.4.1; transformers 5.x requires
-REM     torch >= 2.5. Any torch < 2.5 gets transformers 4.x.
+REM     torch >= 2.6. Any torch < 2.6 gets transformers 4.x.
 REM     Otherwise, make sure transformers is present at all.
 REM ------------------------------------------------------------
-"!APP_PY!" -c "import sys, torch; v = torch.__version__.split('+')[0].split('.'); sys.exit(0 if (int(v[0]) > 2 or (int(v[0]) == 2 and int(v[1]) >= 5)) else 1)" 2>nul
+"!APP_PY!" -c "import sys, torch; v = torch.__version__.split('+')[0].split('.'); sys.exit(0 if (int(v[0]) > 2 or (int(v[0]) == 2 and int(v[1]) >= 6)) else 1)" 2>nul
 if errorlevel 1 (
     echo.
-    echo [INFO] torch ^< 2.5 detected; pinning transformers to 4.x...
+    echo [INFO] torch ^< 2.6 detected; pinning transformers to 4.x...
     "!APP_PY!" -m pip install --upgrade "transformers>=4.45,<5.0"
     if errorlevel 1 (
         echo [ERROR] Failed to pin transformers to 4.x.
@@ -372,7 +393,7 @@ if errorlevel 1 (
     echo [OK] transformers pinned to 4.x
 ) else (
     echo.
-    echo [INFO] torch ^>= 2.5; using latest transformers
+    echo [INFO] torch ^>= 2.6; using latest transformers
     "!APP_PY!" -c "import transformers" >nul 2>nul
     if errorlevel 1 (
         echo [WARN] transformers missing, installing it directly...
@@ -685,7 +706,7 @@ set "REG_PS=%TEMP%\crowdgpt-reg-%RANDOM%.ps1"
 > "!REG_PS!"  echo $k = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\CrowdGPT'
 >> "!REG_PS!" echo New-Item -Path $k -Force ^| Out-Null
 >> "!REG_PS!" echo Set-ItemProperty -Path $k -Name 'DisplayName'     -Value 'CrowdGPT'
->> "!REG_PS!" echo Set-ItemProperty -Path $k -Name 'DisplayVersion'  -Value '0.10.2'
+>> "!REG_PS!" echo Set-ItemProperty -Path $k -Name 'DisplayVersion'  -Value '0.10.3'
 >> "!REG_PS!" echo Set-ItemProperty -Path $k -Name 'Publisher'       -Value 'CrowdGPT Project'
 >> "!REG_PS!" echo Set-ItemProperty -Path $k -Name 'InstallLocation' -Value '!APP_DIR!'
 >> "!REG_PS!" echo Set-ItemProperty -Path $k -Name 'UninstallString' -Value ('"' + '!APP_DIR!\uninstall.bat' + '"')
@@ -725,8 +746,8 @@ REM ============================================================
 :apply_override
 if /I "!BACKEND_OVERRIDE!"=="nvidia" (
     set "BACKEND=nvidia"
-    set "TORCH_INDEX=https://download.pytorch.org/whl/cu121"
-    set "WHEEL_NOTE=forced: nvidia/cu121"
+    set "TORCH_INDEX=https://download.pytorch.org/whl/cu126"
+    set "WHEEL_NOTE=forced: nvidia/cu126"
     exit /b 0
 )
 if /I "!BACKEND_OVERRIDE!"=="amd" (
@@ -770,8 +791,8 @@ if defined NVIDIA_DRIVER (
 
 if not defined NVIDIA_DRIVER (
     set "BACKEND=nvidia"
-    set "TORCH_INDEX=https://download.pytorch.org/whl/cu121"
-    set "WHEEL_NOTE=NVIDIA GPU - could not read driver, defaulting to cu121"
+    set "TORCH_INDEX=https://download.pytorch.org/whl/cu126"
+    set "WHEEL_NOTE=NVIDIA GPU - could not read driver, defaulting to cu126"
     exit /b 0
 )
 
@@ -780,15 +801,15 @@ for /f "tokens=1 delims=." %%M in ("!NVIDIA_DRIVER!") do set "DRIVER_MAJOR=%%M"
 
 if not defined DRIVER_MAJOR (
     set "BACKEND=nvidia"
-    set "TORCH_INDEX=https://download.pytorch.org/whl/cu121"
-    set "WHEEL_NOTE=NVIDIA driver !NVIDIA_DRIVER! - defaulting to cu121"
+    set "TORCH_INDEX=https://download.pytorch.org/whl/cu126"
+    set "WHEEL_NOTE=NVIDIA driver !NVIDIA_DRIVER! - defaulting to cu126"
     exit /b 0
 )
 
 if !DRIVER_MAJOR! GEQ 525 (
     set "BACKEND=nvidia"
-    set "TORCH_INDEX=https://download.pytorch.org/whl/cu121"
-    set "WHEEL_NOTE=NVIDIA driver !NVIDIA_DRIVER! -> CUDA 12.1 wheel"
+    set "TORCH_INDEX=https://download.pytorch.org/whl/cu126"
+    set "WHEEL_NOTE=NVIDIA driver !NVIDIA_DRIVER! -> CUDA 12.6 wheel"
     exit /b 0
 )
 if !DRIVER_MAJOR! GEQ 470 (

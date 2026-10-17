@@ -3,26 +3,30 @@ setlocal EnableExtensions EnableDelayedExpansion
 
 REM ============================================================
 REM CrowdGPT Universal Installer for Windows
-REM v10.1
-REM  Changes vs v10.0:
+REM v10.2
+REM  Changes vs v10.1:
+REM  - Project requirements are now installed directly with
+REM    pip install -r requirements.txt. The PowerShell/regex torch
+REM    filter is gone (it could fail silently and skip ALL deps,
+REM    including transformers). torch is already installed at this
+REM    point, so "torch>=x" lines are satisfied and left alone.
+REM  - A failure while installing requirements is now fatal
+REM    instead of being skipped with a warning.
+REM  - Step 7b now guarantees transformers is installed even if
+REM    something upstream went wrong.
+REM
+REM  Changes in v10.1:
 REM  - uv / Git no longer require a terminal restart. After any
 REM    install the PATH is re-read from the registry and merged
 REM    into the running session, and known install dirs are probed
 REM    as a fallback (winget Links, ~/.local/bin, etc).
 REM  - uv: official installer with a fixed install dir first,
-REM    winget as fallback (the old hardcoded paths missed winget).
-REM  - Git direct-download fallback was broken (404 on
-REM    latest/download/Git-64-bit.exe). Now resolves the real asset
+REM    winget as fallback.
+REM  - Git direct-download fallback resolves the real asset
 REM    through the GitHub API.
-REM  - DirectML verify snippets used Python %-formatting, which
-REM    cmd silently ate (%d / %s / %.4f). Rewritten without '%'.
-REM  - requirements filter regex lost its ^ anchor (cmd ate the
-REM    caret) and could drop unrelated lines such as pytorch-xxx.
-REM  - Uninstaller: PATH cleanup used a pipe that got mangled, and
-REM    the self-delete line had broken nested quotes. Both fixed.
-REM  - Non-integrated install: venv is now created inside the repo
-REM    instead of the directory the installer was launched from.
-REM  - Cosmetic: "^>" no longer printed literally in backend note.
+REM  - DirectML verify snippets contain no '%' characters.
+REM  - Uninstaller: PATH cleanup and self-delete fixed.
+REM  - Non-integrated install: venv is created inside the repo.
 REM  - Start Menu icon: only .ico is used (.svg is not valid).
 REM ============================================================
 
@@ -95,7 +99,7 @@ exit /b 0
 
 echo.
 echo ============================================================
-echo                 CrowdGPT Installer  (v10.1)
+echo                 CrowdGPT Installer  (v10.2)
 echo ============================================================
 echo.
 
@@ -326,11 +330,15 @@ echo [INFO] Installed torch version:
 "!APP_PY!" -c "import torch; print('       ' + torch.__version__)"
 
 REM ------------------------------------------------------------
-REM 7. Install project requirements (torch lines filtered out)
+REM 7. Install project requirements
+REM    torch is already installed above; "torch>=x" in
+REM    requirements.txt is satisfied by it, so pip leaves it alone.
+REM    (If requirements.txt ever pins torch with "==", pip would
+REM    replace the GPU build - keep it as ">=".)
 REM ------------------------------------------------------------
 if not exist "requirements.txt" (
-    echo [WARN] requirements.txt not found; skipping project deps.
-    goto :reqs_done
+    echo [ERROR] requirements.txt not found in !SRC_DIR!
+    goto :fatal
 )
 
 echo.
@@ -338,36 +346,11 @@ echo ============================================================
 echo               Installing project dependencies
 echo ============================================================
 
-set "TMP_REQ=%TEMP%\crowdgpt-req-%RANDOM%.txt"
-set "FILTER_PS=%TEMP%\crowdgpt-filter-%RANDOM%.ps1"
-
-REM Note: ^^ gives a literal caret, ^| a pipe, ^< ^> literal angle brackets.
-> "!FILTER_PS!"  echo $in  = '!SRC_DIR!\requirements.txt'
->> "!FILTER_PS!" echo $out = '!TMP_REQ!'
->> "!FILTER_PS!" echo $rx  = '^^\s*(torch^|torchvision^|torchaudio^|torch-directml)\s*($^|[=^<^>~;#\[])'
->> "!FILTER_PS!" echo Get-Content -LiteralPath $in ^| Where-Object { $_ -notmatch $rx } ^| Set-Content -LiteralPath $out -Encoding ASCII
-
-powershell -NoProfile -ExecutionPolicy Bypass -File "!FILTER_PS!"
-del "!FILTER_PS!" >nul 2>nul
-
-if not exist "!TMP_REQ!" (
-    echo [WARN] No filtered requirements produced.
-    goto :reqs_done
-)
-
-for %%A in ("!TMP_REQ!") do set "TMP_SIZE=%%~zA"
-if "!TMP_SIZE!"=="0" (
-    echo [WARN] requirements.txt contained only torch packages; nothing else to install.
-    del "!TMP_REQ!" >nul 2>nul
-    goto :reqs_done
-)
-
-"!APP_PY!" -m pip install -r "!TMP_REQ!"
+"!APP_PY!" -m pip install -r "!SRC_DIR!\requirements.txt"
 if errorlevel 1 (
-    del "!TMP_REQ!" >nul 2>nul
+    echo [ERROR] pip failed to install project requirements.
     goto :fatal
 )
-del "!TMP_REQ!" >nul 2>nul
 
 :reqs_done
 
@@ -375,6 +358,7 @@ REM ------------------------------------------------------------
 REM 7b. transformers pin, based on installed torch version
 REM     DirectML ships torch 2.4.1; transformers 5.x requires
 REM     torch >= 2.5. Any torch < 2.5 gets transformers 4.x.
+REM     Otherwise, make sure transformers is present at all.
 REM ------------------------------------------------------------
 "!APP_PY!" -c "import sys, torch; v = torch.__version__.split('+')[0].split('.'); sys.exit(0 if (int(v[0]) > 2 or (int(v[0]) == 2 and int(v[1]) >= 5)) else 1)" 2>nul
 if errorlevel 1 (
@@ -388,7 +372,16 @@ if errorlevel 1 (
     echo [OK] transformers pinned to 4.x
 ) else (
     echo.
-    echo [INFO] torch ^>= 2.5; leaving transformers at latest 5.x
+    echo [INFO] torch ^>= 2.5; using latest transformers
+    "!APP_PY!" -c "import transformers" >nul 2>nul
+    if errorlevel 1 (
+        echo [WARN] transformers missing, installing it directly...
+        "!APP_PY!" -m pip install transformers
+        if errorlevel 1 (
+            echo [ERROR] Failed to install transformers.
+            goto :fatal
+        )
+    )
 )
 
 REM ------------------------------------------------------------
@@ -692,7 +685,7 @@ set "REG_PS=%TEMP%\crowdgpt-reg-%RANDOM%.ps1"
 > "!REG_PS!"  echo $k = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\CrowdGPT'
 >> "!REG_PS!" echo New-Item -Path $k -Force ^| Out-Null
 >> "!REG_PS!" echo Set-ItemProperty -Path $k -Name 'DisplayName'     -Value 'CrowdGPT'
->> "!REG_PS!" echo Set-ItemProperty -Path $k -Name 'DisplayVersion'  -Value '0.10.1'
+>> "!REG_PS!" echo Set-ItemProperty -Path $k -Name 'DisplayVersion'  -Value '0.10.2'
 >> "!REG_PS!" echo Set-ItemProperty -Path $k -Name 'Publisher'       -Value 'CrowdGPT Project'
 >> "!REG_PS!" echo Set-ItemProperty -Path $k -Name 'InstallLocation' -Value '!APP_DIR!'
 >> "!REG_PS!" echo Set-ItemProperty -Path $k -Name 'UninstallString' -Value ('"' + '!APP_DIR!\uninstall.bat' + '"')

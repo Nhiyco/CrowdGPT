@@ -1,3 +1,4 @@
-v0.5 summary:
+v1 summary:
 - https migration for server endpoint
-- enhanced GUI version of client
+- Memory requirements reduction
+- Better installer

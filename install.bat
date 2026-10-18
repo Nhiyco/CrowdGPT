@@ -48,6 +48,7 @@ set "WHEEL_NOTE="
 set "LAUNCH=1"
 set "INTEGRATE=1"
 set "BACKEND_OVERRIDE="
+set "LOCAL_INSTALLER_DIR=%~dp0"
 set "AMD_GPU_NAME="
 set "FRESH=1"
 set "PY_VER=3.11"
@@ -91,7 +92,7 @@ echo.
 echo CrowdGPT installer - Windows
 echo.
 echo Options:
-echo   --backend ^<name^>   Force backend: nvidia ^| amd ^| intel ^| cpu
+echo   --backend ^<name^>   Force backend: nvidia ^| amd ^| rocm ^| intel ^| cpu
 echo   --dir ^<path^>       Directory to clone into. Default: .\CrowdGPT
 echo   --no-launch        Install only, don't launch client.py
 echo   --no-integrate     Skip Start Menu and PATH integration
@@ -99,8 +100,9 @@ echo   --no-fresh         Keep existing install (default: wipe and reinstall)
 echo   --help             Show this message
 echo.
 echo Notes:
-echo   - AMD on Windows uses DirectML (torch-directml). For real
-echo     ROCm acceleration on AMD, use the Linux installer.
+echo   - AMD automatic selection uses DirectML.
+echo   - Experimental Windows ROCm: --backend rocm (RX 7800 XT/gfx1101).
+echo   - Requires a compatible AMD driver and TheRock PyTorch wheels.
 echo   - Intel Arc uses the XPU wheel. NVIDIA uses CUDA.
 echo.
 exit /b 0
@@ -128,6 +130,16 @@ if "!INTEGRATE!"=="1" (
 )
 
 REM ------------------------------------------------------------
+REM 0a. For experimental ROCm, validate target before deleting any install.
+if /I "!BACKEND_OVERRIDE!"=="rocm" (
+    powershell -NoProfile -Command "$g=Get-CimInstance Win32_VideoController | Where-Object { $_.Name -match 'Radeon RX 7800 XT' }; if ($g) { exit 0 } else { exit 1 }"
+    if errorlevel 1 (
+        echo [ERROR] This experimental ROCm profile is restricted to RX 7800 XT.
+        echo [ERROR] Existing installation was not modified.
+        exit /b 1
+    )
+)
+
 REM 0b. Wipe previous install (preserve caches)
 REM ------------------------------------------------------------
 if "!INTEGRATE!"=="1" if "!FRESH!"=="1" if exist "!APP_DIR!" (
@@ -247,6 +259,18 @@ echo ============================================================
 echo.
 
 if /I "!BACKEND!"=="amd" call :note_amd
+if /I "!BACKEND!"=="rocm" (
+    echo [NOTE] Experimental Windows ROCm via TheRock, gfx1101.
+    echo [NOTE] This is NOT the regular Windows PyTorch ROCm support channel.
+    echo [NOTE] RX 7800 XT training functionality must be tested.
+    if exist "!LOCAL_INSTALLER_DIR!client_rocm.py" (
+        echo [INFO] Applying bundled ROCm client overlay.
+        copy /Y "!LOCAL_INSTALLER_DIR!client_rocm.py" "!SRC_DIR!\client.py" >nul
+        if errorlevel 1 goto :fatal
+    ) else (
+        echo [INFO] No client_rocm.py supplied; using repository client.py.
+    )
+)
 
 REM ------------------------------------------------------------
 REM 5. Create venv
@@ -295,8 +319,25 @@ echo ============================================================
 
 if /I "!BACKEND!"=="nvidia" goto :pytorch_nvidia
 if /I "!BACKEND!"=="amd"    goto :pytorch_amd
+if /I "!BACKEND!"=="rocm"   goto :pytorch_rocm
 if /I "!BACKEND!"=="intel"  goto :pytorch_intel
 goto :pytorch_cpu
+
+REM TheRock PyTorch Windows gfx1101 (AMD Radeon RX 7800 XT).
+:pytorch_rocm
+echo [INFO] Installing native Windows PyTorch ROCm through AMD TheRock...
+echo [INFO] ROCm 10.1.0 stable, GPU target gfx1101.
+"!APP_PY!" -m pip install --index-url https://stable.repo.amd.com/rocm/whl-next/ "torch[device-gfx1101]==2.13.0+rocm10.1.0"
+if errorlevel 1 (
+    echo [ERROR] ROCm wheel installation failed. Check Python, drivers, and wheel availability.
+    goto :fatal
+)
+"!APP_PY!" -c "import torch; assert torch.version.hip, 'not a HIP build'; assert torch.cuda.is_available(), 'ROCm GPU unavailable'; print('  ROCm GPU:',torch.cuda.get_device_name(0)); x=torch.ones((256,256),device='cuda'); y=x@x; torch.cuda.synchronize(); print('  ROCm matrix test OK:', float(y[0,0].cpu()))"
+if errorlevel 1 (
+    echo [ERROR] PyTorch ROCm could not run the gfx1101 GPU matrix test.
+    goto :fatal
+)
+goto :pytorch_done
 
 :pytorch_nvidia
 echo [INFO] Trying PyTorch CUDA 12.6 cu126...
@@ -358,6 +399,12 @@ echo ============================================================
 
 set "REQ_FILE=!SRC_DIR!\requirements.txt"
 set "TMP_REQ="
+if /I "!BACKEND!"=="rocm" (
+    echo [INFO] ROCm build: protecting AMD PyTorch wheel from requirements changes.
+    set "TMP_REQ=%TEMP%\crowdgpt-req-%RANDOM%.txt"
+    findstr /V /B /I /C:"torch>" /C:"torch=" /C:"torch<" /C:"torch~" /C:"torch " /C:"torchvision" /C:"torchaudio" /C:"torch-directml" "!SRC_DIR!\requirements.txt" > "!TMP_REQ!"
+    set "REQ_FILE=!TMP_REQ!"
+)
 if /I "!BACKEND!"=="amd" (
     echo [INFO] DirectML build: leaving torch lines out ^(torch-directml pins its own torch^).
     set "TMP_REQ=%TEMP%\crowdgpt-req-%RANDOM%.txt"
@@ -450,6 +497,13 @@ if errorlevel 1 (
 )
 
 if /I "!BACKEND!"=="amd" call :verify_directml
+if /I "!BACKEND!"=="rocm" (
+    "!APP_PY!" -c "import torch; assert torch.version.hip and torch.cuda.is_available(), 'ROCm unavailable after requirements'; print('  HIP:',torch.version.hip); print('  Device:',torch.cuda.get_device_name(0))"
+    if errorlevel 1 (
+        echo [ERROR] ROCm unavailable after dependencies installation.
+        goto :fatal
+    )
+)
 
 if /I "!BACKEND!"=="nvidia" (
     "!APP_PY!" -c "import torch; assert torch.cuda.is_available(), 'no CUDA device'; print('  CUDA device:', torch.cuda.get_device_name(0))"
@@ -750,6 +804,12 @@ if /I "!BACKEND_OVERRIDE!"=="nvidia" (
     set "WHEEL_NOTE=forced: nvidia/cu126"
     exit /b 0
 )
+if /I "!BACKEND_OVERRIDE!"=="rocm" (
+    set "BACKEND=rocm"
+    set "TORCH_INDEX=https://stable.repo.amd.com/rocm/whl-next/"
+    set "WHEEL_NOTE=forced: Windows ROCm via TheRock gfx1101"
+    exit /b 0
+)
 if /I "!BACKEND_OVERRIDE!"=="amd" (
     set "BACKEND=amd"
     set "TORCH_INDEX="
@@ -768,8 +828,7 @@ if /I "!BACKEND_OVERRIDE!"=="cpu" (
     set "WHEEL_NOTE=forced: cpu"
     exit /b 0
 )
-echo [ERROR] --backend must be one of: nvidia, amd, intel, cpu
-echo         (Windows uses DirectML for AMD; use the Linux installer for ROCm.)
+echo [ERROR] --backend must be one of: nvidia, amd, rocm, intel, cpu
 exit /b 1
 
 REM ============================================================

@@ -14,4 +14,6 @@ The server acts as a centralized coordinator that assembles all the clients cont
 ## Client architecture
 The client is a simple pytorch training loop wrapper that trains the main model on provided data. It then bring back its updates on the main model to the server, which saves these updates after further verification.
 
+The client trains for 1 hour, then sends back the trained model to the server as a weight delta.
+
 **The client is therefore 100% auditable, opensource, and safe to use** (no arbitrary code coming from server is ever executed)

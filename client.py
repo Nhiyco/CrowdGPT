@@ -3055,22 +3055,22 @@ def startup():
         pass
 
 
-def _create_window_safe(title, html, icon_path, kwargs):
-    usable = False
-    if icon_path and os.path.exists(icon_path):
-        low = icon_path.lower()
-        if low.endswith((".png", ".ico", ".jpg", ".jpeg", ".gif", ".bmp", ".tiff", ".webp")):
-            usable = True
-    if usable:
-        try:
-            return webview.create_window(title, html=html, icon=icon_path, **kwargs)
-        except Exception as e:
-            log.warning(f"[icon] create_window(icon=...) failed, retrying without: {e}")
+def _create_window_safe(title, html, kwargs):
+    # NB: create_window() has no `icon` argument (passing one raises TypeError, which
+    # is why the Linux icon silently vanished). The icon goes to webview.start().
     try:
         return webview.create_window(title, html=html, **kwargs)
     except TypeError:
         kwargs.pop("min_size", None)
         return webview.create_window(title, html=html, **kwargs)
+
+
+def _start_icon_kwargs():
+    """Window icon for webview.start(): GTK/Qt only (Windows is handled natively in startup())."""
+    if sys.platform == "win32" or not ICON_PATH or not os.path.exists(ICON_PATH):
+        return {}
+    log.info(f"[icon] passing icon to webview.start: {ICON_PATH}")
+    return {"icon": ICON_PATH}
 
 
 if __name__ == "__main__":
@@ -3097,6 +3097,9 @@ if __name__ == "__main__":
                     .replace("__LOGO_DARK__", LOGO_URI_DARK)
                     .replace("__VERSION__", CLIENT_VERSION))
 
-    window = _create_window_safe("CrowdGPT", html_out, ICON_PATH, kwargs)
+    window = _create_window_safe("CrowdGPT", html_out, kwargs)
     api.window = window
-    webview.start(startup, debug=False)
+    try:
+        webview.start(startup, debug=False, **_start_icon_kwargs())
+    except TypeError:                      # very old pywebview without start(icon=...)
+        webview.start(startup, debug=False)

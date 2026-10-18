@@ -1,5 +1,5 @@
 
-<img src="https://raw.githubusercontent.com/Vxtzq/CrowdGPT/refs/heads/main/docs/diagram.jpeg" alt="The CrowdGPT architecture" width="700" />
+<img src="https://raw.githubusercontent.com/Vxtzq/CrowdGPT/refs/heads/main/docs/diagram.jpeg" alt="The CrowdGPT architecture"/>
 
 
 # System architecture

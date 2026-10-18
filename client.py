@@ -868,6 +868,22 @@ def auto_detect_vram_budget():
         except Exception:
             pass
 
+    if train_backend == "XPU":
+        try:
+            total = int(torch.xpu.get_device_properties(0).total_memory)
+            free = total
+            try:
+                free, _t = torch.xpu.mem_get_info(0)
+            except Exception:
+                pass
+            total_gb, free_gb = total / 1024**3, int(free) / 1024**3
+            usable = max(0.25, min(total_gb, free_gb) - SAFETY_MARGIN_GB - ALLOCATOR_RESERVE_GB)
+            memory_config.update({"ram_gb": round(usable, 2), "is_auto_detected": True})
+            log.info(f"[VRAM-BUDGET] XPU free={free_gb:.2f}GB total={total_gb:.2f}GB → placement={usable:.2f}GB")
+            return
+        except Exception:
+            pass
+
     if train_backend == "DIRECTML":
         memory_config.update({"ram_gb": 1.5, "is_auto_detected": True})
         return
@@ -932,6 +948,15 @@ def recommend_batch_size(sl=MAX_SEQ_LEN):
             best = bs
         else:
             break
+
+    if train_backend == "ROCM":
+        rocm_bs_cap = max(
+            1, min(8, int(os.environ.get(
+                "CROWDGPT_ROCM_BATCH", 1
+            )))
+        )
+        best = min(best, rocm_bs_cap)
+
     log.info(f"[BATCH] recommended bs={best} for budget={memory_config['ram_gb']:.2f}GB "
              f"(8bit_opt={u8})")
     return best
@@ -1111,24 +1136,49 @@ class EngramMemory(nn.Module):
         return out.to(self.device)
 
 
+def _streamed_block(block, dev, dtype, x, cos, sin, use_chunked):
+    """
+    Run `block` on `dev` using a temporary device copy of its CPU-resident
+    parameters. The copies are differentiable (`.to` is an autograd op), so the
+    gradients land back on the CPU master tensors. Always called through
+    `checkpoint`, so only one block's copy is alive at a time.
+    """
+    if dtype is not None:
+        # Matrices go over the bus in the low-precision compute dtype; the tiny 1-D
+        # LayerNorm params stay fp32 (norm kernels expect fp32 params).
+        params = {n: (p.to(dev, dtype=dtype) if p.dim() > 1 else p.to(dev))
+                  for n, p in block.named_parameters()}
+        with torch.autocast(device_type=dev.type, dtype=dtype):
+            return torch.func.functional_call(block, params, (x, cos, sin, use_chunked))
+    params = {n: p.to(dev) for n, p in block.named_parameters()}
+    return torch.func.functional_call(block, params, (x, cos, sin, use_chunked))
+
+
 class SotaGPT(nn.Module):
+    """
+    Placement model: every layer is *computed* on `main_device`. Layers listed in
+    `gpu_layer_set` (and the head if `head_on_gpu`) are also *stored* there; the
+    rest are stored in system RAM and streamed in per use.
+    """
+
     def __init__(self, bn, device, gpu_layers=None, bs=1, sl=MAX_SEQ_LEN):
         super().__init__()
         self.main_device = device
+        self.accel_device = device
         self.cpu_device  = torch.device('cpu')
         self.backend_name = bn
-
-        use_ckpt = (device is not None and device.type == 'cuda')
+        is_cpu = (device is None) or (device.type == 'cpu')
 
         if gpu_layers is None:
-            gpu_layers = _plan_gpu_layers(device, bn, memory_config["ram_gb"],
-                                          bs=bs, sl=sl,
-                                          use_ckpt=use_ckpt,
-                                          u8=has_bitsandbytes())
-        self.gpu_layers = max(0, min(N_LAYERS, int(gpu_layers)))
+            head_gpu, gpu_layers = _plan_placement(
+                device, bn, memory_config["ram_gb"], bs=bs, sl=sl,
+                u8=(has_bitsandbytes() and device is not None and device.type == 'cuda'))
+        else:
+            head_gpu = int(gpu_layers) >= N_LAYERS
+
+        self.gpu_layers = 0 if is_cpu else max(0, min(N_LAYERS, int(gpu_layers)))
         self.gpu_layer_set = set(range(self.gpu_layers))
-        self.all_on_gpu = (self.gpu_layers == N_LAYERS) and (device.type != 'cpu')
-        self.any_on_gpu = (self.gpu_layers > 0) and (device.type != 'cpu')
+        self.head_on_gpu = bool(head_gpu) and not is_cpu
 
         self.wte = nn.Embedding(VOCAB_SIZE, DIM)
         self.engram = EngramMemory(bn, device)
@@ -1147,50 +1197,49 @@ class SotaGPT(nn.Module):
         self.register_buffer("freqs_sin_cpu", sm_cpu)
 
         for i, block in enumerate(self.blocks):
-            block.to(device if (self.all_on_gpu or i in self.gpu_layer_set)
-                     else self.cpu_device)
+            block.to(device if i in self.gpu_layer_set else self.cpu_device)
 
         self._place_head()
         self.engram.table.to('cpu')
 
-        log.info(
-            f"🧠 SotaGPT: {self.gpu_layers}/{N_LAYERS} blocks on {device.type}, "
-            f"head on {self.ln_f.weight.device.type}, ckpt={use_ckpt}"
-        )
+        if is_cpu:
+            log.info("🧠 SotaGPT: CPU-only, all weights in system RAM")
+        else:
+            log.info(
+                f"🧠 SotaGPT: compute on {device.type}; {self.gpu_layers}/{N_LAYERS} blocks resident "
+                f"(rest streamed from RAM), head {'resident' if self.head_on_gpu else 'streamed'}"
+            )
 
     def _place_head(self):
-        if self.all_on_gpu:
-            self.wte.to(self.main_device)
-            self.ln_f.to(self.main_device)
-            self.lm_head.to(self.main_device)
-        else:
-            self.wte.to(self.cpu_device)
-            self.ln_f.to(self.cpu_device)
-            self.lm_head.to(self.cpu_device)
+        head_dev = self.main_device if self.head_on_gpu else self.cpu_device
+        self.wte.to(head_dev)
+        self.lm_head.to(head_dev)
+        self.ln_f.to(self.main_device)          # tiny, always next to the compute
 
     def set_gpu_layers(self, n):
         n = max(0, min(N_LAYERS, int(n)))
+        if self.main_device.type == 'cpu':
+            n = 0
         self.gpu_layers = n
         self.gpu_layer_set = set(range(n))
-        self.all_on_gpu = (n == N_LAYERS) and (self.main_device.type != 'cpu')
-        self.any_on_gpu = (n > 0) and (self.main_device.type != 'cpu')
+        if n < N_LAYERS:
+            self.head_on_gpu = False
         for i, blk in enumerate(self.blocks):
             blk.to(self.main_device if i < n else self.cpu_device)
         self._place_head()
-        log.info(f"[PLACEMENT] set_gpu_layers({n}) → head on {self.ln_f.weight.device.type}")
+        log.info(f"[PLACEMENT] {n}/{N_LAYERS} blocks resident, "
+                 f"head {'resident' if self.head_on_gpu else 'streamed'}")
 
     def force_head_cpu(self):
-        self.all_on_gpu = False
-        self.wte.to(self.cpu_device)
-        self.ln_f.to(self.cpu_device)
-        self.lm_head.to(self.cpu_device)
-        log.info("[PLACEMENT] head forced to CPU")
+        """Keep the head's master copy in RAM (it is still computed on the accelerator)."""
+        self.head_on_gpu = False
+        self._place_head()
+        log.info("[PLACEMENT] head master copy → system RAM (streamed per step)")
 
     def to_cpu_only(self):
         self.gpu_layers = 0
         self.gpu_layer_set = set()
-        self.all_on_gpu = False
-        self.any_on_gpu = False
+        self.head_on_gpu = False
         self.main_device = self.cpu_device
         for blk in self.blocks:
             blk.to(self.cpu_device)
@@ -1199,44 +1248,43 @@ class SotaGPT(nn.Module):
         self.engram.device = self.cpu_device
         log.info("[PLACEMENT] model → CPU-only")
 
-    def _block_device(self, i):
-        if self.all_on_gpu or i in self.gpu_layer_set:
-            return self.main_device
-        return self.cpu_device
+    def head_weight(self, dtype=None):
+        """Head/embedding weight on the compute device (a differentiable copy if streamed or cast)."""
+        w = self.lm_head.weight
+        if w.device != self.main_device:
+            return w.to(self.main_device, dtype=dtype) if dtype is not None else w.to(self.main_device)
+        if dtype is not None and w.dtype != dtype:
+            return w.to(dtype)
+        return w
 
-    def forward_features(self, idx, use_chunked=True, use_ckpt=True):
-        wte_dev = self.wte.weight.device
-        if idx.device != wte_dev:
-            idx = idx.to(wte_dev)
-        x = self.wte(idx)
+    def forward_features(self, idx, use_chunked=True, use_ckpt=True, stream_dtype=None):
+        dev = self.main_device
+        wdev = self.wte.weight.device
+        x = F.embedding(idx.to(wdev), self.wte.weight)
+        if x.device != dev:
+            x = x.to(dev)
 
-        first_dev = self._block_device(0) if len(self.blocks) else self.cpu_device
-        if x.device != first_dev:
-            x = x.to(first_dev)
-        cur_dev = x.device
+        if dev.type == 'cpu':
+            cos, sin = self.freqs_cos_cpu, self.freqs_sin_cpu
+        else:
+            cos, sin = self.freqs_cos_main, self.freqs_sin_main
 
         for i, block in enumerate(self.blocks):
-            target = self._block_device(i)
-            if target != cur_dev:
-                x = x.to(target)
-                cur_dev = target
-
-            cos, sin = ((self.freqs_cos_cpu, self.freqs_sin_cpu)
-                        if cur_dev == self.cpu_device
-                        else (self.freqs_cos_main, self.freqs_sin_main))
-
-            if use_ckpt:
-                x = checkpoint(block, x, cos, sin, use_chunked, use_reentrant=False)
+            if dev.type == 'cpu' or i in self.gpu_layer_set:
+                if use_ckpt:
+                    x = checkpoint(block, x, cos, sin, use_chunked,
+                                   use_reentrant=False, preserve_rng_state=False)
+                else:
+                    x = block(x, cos, sin, use_chunked)
             else:
-                x = block(x, cos, sin, use_chunked)
-
-        head_dev = self.ln_f.weight.device
-        if x.device != head_dev:
-            x = x.to(head_dev)
+                # Streamed blocks must be checkpointed, otherwise autograd would
+                # keep every block's device copy alive until backward.
+                x = checkpoint(_streamed_block, block, dev, stream_dtype, x, cos, sin, use_chunked,
+                               use_reentrant=False, preserve_rng_state=False)
         return self.ln_f(x)
 
     def forward(self, idx, use_chunked=True, use_ckpt=True):
-        return self.lm_head(self.forward_features(idx, use_chunked, use_ckpt))
+        return F.linear(self.forward_features(idx, use_chunked, use_ckpt), self.head_weight())
 
     def get_base_weights(self):
         return np.concatenate([
@@ -1804,45 +1852,34 @@ def fetch_task(srv, h, prec, se, emit):
 # =========================================================================
 # Loss + training step + degrade ladder
 # =========================================================================
-def _chunk_ce(m, xs, ys):
-    return F.cross_entropy(m.lm_head(xs).reshape(-1, VOCAB_SIZE), ys.reshape(-1))
+def _chunk_ce(xs, w, ys):
+    logits = F.linear(xs.to(w.dtype), w)
+    return F.cross_entropy(logits.reshape(-1, VOCAB_SIZE).float(), ys.reshape(-1))
 
 
 def _fwl(m, x, y, sl, ua, ad, ls=1.0, preview=False, loss_chunk=LOSS_CHUNK):
-    use_ckpt = (m.gpu_layers > 0) and (m.main_device.type == 'cuda')
-
-    def fwd():
-        return m.forward_features(x, use_chunked=True, use_ckpt=use_ckpt)
-
+    # Everything (blocks, head, loss) is computed on m.main_device. Weights whose
+    # master copy lives in RAM are streamed in; see SotaGPT / _streamed_block.
+    sd = ad if ua else None
     nc = max(1, math.ceil(sl / loss_chunk))
 
-    if ua:
-        with torch.autocast(device_type='cuda', dtype=ad):
-            xe = fwd()
-            head_dev = m.lm_head.weight.device
-            if xe.device != head_dev:
-                xe = xe.to(head_dev)
-            y_dev = y.to(head_dev)
-            lo = sum(
-                checkpoint(_chunk_ce, m,
-                           xe[:, i:i + loss_chunk, :],
-                           y_dev[:, i:i + loss_chunk],
-                           use_reentrant=False)
-                for i in range(0, sl, loss_chunk)
-            ) / nc
-    else:
-        xe = fwd()
-        head_dev = m.lm_head.weight.device
-        if xe.device != head_dev:
-            xe = xe.to(head_dev)
-        y_dev = y.to(head_dev)
+    def compute():
+        xe = m.forward_features(x, use_chunked=True, use_ckpt=True, stream_dtype=sd)
+        w = m.head_weight(sd)                      # one copy per micro-step, reused by all chunks
+        y_dev = y.to(xe.device)
         lo = sum(
-            checkpoint(_chunk_ce, m,
-                       xe[:, i:i + loss_chunk, :],
-                       y_dev[:, i:i + loss_chunk],
-                       use_reentrant=False)
+            checkpoint(_chunk_ce,
+                       xe[:, i:i + loss_chunk, :], w, y_dev[:, i:i + loss_chunk],
+                       use_reentrant=False, preserve_rng_state=False)
             for i in range(0, sl, loss_chunk)
         ) / nc
+        return lo, xe, w
+
+    if ua:
+        with torch.autocast(device_type=m.main_device.type, dtype=ad):
+            lo, xe, w = compute()
+    else:
+        lo, xe, w = compute()
 
     cards = []
     if preview:
@@ -1861,8 +1898,8 @@ def _fwl(m, x, y, sl, ua, ad, ls=1.0, preview=False, loss_chunk=LOSS_CHUNK):
                     start = max(0, p - 9)
                     ctx_ids = x[b, start:p + 1].tolist()
                     target_id = int(y[b, p].item())
-                    hidden = xe[b, p, :].unsqueeze(0).to(m.lm_head.weight.dtype)
-                    logits = m.lm_head(hidden).float()
+                    hidden = xe[b, p, :].unsqueeze(0).to(w.dtype)
+                    logits = F.linear(hidden, w).float()
                     probs = torch.softmax(logits[0], dim=-1)
                     prob, pred = torch.max(probs, dim=0)
                     pred_id = int(pred.item())
@@ -1893,54 +1930,79 @@ def _clear_accel_cache(device):
     try:
         if device is not None and device.type == 'cuda':
             torch.cuda.empty_cache()
+        elif device is not None and device.type == 'xpu':
+            torch.xpu.empty_cache()
     except Exception:
         pass
     gc.collect()
 
 
 class DegradeLadder:
+    """
+    OOM response, cheapest first. Each rung moves *storage* from the accelerator
+    to system RAM (compute stays on the accelerator) until the very last rung.
+    Rungs that would change nothing are skipped.
+    """
+
     def __init__(self, model, on_step_down=None):
         self.model = model
         self.stage = 0
-        self.loss_chunk = min(LOSS_CHUNK, 128) if model.backend_name == 'ROCM' else LOSS_CHUNK
+        self.loss_chunk = (
+            min(256, 128)
+            if model.backend_name == "ROCM"
+            else LOSS_CHUNK
+        )
         self.on_step_down = on_step_down
 
     def step_down(self, emit) -> bool:
-        self.stage += 1
         m = self.model
-
-        if self.stage == 1:
-            emit('log', "🔻 VRAM rung 1: force head (wte/lm_head/ln_f) → CPU")
-            m.force_head_cpu()
-        elif self.stage == 2:
-            cur = m.gpu_layers
-            nxt = max(0, cur // 2)
-            emit('log', f"🔻 VRAM rung 2: GPU blocks {cur} → {nxt}")
-            m.set_gpu_layers(nxt)
-        elif self.stage == 3:
-            emit('log', "🔻 VRAM rung 3: all blocks → CPU")
-            m.set_gpu_layers(0)
-        elif self.stage == 4:
-            old = self.loss_chunk
-            self.loss_chunk = max(32, old // 2)
-            emit('log', f"🔻 VRAM rung 4: LOSS_CHUNK {old} → {self.loss_chunk}")
-        elif self.stage == 5:
-            old = self.loss_chunk
-            self.loss_chunk = max(16, old // 2)
-            emit('log', f"🔻 VRAM rung 5: LOSS_CHUNK {old} → {self.loss_chunk}")
-        elif self.stage == 6:
-            emit('log', "🔻 VRAM rung 6: hard fallback — CPU-only model")
-            m.to_cpu_only()
-            self.loss_chunk = 16
-        else:
-            return False
+        while True:
+            self.stage += 1
+            s = self.stage
+            if s == 1:
+                if not m.head_on_gpu:
+                    continue
+                emit('log', "🔻 VRAM rung 1: head weights → system RAM (streamed per step)")
+                m.force_head_cpu()
+            elif s == 2:
+                if m.gpu_layers <= 0:
+                    continue
+                cur, nxt = m.gpu_layers, m.gpu_layers // 2
+                emit('log', f"🔻 VRAM rung 2: resident blocks {cur} → {nxt} (rest streamed)")
+                m.set_gpu_layers(nxt)
+            elif s == 3:
+                if m.gpu_layers <= 0:
+                    continue
+                emit('log', "🔻 VRAM rung 3: all blocks streamed from system RAM")
+                m.set_gpu_layers(0)
+            elif s == 4:
+                old, new = self.loss_chunk, max(32, self.loss_chunk // 2)
+                if new == old:
+                    continue
+                self.loss_chunk = new
+                emit('log', f"🔻 VRAM rung 4: LOSS_CHUNK {old} → {new}")
+            elif s == 5:
+                old, new = self.loss_chunk, max(16, self.loss_chunk // 2)
+                if new == old:
+                    continue
+                self.loss_chunk = new
+                emit('log', f"🔻 VRAM rung 5: LOSS_CHUNK {old} → {new}")
+            elif s == 6:
+                if m.main_device.type == 'cpu':
+                    return False
+                emit('log', "🔻 VRAM rung 6: hard fallback — CPU-only model")
+                m.to_cpu_only()
+                self.loss_chunk = 16
+            else:
+                return False
+            break
 
         if self.on_step_down is not None:
             try:
                 self.on_step_down(self)
             except Exception as e:
                 log.warning(f"on_step_down failed: {e}")
-        _clear_accel_cache(m.main_device)
+        _clear_accel_cache(m.accel_device)
         return True
 
 
@@ -1954,8 +2016,8 @@ def _train_step_safe(model, x, y, sl, ua, ad, ls, preview, ladder, emit):
         except RuntimeError as e:
             if not _is_oom(e):
                 raise
-            emit('log', f"[ROCM-FIX] OOM during step: {str(e)[:220]}")
-            _clear_accel_cache(model.main_device)
+            emit('log', f"💥 OOM detected: {str(e).splitlines()[0]}")
+            _clear_accel_cache(model.accel_device)
             if not ladder.step_down(emit):
                 emit('log', "💀 OOM even at CPU-only — this is a bug, not VRAM.")
                 raise
@@ -2085,19 +2147,126 @@ def _build_model(bn, device, iw, ie, emit, bs=1, sl=MAX_SEQ_LEN):
     return model
 
 
+class _MultiOpt:
+    """Several optimizers behind one zero_grad()/step() (one per device group)."""
+
+    def __init__(self, opts):
+        self.opts = [o for o in opts if o is not None]
+
+    def zero_grad(self, set_to_none=True):
+        for o in self.opts:
+            o.zero_grad(set_to_none=set_to_none)
+
+    def step(self):
+        for o in self.opts:
+            o.step()
+
+
 def _build_optimizers(model, lr=1e-4):
+    """
+    One optimizer per storage device, so streamed (CPU-resident) weights are
+    never handed to an accelerator-only optimizer such as bitsandbytes.
+    """
     bp = [p for n, p in model.named_parameters() if not n.startswith('engram.')]
     ep = list(model.engram.parameters())
-    try:
-        import bitsandbytes as bnb
-        ob = bnb.optim.AdamW8bit(bp, lr=lr, betas=(0.9, 0.95), weight_decay=0.01)
-    except Exception:
-        ob = torch.optim.AdamW(bp, lr=lr, betas=(0.9, 0.95), weight_decay=0.01)
+
+    groups = {}
+    for p in bp:
+        groups.setdefault(p.device.type, []).append(p)
+
+    opts = []
+    for dev_type, ps in groups.items():
+        o = None
+        if dev_type == 'cuda':
+            try:
+                import bitsandbytes as bnb
+                o = bnb.optim.AdamW8bit(ps, lr=lr, betas=(0.9, 0.95), weight_decay=0.01)
+            except Exception:
+                o = None
+        if o is None:
+            kw = {} if dev_type in ('cpu', 'cuda') else {"foreach": False}
+            o = torch.optim.AdamW(ps, lr=lr, betas=(0.9, 0.95), weight_decay=0.01, **kw)
+        opts.append(o)
+    ob = _MultiOpt(opts)
+
     try:
         oe = torch.optim.SparseAdam(ep, lr=lr)
     except Exception:
         oe = torch.optim.AdamW(ep, lr=lr, weight_decay=0.01)
     return ob, oe
+
+
+def _trim_heap():
+    """Return freed memory to the OS (glibc keeps it otherwise, so RSS never drops)."""
+    gc.collect()
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
+
+
+def _to_bf16_exact(arr):
+    """
+    fp32 numpy -> bf16 tensor. Lossless here: every initial weight originates
+    from a bf16 file/stream, so it is exactly representable. Halves the memory
+    of the 'initial weights' copies kept for computing the delta.
+    """
+    return torch.from_numpy(arr).to(torch.bfloat16)
+
+
+def _base_delta_bf16(model, iw_bf16):
+    """Delta (current - initial) of all non-engram params, written per-tensor into one bf16 buffer."""
+    out = torch.empty(iw_bf16.numel(), dtype=torch.bfloat16)
+    o = 0
+    for n, p in model.named_parameters():
+        if n.startswith('engram.'):
+            continue
+        s = p.numel()
+        cur = p.detach().to('cpu', torch.float32).reshape(-1)
+        out[o:o + s] = cur - iw_bf16[o:o + s].float()
+        o += s
+    if o != iw_bf16.numel():
+        raise RuntimeError(f"delta size mismatch: {o} vs {iw_bf16.numel()}")
+    return out.view(torch.int16).numpy().view(np.uint16)
+
+
+def _engram_sparse_delta(table, iew_bf16, frac=0.10, chunk=32768):
+    """Top-`frac` changed rows of the engram table, without materialising the full delta."""
+    n = table.shape[0]
+    rn = torch.empty(n)
+    for i in range(0, n, chunk):
+        rn[i:i + chunk] = (table[i:i + chunk] - iew_bf16[i:i + chunk].float()).abs().sum(dim=1)
+    k = max(1, int(n * frac))
+    tv, ti = torch.topk(rn, k)
+    ai = ti[tv > 1e-8]
+    if len(ai) == 0:
+        return np.array([], dtype=np.uint32), np.array([], dtype=np.uint16)
+    sv = (table[ai] - iew_bf16[ai].float()).to(torch.bfloat16).view(torch.int16).numpy().view(np.uint16)
+    return ai.numpy().astype(np.uint32), sv
+
+
+def _gzip_stream(header_bytes, arrays, level=6, piece=64 * 1024 * 1024):
+    """gzip header + arrays piecewise (no giant concatenated intermediate bytes object)."""
+    buf = io.BytesIO()
+    with gzip.GzipFile(fileobj=buf, mode='wb', compresslevel=level) as gz:
+        gz.write(header_bytes)
+        for a in arrays:
+            mv = memoryview(np.ascontiguousarray(a)).cast('B')
+            for i in range(0, len(mv), piece):
+                gz.write(mv[i:i + piece])
+    return buf.getvalue()
+
+
+def _pick_autocast(backend):
+    """bf16 autocast where the backend supports it; (use_autocast, dtype)."""
+    try:
+        if backend in ("CUDA", "ROCM") and torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+            return True, torch.bfloat16
+        if backend == "XPU" and hasattr(torch, "xpu") and torch.xpu.is_bf16_supported():
+            return True, torch.bfloat16
+    except Exception:
+        pass
+    return False, None
 
 
 # =========================================================================
@@ -2182,18 +2351,6 @@ def run_single_round_wrapper(srv, at, se, emit):
             at,
         )
         bs = recommend_batch_size(sl)
-        if train_backend == 'ROCM':
-            # The original memory estimator chooses bs=16 on RX 7800 XT.
-            # This is too aggressive for 24 blocks + BF16 + backward in practice.
-            # Keep ROCm conservative until we have a successful completed round.
-            try:
-                rocm_bs_cap = max(1, min(8, int(os.environ.get('CROWDGPT_ROCM_BATCH', '1'))))
-            except ValueError:
-                rocm_bs_cap = 1
-            bs = min(bs, rocm_bs_cap)
-            emit('log', f"[ROCM-FIX] Using {torch.cuda.get_device_name(train_device.index or 0)} "
-                        f"(cuda:{train_device.index or 0}); initial batch={bs}, "
-                        f"cap={rocm_bs_cap} (was automatic {recommend_batch_size(sl)}).")
 
         model = None
         while bs >= 1:
@@ -2219,6 +2376,13 @@ def run_single_round_wrapper(srv, at, se, emit):
             emit('log', "Failed to initialize model.")
             return
 
+        # The initial-weight copies are only needed to compute the delta at the
+        # end. Keep them as exact bf16 (half the RAM) and drop the fp32 arrays.
+        iw = _to_bf16_exact(iw)
+        iew = _to_bf16_exact(ie)
+        ie = None
+        _trim_heap()
+
         mbt = bs * sl
         as_ = max(1, round(131072 / mbt))
         ls = 1.0 / as_
@@ -2232,10 +2396,7 @@ def run_single_round_wrapper(srv, at, se, emit):
 
         ladder = DegradeLadder(model, on_step_down=_on_step_down)
 
-        iew = model.engram.table.weight.data.cpu().clone()
-
-        ua = train_backend in ("CUDA", "ROCM") and torch.cuda.is_bf16_supported()
-        ad = torch.bfloat16 if ua else None
+        ua, ad = _pick_autocast(train_backend)
 
         emit('log', f"Backend: {train_backend} | autocast: {ua} | "
                    f"bs={bs} | accum={as_} | dtype={'bf16' if ua else 'fp32'}")
@@ -2408,14 +2569,28 @@ def run_single_round_wrapper(srv, at, se, emit):
         fl = float(lval) if lval else 10.0
         emit('log', f"Done: {micro_step} micro-steps, loss {fl:.4f}")
         emit('status', 'uploading')
-        dbf = torch.from_numpy(model.get_base_weights() - iw).to(torch.bfloat16).view(torch.uint16).numpy()
-        ed = model.engram.table.weight.data.cpu() - iew
-        rn = ed.abs().sum(dim=1)
-        k = max(1, int(len(rn) * 0.10))
-        tv, ti = torch.topk(rn, k)
-        ai = ti[tv > 1e-8]
-        si = ai.cpu().numpy().astype(np.uint32) if len(ai) else np.array([], dtype=np.uint32)
-        sv = ed[ai].to(torch.bfloat16).view(torch.uint16).numpy() if len(ai) else np.array([], dtype=np.uint16)
+
+        # 1) Drop everything training needed but the delta does not: optimizer
+        #    state (GBs), grads, the ladder (holds a model reference).
+        for _o in (ob, oe):
+            try:
+                _o.zero_grad(set_to_none=True)
+            except Exception:
+                pass
+        ob = oe = ladder = None
+        for _p in model.parameters():
+            _p.grad = None
+        _clear_accel_cache(train_device)
+        _trim_heap()
+
+        # 2) Streaming delta: one preallocated bf16 buffer, no fp32 concatenation.
+        dbf = _base_delta_bf16(model, iw)
+        iw = None
+        si, sv = _engram_sparse_delta(model.engram.table.weight.data, iew)
+        iew = None
+        model = None                         # weights (CPU + accelerator) no longer needed
+        _clear_accel_cache(train_device)
+        _trim_heap()
         has_engram = bool(len(si) > 0)
         engram_sparse_count = int(len(si))
         pl = json.dumps({
@@ -2423,11 +2598,11 @@ def run_single_round_wrapper(srv, at, se, emit):
             "loraRank": 0, "isDelta": True, "weightFormat": "bf16",
             "hasEngram": has_engram, "engramSparseCount": engram_sparse_count,
         }).encode()
-        bi = struct.pack('<I', len(pl)) + pl + np.ascontiguousarray(dbf).tobytes() + np.ascontiguousarray(si).tobytes() + np.ascontiguousarray(sv).tobytes()
-        compressed_data = gzip.compress(bi, compresslevel=6)
+        # 3) Compress piecewise: no giant intermediate bytes object.
+        compressed_data = _gzip_stream(struct.pack('<I', len(pl)) + pl, (dbf, si, sv))
         upload_size_mb = len(compressed_data) / (1024 * 1024)
-        del dbf, ed, si, sv, pl, bi
-        gc.collect()
+        del dbf, si, sv, pl
+        _trim_heap()
         meta = {
             "taskId": tid, "loss": fl, "localSteps": micro_step, "tokensProcessed": tt,
             "loraRank": 0, "isDelta": True, "weightFormat": "bf16",
@@ -2929,22 +3104,22 @@ def startup():
         pass
 
 
-def _create_window_safe(title, html, icon_path, kwargs):
-    usable = False
-    if icon_path and os.path.exists(icon_path):
-        low = icon_path.lower()
-        if low.endswith((".png", ".ico", ".jpg", ".jpeg", ".gif", ".bmp", ".tiff", ".webp")):
-            usable = True
-    if usable:
-        try:
-            return webview.create_window(title, html=html, icon=icon_path, **kwargs)
-        except Exception as e:
-            log.warning(f"[icon] create_window(icon=...) failed, retrying without: {e}")
+def _create_window_safe(title, html, kwargs):
+    # NB: create_window() has no `icon` argument (passing one raises TypeError, which
+    # is why the Linux icon silently vanished). The icon goes to webview.start().
     try:
         return webview.create_window(title, html=html, **kwargs)
     except TypeError:
         kwargs.pop("min_size", None)
         return webview.create_window(title, html=html, **kwargs)
+
+
+def _start_icon_kwargs():
+    """Window icon for webview.start(): GTK/Qt only (Windows is handled natively in startup())."""
+    if sys.platform == "win32" or not ICON_PATH or not os.path.exists(ICON_PATH):
+        return {}
+    log.info(f"[icon] passing icon to webview.start: {ICON_PATH}")
+    return {"icon": ICON_PATH}
 
 
 if __name__ == "__main__":
@@ -2971,6 +3146,9 @@ if __name__ == "__main__":
                     .replace("__LOGO_DARK__", LOGO_URI_DARK)
                     .replace("__VERSION__", CLIENT_VERSION))
 
-    window = _create_window_safe("CrowdGPT", html_out, ICON_PATH, kwargs)
+    window = _create_window_safe("CrowdGPT", html_out, kwargs)
     api.window = window
-    webview.start(startup, debug=False)
+    try:
+        webview.start(startup, debug=False, **_start_icon_kwargs())
+    except TypeError:                      # very old pywebview without start(icon=...)
+        webview.start(startup, debug=False)

@@ -9,9 +9,10 @@ Memory-safety guarantees:
     instead of a driver-level failure.
   * The batch/placement estimator counts weights, grads, optimizer state,
     activations, loss chunks, and an allocator reserve.
-  * A DegradeLadder reacts to any OOM by moving work to CPU (head, then blocks,
-    then everything) and retrying the same micro-batch. The bottom rung has
-    zero accelerator allocations, so VRAM OOM is physically impossible there.
+  * A DegradeLadder reacts to any OOM by moving weight *storage* to system RAM
+    (head, then blocks; compute stays on the accelerator and the weights are
+    streamed in per use) and retrying the same micro-batch. The bottom rung is
+    CPU-only, which has zero accelerator allocations.
   * Calibration is bounded by wall-clock time and step count so slow hardware
     does not hang in "Calibrating" for hours.
 
@@ -299,6 +300,9 @@ HEAD_DIM = MODEL_CONFIG["headDim"]
 MAX_SEQ_LEN = MODEL_CONFIG["maxSeqLen"]
 MLP_HIDDEN = MODEL_CONFIG["mlpHidden"]
 ENG_NUM_BUCKETS = 227865
+# The engram table is never read by SotaGPT.forward_features, so it gets no gradients and
+# its delta is always empty. While that holds, don't allocate/load/diff its 1.4 GB.
+ENGRAM_ACTIVE = False
 LOSS_CHUNK = 256
 UPLOAD_BUFFER_MIN = 25
 ALLOWED_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64, 128]
@@ -898,6 +902,32 @@ def auto_detect_vram_budget():
         pass
 
 
+def apply_vram_override(user_gb=0.0):
+    """
+    Cap how much VRAM the placement planner may fill. Priority: the UI dropdown, then
+    the CROWDGPT_VRAM_GB env var; 0 / unset = Auto (everything the card has free).
+    Lower = less VRAM used, more weights streamed from RAM (slower). Applied each round.
+    """
+    if "auto_gb" not in memory_config:          # budget not detected yet (before first Start)
+        return
+    auto = float(memory_config["auto_gb"])
+    cap, src = 0.0, ""
+    try:
+        if user_gb and float(user_gb) > 0:
+            cap, src = float(user_gb), "UI"
+        else:
+            v = os.environ.get("CROWDGPT_VRAM_GB", "").strip()
+            if v and float(v) > 0:
+                cap, src = float(v), "CROWDGPT_VRAM_GB"
+    except ValueError:
+        log.warning("[VRAM-BUDGET] ignoring invalid VRAM limit")
+    new = min(auto, cap) if cap > 0 else auto
+    memory_config["ram_gb"] = round(new, 2)
+    if cap > 0:
+        memory_config["is_auto_detected"] = False
+        log.info(f"[VRAM-BUDGET] limit {cap:.1f} GB ({src}) → placement budget {new:.2f} GB (auto {auto:.2f} GB)")
+
+
 def has_bitsandbytes():
     try:
         import bitsandbytes
@@ -940,7 +970,7 @@ def estimate_vram_bytes(bs, sl, u8):
 
 
 def recommend_batch_size(sl=MAX_SEQ_LEN):
-    u8 = has_bitsandbytes()
+    u8 = has_bitsandbytes() and train_backend in ("CUDA", "ROCM")
     budget = int(memory_config["ram_gb"] * 1024**3)
     best = 1
     for bs in ALLOWED_BATCH_SIZES:
@@ -950,11 +980,7 @@ def recommend_batch_size(sl=MAX_SEQ_LEN):
             break
 
     if train_backend == "ROCM":
-        rocm_bs_cap = max(
-            1, min(8, int(os.environ.get(
-                "CROWDGPT_ROCM_BATCH", 1
-            )))
-        )
+        rocm_bs_cap = max(1, min(8, int(os.environ.get("CROWDGPT_ROCM_BATCH", 1))))
         best = min(best, rocm_bs_cap)
 
     log.info(f"[BATCH] recommended bs={best} for budget={memory_config['ram_gb']:.2f}GB "
@@ -962,37 +988,69 @@ def recommend_batch_size(sl=MAX_SEQ_LEN):
     return best
 
 
-def _plan_gpu_layers(device, backend_name, budget_gb, bs=1, sl=MAX_SEQ_LEN,
-                     use_ckpt=True, u8=False):
+def _plan_placement(device, backend_name, budget_gb, bs=1, sl=MAX_SEQ_LEN,
+                    u8=False, loss_chunk=LOSS_CHUNK):
+    """
+    Decide where the *master copy* of each tensor lives. All compute (blocks,
+    head, loss) always runs on the accelerator; only storage differs:
+
+      * resident blocks / head : weights + grads + optimizer state on the accelerator
+      * streamed blocks / head : master copy in system RAM, copied to the
+                                 accelerator for each use (grads are copied back
+                                 by autograd, the optimizer step runs on the CPU)
+
+    Blocks are made resident first (their weights are streamed 3x per
+    micro-step: forward, recompute, grads; the head only 2x). The head becomes
+    resident only if every block fits as well. With a small budget the loss chunk
+    (logits buffer) is shrunk first, which costs almost no speed.
+
+    Returns (head_on_gpu, n_resident_blocks, loss_chunk).
+    """
+    if backend_name == "ROCM":
+        loss_chunk = min(loss_chunk, 128)
     if device is None or device.type == "cpu":
-        return 0
+        return False, 0, loss_chunk
 
-    budget = int(max(0.0, budget_gb) * 1024**3)
-    reserve = int(ALLOCATOR_RESERVE_GB * 1024**3)
-    usable = max(0, budget - reserve)
-    if usable <= 0:
-        log.info(f"[PLACEMENT] {backend_name}: budget {budget_gb:.2f}GB "
-                 f"≤ reserve {ALLOCATOR_RESERVE_GB:.2f}GB → 0 blocks on GPU")
-        return 0
-
+    GB = 1024 ** 3
+    cd = 2 if device.type in ("cuda", "xpu") else 4      # bytes/param of a streamed copy
+    budget = int(max(0.0, budget_gb) * GB)
     per_block = _bytes_per_block_params()
-    weights   = per_block * 4
-    grads     = per_block * 4
-    adam      = per_block * (2 if u8 else 8)
+    head_params = VOCAB_SIZE * DIM
+    opt_b = 2 if u8 else 8
 
-    act = bs * sl * DIM * 4 * (1 if use_ckpt else 10)
+    def fixed_cost(lc):
+        return (
+            N_LAYERS * bs * sl * DIM * 4                  # checkpointed block inputs
+            + bs * sl * (DIM * 12 + MLP_HIDDEN * 3) * 4   # one block's recompute workspace
+            + per_block * cd * 2                          # one streamed block (weights + grads)
+            + bs * lc * VOCAB_SIZE * 4 * 3                # loss-chunk logits (+ fp32 copy + grad)
+            + int(ALLOCATOR_RESERVE_GB * GB)
+        )
 
-    per_block_total = weights + grads + adam + act
-    n = int(usable // per_block_total) if per_block_total > 0 else 0
-    n = max(0, min(N_LAYERS, n))
+    blk_res = per_block * (4 + 4 + opt_b)
+    head_res = head_params * (4 + 4 + opt_b)
+    head_stream = head_params * cd * 2
 
-    if backend_name == "DIRECTML":
-        n = min(n, 2)
+    lc = loss_chunk
+    while lc > 32 and budget - fixed_cost(lc) <= head_stream:
+        lc //= 2
+    fixed = fixed_cost(lc)
+    remaining = budget - fixed
 
-    log.info(f"[PLACEMENT] {backend_name}: budget={budget_gb:.2f}GB "
-             f"reserve={ALLOCATOR_RESERVE_GB:.2f}GB per_blk={per_block_total/1024**2:.1f}MB "
-             f"ckpt={use_ckpt} bs={bs} u8={u8} → {n}/{N_LAYERS} blocks on GPU")
-    return n
+    head_gpu, n = False, 0
+    if remaining > head_stream:
+        n = int((remaining - head_stream) // blk_res)
+        n = max(0, min(N_LAYERS, n))
+        if n == N_LAYERS and remaining >= N_LAYERS * blk_res + head_res:
+            head_gpu = True
+
+    if backend_name == "DIRECTML":          # conservative: unknown real VRAM, flaky allocator
+        head_gpu, n = False, min(n, 2)
+
+    log.info(f"[PLACEMENT] {backend_name}: budget={budget_gb:.2f}GB fixed={fixed/GB:.2f}GB "
+             f"blk_res={blk_res/1024**2:.0f}MB head_res={head_res/GB:.2f}GB bs={bs} u8={u8} "
+             f"loss_chunk={lc} → {n}/{N_LAYERS} blocks resident, head {'resident' if head_gpu else 'streamed'}")
+    return head_gpu, n, lc
 
 
 def precompute_freqs(dim, sl, dev):
@@ -1045,6 +1103,8 @@ class GroupedQueryAttention(nn.Module):
         self.wo = nn.Linear(DIM, DIM, bias=False)
 
     def forward(self, x, cos, sin, use_chunked=True):
+        # `use_chunked` is kept for call-compatibility; attention now always uses
+        # the fused SDPA kernel (flash / mem-efficient on GPU, tiled on CPU).
         B, T, C = x.size()
         q = self.wq(x).view(B, T, self.nh, HEAD_DIM).transpose(1, 2)
         k = self.wk(x).view(B, T, self.nkv, HEAD_DIM).transpose(1, 2)
@@ -1054,45 +1114,41 @@ class GroupedQueryAttention(nn.Module):
         k = k * ct + rotate_half(k) * st
         k = k.unsqueeze(2).expand(B, self.nkv, self.nrep, T, HEAD_DIM).reshape(B, self.nh, T, HEAD_DIM)
         v = v.unsqueeze(2).expand(B, self.nkv, self.nrep, T, HEAD_DIM).reshape(B, self.nh, T, HEAD_DIM)
-        if use_chunked:
-            # Windows TheRock / HIP: fused SDPA avoids thousands of small
-            # attention matmuls and their memory overhead at sequence 2048.
-            if (q.device.type == 'cuda' and getattr(torch.version, 'hip', None)
-                    and os.environ.get('CROWDGPT_ROCM_SDPA', '1') != '0'):
+        if q.dtype != v.dtype or k.dtype != v.dtype:
+            q, k = q.to(v.dtype), k.to(v.dtype)
+        if _is_directml(q):
+            # DirectML lacks a usable fused attention; do just this op on the CPU.
+            o = F.scaled_dot_product_attention(
+                q.contiguous().cpu(), k.contiguous().cpu(), v.contiguous().cpu(),
+                is_causal=True).to(q.device)
+        elif q.device.type == 'cuda' and getattr(torch.version, 'hip', None):
+            # Windows TheRock / HIP: fused SDPA, but keep the original chunked attention as a
+            # safety net (and a kill-switch: CROWDGPT_ROCM_SDPA=0) in case a kernel is missing.
+            if os.environ.get('CROWDGPT_ROCM_SDPA', '1') != '0':
                 try:
-                    a = F.scaled_dot_product_attention(q, k, v,
-                                                       dropout_p=0.0, is_causal=True)
-                    return self.wo(a.transpose(1, 2).contiguous().view(B, T, C))
+                    o = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=True)
                 except RuntimeError as exc:
                     if _is_oom(exc):
                         raise
-                    log.warning(f"[ROCM-FIX] SDPA unavailable, using original attention: {exc}")
-            return self._chunked(q, k, v, B, T, C)
-        a = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(HEAD_DIM))
-        a = a.masked_fill(torch.tril(torch.ones(T, T, device=x.device)).view(1, 1, T, T) == 0, float('-inf'))
-        a = F.softmax(a, dim=-1, dtype=torch.float32).to(q.dtype)
-        return self.wo((a @ v).transpose(1, 2).contiguous().view(B, T, C))
-
-    def _chunked(self, q, k, v, B, T, C, cs=64):
-        use_cpu = _is_directml(q)
-        if use_cpu:
-            q_ = q.contiguous().cpu()
-            k_ = k.contiguous().cpu()
-            v_ = v.contiguous().cpu()
+                    log.warning(f"[ROCM-FIX] SDPA unavailable, using chunked attention: {exc}")
+                    o = self._chunked_attn(q, k, v, T)
+            else:
+                o = self._chunked_attn(q, k, v, T)
         else:
-            q_, k_, v_ = q, k, v
+            o = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        return self.wo(o.transpose(1, 2).contiguous().view(B, T, C))
+
+    def _chunked_attn(self, q, k, v, T, cs=64):
+        """Original causal attention in 64-row chunks (slow; fallback only). Returns (B, nh, T, hd)."""
         chunks = []
         for i in range(0, T, cs):
             e = min(i + cs, T)
-            aw = (q_[:, :, i:e, :] @ k_[:, :, :e, :].transpose(-2, -1)) * (1.0 / math.sqrt(HEAD_DIM))
-            ri = torch.arange(i, e, device=q_.device).unsqueeze(1)
-            ci = torch.arange(e, device=q_.device).unsqueeze(0)
+            aw = (q[:, :, i:e, :] @ k[:, :, :e, :].transpose(-2, -1)) * (1.0 / math.sqrt(HEAD_DIM))
+            ri = torch.arange(i, e, device=q.device).unsqueeze(1)
+            ci = torch.arange(e, device=q.device).unsqueeze(0)
             aw = aw.masked_fill(~(ci <= ri).unsqueeze(0).unsqueeze(0), float('-inf'))
-            chunks.append(F.softmax(aw, dim=-1, dtype=torch.float32).to(q_.dtype) @ v_[:, :, :e, :])
-        out = torch.cat(chunks, dim=2).transpose(1, 2).contiguous().view(B, T, C)
-        if use_cpu:
-            out = out.to(q.device)
-        return self.wo(out)
+            chunks.append(F.softmax(aw, dim=-1, dtype=torch.float32).to(q.dtype) @ v[:, :, :e, :])
+        return torch.cat(chunks, dim=2)
 
 
 class SwiGLU(nn.Module):
@@ -1123,7 +1179,8 @@ class EngramMemory(nn.Module):
     def __init__(self, bn, device):
         super().__init__()
         self.device = device
-        self.table = nn.Embedding(ENG_NUM_BUCKETS, DIM, sparse=True).to('cpu')
+        rows = ENG_NUM_BUCKETS if ENGRAM_ACTIVE else 1
+        self.table = nn.Embedding(rows, DIM, sparse=True).to('cpu')
         nn.init.normal_(self.table.weight, mean=0.0, std=0.02)
 
     def forward(self, idx):
@@ -1170,11 +1227,12 @@ class SotaGPT(nn.Module):
         is_cpu = (device is None) or (device.type == 'cpu')
 
         if gpu_layers is None:
-            head_gpu, gpu_layers = _plan_placement(
+            head_gpu, gpu_layers, self.loss_chunk_hint = _plan_placement(
                 device, bn, memory_config["ram_gb"], bs=bs, sl=sl,
-                u8=(has_bitsandbytes() and device is not None and device.type == 'cuda'))
+                u8=(has_bitsandbytes() and device is not None and device.type in ('cuda',)))
         else:
             head_gpu = int(gpu_layers) >= N_LAYERS
+            self.loss_chunk_hint = LOSS_CHUNK
 
         self.gpu_layers = 0 if is_cpu else max(0, min(N_LAYERS, int(gpu_layers)))
         self.gpu_layer_set = set(range(self.gpu_layers))
@@ -1257,12 +1315,20 @@ class SotaGPT(nn.Module):
             return w.to(dtype)
         return w
 
-    def forward_features(self, idx, use_chunked=True, use_ckpt=True, stream_dtype=None):
+    def forward_features(self, idx, use_chunked=True, use_ckpt=True, stream_dtype=None, head_w=None):
         dev = self.main_device
         wdev = self.wte.weight.device
-        x = F.embedding(idx.to(wdev), self.wte.weight)
-        if x.device != dev:
-            x = x.to(dev)
+        if head_w is not None and not self.head_on_gpu and head_w.device == dev:
+            # Streamed head: look the embeddings up in the device copy that the loss uses
+            # anyway. Its gradient then accumulates on the device and crosses the bus once,
+            # instead of a dense ~0.9 GB zero tensor + index_add on the CPU every micro-step.
+            x = F.embedding(idx.to(dev), head_w)
+            if x.dtype != torch.float32:
+                x = x.float()
+        else:
+            x = F.embedding(idx.to(wdev), self.wte.weight)
+            if x.device != dev:
+                x = x.to(dev)
 
         if dev.type == 'cpu':
             cos, sin = self.freqs_cos_cpu, self.freqs_sin_cpu
@@ -1727,13 +1793,17 @@ def _load_safetensors_flat(path, expected_numel, label="weights"):
         t = next(iter(tensors.values()))
     else:
         raise RuntimeError(f"{label}: cannot identify tensor key. keys={list(tensors.keys())[:20]}")
-    arr = t.to(torch.float32).contiguous().clone().cpu().numpy()
-    del tensors, t
+    # Keep the file's own dtype (bf16 -> half the RAM of the old fp32 numpy copies,
+    # and no 2.6 GB + 2.6 GB temporaries while loading). Anything exotic goes to fp32.
+    t = t.contiguous().reshape(-1)
+    if t.dtype not in (torch.bfloat16, torch.float32):
+        t = t.to(torch.float32)
+    del tensors
     gc.collect()
-    if arr.size != int(expected_numel):
-        raise RuntimeError(f"{label} size mismatch: got {arr.size}, expected {expected_numel}.")
-    _ = float(arr[0]) + float(arr[-1])
-    return arr
+    if t.numel() != int(expected_numel):
+        raise RuntimeError(f"{label} size mismatch: got {t.numel()}, expected {expected_numel}.")
+    _ = float(t[0]) + float(t[-1])
+    return t
 
 
 def fetch_weights_from_hf(md, se, emit):
@@ -1754,7 +1824,7 @@ def fetch_weights_from_hf(md, se, emit):
             model_size = int(hr.headers.get("content-length", 0) or 0) or None
         except Exception:
             model_size = None
-    if not engram_size:
+    if ENGRAM_ACTIVE and not engram_size:
         try:
             hr = requests.head(engram_url, allow_redirects=True, timeout=30)
             engram_size = int(hr.headers.get("content-length", 0) or 0) or None
@@ -1765,12 +1835,13 @@ def fetch_weights_from_hf(md, se, emit):
     emit("status", "downloading")
     emit("overlay_show", {"title_key": "dl_weights", "indeterminate": False})
     _download_file_with_progress(model_url, model_path, emit, se, expected_size=model_size, label="model_bf16.safetensors")
-    _download_file_with_progress(engram_url, engram_path, emit, se, expected_size=engram_size, label="engram_bf16.safetensors")
+    if ENGRAM_ACTIVE:
+        _download_file_with_progress(engram_url, engram_path, emit, se, expected_size=engram_size, label="engram_bf16.safetensors")
     emit("overlay_hide", {})
     emit("status", "preparing")
     emit("log", "Loading weights from safetensors...")
     iw = _load_safetensors_flat(model_path, EXPECTED_MODEL_SIZE, "model weights")
-    ie = _load_safetensors_flat(engram_path, EXPECTED_ENGRAM_SIZE, "engram weights")
+    ie = _load_safetensors_flat(engram_path, EXPECTED_ENGRAM_SIZE, "engram weights") if ENGRAM_ACTIVE else None
 
     # Defensive cleanup of any residual .part files.
     try:
@@ -1864,8 +1935,8 @@ def _fwl(m, x, y, sl, ua, ad, ls=1.0, preview=False, loss_chunk=LOSS_CHUNK):
     nc = max(1, math.ceil(sl / loss_chunk))
 
     def compute():
-        xe = m.forward_features(x, use_chunked=True, use_ckpt=True, stream_dtype=sd)
-        w = m.head_weight(sd)                      # one copy per micro-step, reused by all chunks
+        w = m.head_weight(sd)                      # one copy per micro-step: embedding + all loss chunks
+        xe = m.forward_features(x, use_chunked=True, use_ckpt=True, stream_dtype=sd, head_w=w)
         y_dev = y.to(xe.device)
         lo = sum(
             checkpoint(_chunk_ce,
@@ -1947,11 +2018,8 @@ class DegradeLadder:
     def __init__(self, model, on_step_down=None):
         self.model = model
         self.stage = 0
-        self.loss_chunk = (
-            min(256, 128)
-            if model.backend_name == "ROCM"
-            else LOSS_CHUNK
-        )
+        base_chunk = getattr(model, 'loss_chunk_hint', LOSS_CHUNK)
+        self.loss_chunk = min(base_chunk, 128) if model.backend_name == "ROCM" else base_chunk
         self.on_step_down = on_step_down
 
     def step_down(self, emit) -> bool:
@@ -2140,8 +2208,8 @@ def _build_model(bn, device, iw, ie, emit, bs=1, sl=MAX_SEQ_LEN):
     model = SotaGPT(bn, device, gpu_layers=None, bs=bs, sl=sl)
     model.engram.table.to('cpu')
     model.load_base_weights(iw)
-    model.engram.table.weight.data.copy_(
-        torch.from_numpy(ie).view(model.engram.table.weight.shape))
+    if ENGRAM_ACTIVE and ie is not None:
+        model.engram.table.weight.data.copy_(ie.view(model.engram.table.weight.shape))
     model.engram.table.to('cpu')
     model.train()
     return model
@@ -2203,6 +2271,12 @@ def _trim_heap():
         ctypes.CDLL("libc.so.6").malloc_trim(0)
     except Exception:
         pass
+
+
+def _bf16_from_bytes(buf, offset, nbytes):
+    """bf16 tensor from raw little-endian bf16 bytes (coordinator payload), one copy only."""
+    a = np.frombuffer(buf, dtype=np.int16, count=nbytes // 2, offset=offset).copy()
+    return torch.from_numpy(a).view(torch.bfloat16)
 
 
 def _to_bf16_exact(arr):
@@ -2317,7 +2391,7 @@ def run_single_round_wrapper(srv, at, se, emit):
                     print(f"[HF-FAIL-TRACEBACK]\n{_tb.format_exc()}\n", flush=True)
                     emit('log', "Falling back to coordinator weight stream...")
                     iw = ie = None
-        if iw is None or ie is None:
+        if iw is None or (ENGRAM_ACTIVE and ie is None):
             emit('log', "Downloading weights from coordinator...")
             md2, wb = fetch_task(srv, h, "bf16", se, emit)
             if md2 is None:
@@ -2330,11 +2404,11 @@ def run_single_round_wrapper(srv, at, se, emit):
                 return
             bbl = EXPECTED_MODEL_SIZE * 2
             ebl = EXPECTED_ENGRAM_SIZE * 2
-            needed = bbl + ebl
+            needed = bbl + (ebl if ENGRAM_ACTIVE else 0)
             if len(wb) < needed:
                 raise RuntimeError(f"Incomplete coordinator payload: got {len(wb)}, expected {needed}")
-            iw = decompress_weights(wb[:bbl], "bf16")
-            ie = decompress_weights(wb[bbl:bbl + ebl], "bf16")
+            iw = _bf16_from_bytes(wb, 0, bbl)
+            ie = _bf16_from_bytes(wb, bbl, ebl) if ENGRAM_ACTIVE else None
             del wb
             gc.collect()
 
@@ -2376,10 +2450,8 @@ def run_single_round_wrapper(srv, at, se, emit):
             emit('log', "Failed to initialize model.")
             return
 
-        # The initial-weight copies are only needed to compute the delta at the
-        # end. Keep them as exact bf16 (half the RAM) and drop the fp32 arrays.
-        iw = _to_bf16_exact(iw)
-        iew = _to_bf16_exact(ie)
+        # `iw` (bf16, 1.3 GB) is kept only to compute the delta at the end.
+        iew = ie.view(model.engram.table.weight.shape) if (ENGRAM_ACTIVE and ie is not None) else None
         ie = None
         _trim_heap()
 
@@ -2400,13 +2472,13 @@ def run_single_round_wrapper(srv, at, se, emit):
 
         emit('log', f"Backend: {train_backend} | autocast: {ua} | "
                    f"bs={bs} | accum={as_} | dtype={'bf16' if ua else 'fp32'}")
-
-        # --- Calibration: bounded by wall-clock time AND step count ---
-        emit('log', f"Calibrating speed (max {CAL_TIME_BUDGET:.0f}s / {CAL_MAX_MICRO_HARD} micro-steps)...")
         if train_backend == 'ROCM':
             emit('log', '[ROCM-FIX] Attention: SDPA=' +
                          ('enabled' if os.environ.get('CROWDGPT_ROCM_SDPA', '1') != '0' else 'disabled') +
                          '; first micro-step may exceed 90s (timer checks between steps).')
+
+        # --- Calibration: bounded by wall-clock time AND step count ---
+        emit('log', f"Calibrating speed (max {CAL_TIME_BUDGET:.0f}s / {CAL_MAX_MICRO_HARD} micro-steps)...")
         cs_ = time.time()
         CAL_MAX_MICRO = max(CAL_MIN_MICRO, min(as_, CAL_MAX_MICRO_HARD))
         target_micro_steps = 100
@@ -2586,7 +2658,10 @@ def run_single_round_wrapper(srv, at, se, emit):
         # 2) Streaming delta: one preallocated bf16 buffer, no fp32 concatenation.
         dbf = _base_delta_bf16(model, iw)
         iw = None
-        si, sv = _engram_sparse_delta(model.engram.table.weight.data, iew)
+        if ENGRAM_ACTIVE and iew is not None:
+            si, sv = _engram_sparse_delta(model.engram.table.weight.data, iew)
+        else:
+            si, sv = np.array([], dtype=np.uint32), np.array([], dtype=np.uint16)
         iew = None
         model = None                         # weights (CPU + accelerator) no longer needed
         _clear_accel_cache(train_device)
@@ -2689,7 +2764,7 @@ header{flex:0 0 auto;height:54px;border-bottom:1px solid var(--border);display:f
 .theme-toggle .icon-sun{display:none}
 body.dark .theme-toggle .icon-sun{display:inline}
 body.dark .theme-toggle .icon-moon{display:none}
-body:not(.dashboard-active) #backend-select{display:none}
+body:not(.dashboard-active) #backend-select,body:not(.dashboard-active) #vram-select{display:none}
 .backend-select,.lang-select{font-family:var(--sans);font-size:12px;background:var(--bg-soft);color:var(--text);border:1px solid var(--border);padding:5px 8px;border-radius:4px;cursor:pointer;outline:none}
 .backend-select:hover,.lang-select:hover{border-color:var(--border-strong)}
 .backend-select:disabled{opacity:.5;cursor:not-allowed}
@@ -2796,6 +2871,9 @@ body.dark .overlay{background:rgba(26,26,30,.86)}
   <div class="header-right">
     <span id="user-info"></span>
     <select class="backend-select" id="backend-select" disabled></select>
+    <select class="backend-select" id="vram-select" title="Max VRAM to use. Lower = less VRAM, more streaming from RAM (slower). Applies from the next round.">
+      <option value="0">VRAM: Auto</option><option value="3">VRAM ≤ 3 GB</option><option value="4">VRAM ≤ 4 GB</option><option value="5">VRAM ≤ 5 GB</option><option value="6">VRAM ≤ 6 GB</option><option value="8">VRAM ≤ 8 GB</option><option value="10">VRAM ≤ 10 GB</option><option value="12">VRAM ≤ 12 GB</option>
+    </select>
     <select class="lang-select" id="lang-select">
       <option value="en">🇬🇧 English</option>
       <option value="fr">🇫🇷 Français</option>
@@ -2897,6 +2975,7 @@ document.getElementById('go-to-register').addEventListener('click',e=>{e.prevent
 document.getElementById('go-to-login').addEventListener('click',e=>{e.preventDefault();showAuthScreen('login')});
 function callApi(n,...a){if(window.pywebview&&window.pywebview.api&&window.pywebview.api[n]){window.pywebview.api[n](...a);return true}return false}
 window.addEventListener('pywebviewready',()=>callApi('get_backends'));
+document.getElementById('vram-select').addEventListener('change',e=>{callApi('set_vram',parseFloat(e.target.value)||0)});
 document.getElementById('backend-select').addEventListener('change',e=>{const nb=e.target.value;if(nb===window._currentBackend)return;callApi('set_backend',nb);});
 document.getElementById('btn-login').addEventListener('click',()=>{const srv=document.getElementById('login-server').value.trim();const u=document.getElementById('login-user').value.trim();const p=document.getElementById('login-pass').value;if(!u||!p){showLoginError('err_invalid_credentials');return}document.getElementById('login-error').classList.remove('show');document.getElementById('btn-login').disabled=true;callApi('login',srv,u,p)});
 document.getElementById('btn-register').addEventListener('click',()=>{const srv=document.getElementById('reg-server').value.trim();const u=document.getElementById('reg-user').value.trim();const email=document.getElementById('reg-email').value.trim();const p=document.getElementById('reg-pass').value;if(!u||!email||!p){showRegError('err_invalid_input');return}document.getElementById('reg-error').classList.remove('show');document.getElementById('btn-register').disabled=true;callApi('register',srv,u,email,p)});
@@ -2914,6 +2993,7 @@ if(ev==='login_success'){document.getElementById('view-login').classList.remove(
 else if(ev==='login_error'){const code=data.code||'err_invalid_credentials';const map={invalid_credentials:'err_invalid_credentials',login_failed:'err_login_failed',username_taken:'err_username_taken',email_taken:'err_email_taken',weak_password:'err_weak_password',invalid_input:'err_invalid_input',register_failed:'err_register_failed',network:'err_network'};const tk=map[code]||'err_login_failed';const loginActive=document.getElementById('screen-login').classList.contains('active');if(loginActive)showLoginError(tk);else showRegError(tk)}
 else if(ev==='log'){document.getElementById('status-event').textContent=data}
 else if(ev==='backends'){const sel=document.getElementById('backend-select');sel.innerHTML='';window._currentBackend=data.current;const order=[{key:'cuda',label:'CUDA (NVIDIA)'},{key:'rocm',label:'ROCm (AMD)'},{key:'mps',label:'MPS (Apple)'},{key:'xpu',label:'XPU (Intel)'},{key:'directml',label:'DirectML (Windows)'},{key:'cpu',label:'CPU'}];order.forEach(bk=>{const opt=document.createElement('option');opt.value=bk.key;opt.textContent=bk.label;opt.disabled=!data.available[bk.key];if(bk.key===data.current)opt.selected=true;sel.appendChild(opt)});sel.disabled=false}
+else if(ev==='vram'){const vs=document.getElementById('vram-select');if(vs){const vv=String(Math.round(data.current||0));vs.value=[...vs.options].some(o=>o.value===vv)?vv:'0'}}
 else if(ev==='overlay_show'){overlayShow(data)}
 else if(ev==='overlay_progress'){const bar=document.getElementById('overlay-bar');if(data.total>0){bar.classList.remove('indet');const pct=Math.min(100,data.done/data.total*100);document.getElementById('overlay-fill').style.width=pct+'%';document.getElementById('overlay-pct').textContent=pct.toFixed(1)+'%';document.getElementById('overlay-mb').textContent=mb(data.done)+' / '+mb(data.total)+' MB'}}
 else if(ev==='overlay_hide'){overlayHide()}
@@ -2952,6 +3032,13 @@ class Api:
             saved = None
         self.selected_backend = saved or get_best_default_backend()
         log.info(f"[CLIENT] Selected backend: {self.selected_backend}")
+        self._vram_file = CHECKPOINT_DIR / "selected_vram.json"
+        self.vram_gb = 0.0
+        try:
+            if self._vram_file.exists():
+                self.vram_gb = max(0.0, float(json.loads(self._vram_file.read_text()).get("vram_gb", 0) or 0))
+        except Exception:
+            self.vram_gb = 0.0
 
     def emit(self, ev, data):
         if not self.window:
@@ -2975,6 +3062,22 @@ class Api:
     def get_backends(self):
         available = get_available_backends()
         self.emit('backends', {'available': available, 'current': self.selected_backend})
+        self.emit('vram', {'current': self.vram_gb})
+
+    def set_vram(self, gb):
+        try:
+            gb = max(0.0, float(gb))
+        except (TypeError, ValueError):
+            gb = 0.0
+        self.vram_gb = gb
+        try:
+            self._vram_file.write_text(json.dumps({"vram_gb": gb}))
+        except Exception as e:
+            log.warning(f"Failed to save VRAM limit: {e}")
+        apply_vram_override(gb)
+        busy = self.thread is not None and self.thread.is_alive()
+        label = "Auto" if gb <= 0 else f"{gb:g} GB"
+        self.emit('log', f"VRAM limit: {label}" + (" (applies from the next round)" if busy else ""))
 
     def set_backend(self, backend_name):
         log.info(f"[CLIENT] set_backend called with: {backend_name} (was {self.selected_backend})")
@@ -3045,6 +3148,8 @@ class Api:
             self.emit('meta', {'backend': train_backend})
             self.emit('log', f"Backend: {train_backend} ({train_device})")
             auto_detect_vram_budget()
+            memory_config["auto_gb"] = memory_config["ram_gb"]
+            apply_vram_override(self.vram_gb)
             self.emit('log', f"Placement budget: {memory_config['ram_gb']:.2f} GB "
                              f"(margin {SAFETY_MARGIN_GB:.2f} GB)")
             install_hard_vram_cap(train_device, SAFETY_MARGIN_GB)
@@ -3055,6 +3160,7 @@ class Api:
         round_count = 0
         while not self.stop_event.is_set():
             round_count += 1
+            apply_vram_override(self.vram_gb)
             self.emit('log', f"{'='*40}")
             self.emit('log', f"Starting Round Cycle #{round_count}")
             self.emit('log', f"{'='*40}")

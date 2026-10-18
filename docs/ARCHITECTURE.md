@@ -1,4 +1,6 @@
-![The CrowdGPT architecture](https://raw.githubusercontent.com/Vxtzq/CrowdGPT/refs/heads/main/docs/diagram.jpeg)
+
+<img src="https://raw.githubusercontent.com/Vxtzq/CrowdGPT/refs/heads/main/docs/diagram.jpeg" alt="The CrowdGPT architecture" width="700" />
+
 
 # System architecture
 The CrowdGPT framework is Split into two parts:

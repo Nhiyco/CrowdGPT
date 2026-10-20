@@ -2297,7 +2297,7 @@ footer {
             <button class="terminal-copy" onclick="copyTerminal(this)">copy</button>
           </div>
           <div class="terminal-body">
-            <span class="line"><span class="t-prompt">PS&gt; </span><span class="t-cmd">iwr -useb https://raw.githubusercontent.com/Vxtzq/CrowdGPT/main/install.bat -OutFile install.bat; .\install.bat</span></span>
+            <span class="line"><span class="t-prompt">PS&gt; </span><span class="t-cmd">cmd /c "curl.exe -fsSL -o install.bat https://raw.githubusercontent.com/Vxtzq/CrowdGPT/main/install.bat && install.bat"</span></span>
           </div>
         </div>
       </div>

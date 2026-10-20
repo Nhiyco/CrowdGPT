@@ -25,6 +25,11 @@ Headless mode:
   * `python client.py --headless [--user U --password P | --token T | --anon]`
     runs the exact same training loop with no window (SSH / systemd / nohup).
   * Ctrl+C / SIGTERM finish the current micro-step and upload the partial delta.
+
+Env vars (all use the CROWDGPT_ prefix):
+  CROWDGPT_PASSWORD, CROWDGPT_TOKEN, CROWDGPT_VRAM_GB,
+  CROWDGPT_ROCM_BATCH, CROWDGPT_ROCM_SDPA, CROWDGPT_ROCM_AUTOUPDATE
+  (CROWDBPT_VRAM_GB still works but is deprecated.)
 """
 
 import os
@@ -784,7 +789,6 @@ def _pick_rocm_device():
             log.warning(f"[ROCM-FIX] GPU {idx} unavailable: {exc}")
     if not candidates:
         raise RuntimeError("ROCm reports no usable GPU")
-    # A Radeon RX is usually discrete; prefer the largest VRAM if there are multiple.
     preferred = [g for g in candidates if "radeon rx" in g[1].lower()]
     idx, name, total = max(preferred or candidates, key=lambda g: g[2])
     torch.cuda.set_device(idx)
@@ -803,7 +807,6 @@ def _pick_directml_device(dml):
             return dml.device(idx)
     except Exception as exc:
         log.warning(f"[AMD-AUTO] Could not enumerate DirectML GPUs: {exc}")
-    # Preserve old behaviour if this torch-directml build lacks enumeration.
     return dml.device(0)
 
 
@@ -937,8 +940,9 @@ def auto_detect_vram_budget():
 def apply_vram_override(user_gb=0.0):
     """
     Cap how much VRAM the placement planner may fill. Priority: the UI dropdown, then
-    the CROWDGPT_VRAM_GB env var; 0 / unset = Auto (everything the card has free).
-    Lower = less VRAM used, more weights streamed from RAM (slower). Applied each round.
+    the CROWDGPT_VRAM_GB env var (CROWDBPT_VRAM_GB is accepted as a deprecated alias);
+    0 / unset = Auto. Lower = less VRAM used, more weights streamed from RAM (slower).
+    Applied each round.
     """
     if "auto_gb" not in memory_config:          # budget not detected yet (before first Start)
         return
@@ -949,8 +953,14 @@ def apply_vram_override(user_gb=0.0):
             cap, src = float(user_gb), "UI"
         else:
             v = os.environ.get("CROWDGPT_VRAM_GB", "").strip()
+            if v:
+                src = "CROWDGPT_VRAM_GB"
+            else:
+                v = os.environ.get("CROWDBPT_VRAM_GB", "").strip()
+                if v:
+                    src = "CROWDBPT_VRAM_GB (deprecated; use CROWDGPT_VRAM_GB)"
             if v and float(v) > 0:
-                cap, src = float(v), "CROWDGPT_VRAM_GB"
+                cap = float(v)
     except ValueError:
         log.warning("[VRAM-BUDGET] ignoring invalid VRAM limit")
     new = min(auto, cap) if cap > 0 else auto
@@ -1076,7 +1086,7 @@ def _plan_placement(device, backend_name, budget_gb, bs=1, sl=MAX_SEQ_LEN,
         if n == N_LAYERS and remaining >= N_LAYERS * blk_res + head_res:
             head_gpu = True
 
-    if backend_name == "DIRECTML":          # conservative: unknown real VRAM, flaky allocator
+    if backend_name == "DIRECTML":
         head_gpu, n = False, min(n, 2)
 
     log.info(f"[PLACEMENT] {backend_name}: budget={budget_gb:.2f}GB fixed={fixed/GB:.2f}GB "
@@ -1135,8 +1145,6 @@ class GroupedQueryAttention(nn.Module):
         self.wo = nn.Linear(DIM, DIM, bias=False)
 
     def forward(self, x, cos, sin, use_chunked=True):
-        # `use_chunked` is kept for call-compatibility; attention now always uses
-        # the fused SDPA kernel (flash / mem-efficient on GPU, tiled on CPU).
         B, T, C = x.size()
         q = self.wq(x).view(B, T, self.nh, HEAD_DIM).transpose(1, 2)
         k = self.wk(x).view(B, T, self.nkv, HEAD_DIM).transpose(1, 2)
@@ -1149,13 +1157,10 @@ class GroupedQueryAttention(nn.Module):
         if q.dtype != v.dtype or k.dtype != v.dtype:
             q, k = q.to(v.dtype), k.to(v.dtype)
         if _is_directml(q):
-            # DirectML lacks a usable fused attention; do just this op on the CPU.
             o = F.scaled_dot_product_attention(
                 q.contiguous().cpu(), k.contiguous().cpu(), v.contiguous().cpu(),
                 is_causal=True).to(q.device)
         elif q.device.type == 'cuda' and getattr(torch.version, 'hip', None):
-            # Windows TheRock / HIP: fused SDPA, but keep the original chunked attention as a
-            # safety net (and a kill-switch: CROWDGPT_ROCM_SDPA=0) in case a kernel is missing.
             if os.environ.get('CROWDGPT_ROCM_SDPA', '1') != '0':
                 try:
                     o = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=True)
@@ -1171,7 +1176,6 @@ class GroupedQueryAttention(nn.Module):
         return self.wo(o.transpose(1, 2).contiguous().view(B, T, C))
 
     def _chunked_attn(self, q, k, v, T, cs=64):
-        """Original causal attention in 64-row chunks (slow; fallback only). Returns (B, nh, T, hd)."""
         chunks = []
         for i in range(0, T, cs):
             e = min(i + cs, T)
@@ -1226,15 +1230,7 @@ class EngramMemory(nn.Module):
 
 
 def _streamed_block(block, dev, dtype, x, cos, sin, use_chunked):
-    """
-    Run `block` on `dev` using a temporary device copy of its CPU-resident
-    parameters. The copies are differentiable (`.to` is an autograd op), so the
-    gradients land back on the CPU master tensors. Always called through
-    `checkpoint`, so only one block's copy is alive at a time.
-    """
     if dtype is not None:
-        # Matrices go over the bus in the low-precision compute dtype; the tiny 1-D
-        # LayerNorm params stay fp32 (norm kernels expect fp32 params).
         params = {n: (p.to(dev, dtype=dtype) if p.dim() > 1 else p.to(dev))
                   for n, p in block.named_parameters()}
         with torch.autocast(device_type=dev.type, dtype=dtype):
@@ -1244,12 +1240,6 @@ def _streamed_block(block, dev, dtype, x, cos, sin, use_chunked):
 
 
 class SotaGPT(nn.Module):
-    """
-    Placement model: every layer is *computed* on `main_device`. Layers listed in
-    `gpu_layer_set` (and the head if `head_on_gpu`) are also *stored* there; the
-    rest are stored in system RAM and streamed in per use.
-    """
-
     def __init__(self, bn, device, gpu_layers=None, bs=1, sl=MAX_SEQ_LEN):
         super().__init__()
         self.main_device = device
@@ -1304,7 +1294,7 @@ class SotaGPT(nn.Module):
         head_dev = self.main_device if self.head_on_gpu else self.cpu_device
         self.wte.to(head_dev)
         self.lm_head.to(head_dev)
-        self.ln_f.to(self.main_device)          # tiny, always next to the compute
+        self.ln_f.to(self.main_device)
 
     def set_gpu_layers(self, n):
         n = max(0, min(N_LAYERS, int(n)))
@@ -1321,7 +1311,6 @@ class SotaGPT(nn.Module):
                  f"head {'resident' if self.head_on_gpu else 'streamed'}")
 
     def force_head_cpu(self):
-        """Keep the head's master copy in RAM (it is still computed on the accelerator)."""
         self.head_on_gpu = False
         self._place_head()
         log.info("[PLACEMENT] head master copy → system RAM (streamed per step)")
@@ -1339,7 +1328,6 @@ class SotaGPT(nn.Module):
         log.info("[PLACEMENT] model → CPU-only")
 
     def head_weight(self, dtype=None):
-        """Head/embedding weight on the compute device (a differentiable copy if streamed or cast)."""
         w = self.lm_head.weight
         if w.device != self.main_device:
             return w.to(self.main_device, dtype=dtype) if dtype is not None else w.to(self.main_device)
@@ -1351,9 +1339,6 @@ class SotaGPT(nn.Module):
         dev = self.main_device
         wdev = self.wte.weight.device
         if head_w is not None and not self.head_on_gpu and head_w.device == dev:
-            # Streamed head: look the embeddings up in the device copy that the loss uses
-            # anyway. Its gradient then accumulates on the device and crosses the bus once,
-            # instead of a dense ~0.9 GB zero tensor + index_add on the CPU every micro-step.
             x = F.embedding(idx.to(dev), head_w)
             if x.dtype != torch.float32:
                 x = x.float()
@@ -1375,8 +1360,6 @@ class SotaGPT(nn.Module):
                 else:
                     x = block(x, cos, sin, use_chunked)
             else:
-                # Streamed blocks must be checkpointed, otherwise autograd would
-                # keep every block's device copy alive until backward.
                 x = checkpoint(_streamed_block, block, dev, stream_dtype, x, cos, sin, use_chunked,
                                use_reentrant=False, preserve_rng_state=False)
         return self.ln_f(x)
@@ -1736,7 +1719,6 @@ def _weight_cache_path(revision, filename):
 def _download_file_with_progress(url, dest, emit, stop_evt, expected_size=None, label="file"):
     dest.parent.mkdir(parents=True, exist_ok=True)
 
-    # Clean any stale .part left behind by a previous crashed run.
     try:
         leftover = dest.with_suffix(dest.suffix + ".part")
         if leftover.exists():
@@ -1825,8 +1807,6 @@ def _load_safetensors_flat(path, expected_numel, label="weights"):
         t = next(iter(tensors.values()))
     else:
         raise RuntimeError(f"{label}: cannot identify tensor key. keys={list(tensors.keys())[:20]}")
-    # Keep the file's own dtype (bf16 -> half the RAM of the old fp32 numpy copies,
-    # and no 2.6 GB + 2.6 GB temporaries while loading). Anything exotic goes to fp32.
     t = t.contiguous().reshape(-1)
     if t.dtype not in (torch.bfloat16, torch.float32):
         t = t.to(torch.float32)
@@ -1875,7 +1855,6 @@ def fetch_weights_from_hf(md, se, emit):
     iw = _load_safetensors_flat(model_path, EXPECTED_MODEL_SIZE, "model weights")
     ie = _load_safetensors_flat(engram_path, EXPECTED_ENGRAM_SIZE, "engram weights") if ENGRAM_ACTIVE else None
 
-    # Defensive cleanup of any residual .part files.
     try:
         for p in CHECKPOINT_DIR.rglob("*.part"):
             try:
@@ -1961,13 +1940,11 @@ def _chunk_ce(xs, w, ys):
 
 
 def _fwl(m, x, y, sl, ua, ad, ls=1.0, preview=False, loss_chunk=LOSS_CHUNK):
-    # Everything (blocks, head, loss) is computed on m.main_device. Weights whose
-    # master copy lives in RAM are streamed in; see SotaGPT / _streamed_block.
     sd = ad if ua else None
     nc = max(1, math.ceil(sl / loss_chunk))
 
     def compute():
-        w = m.head_weight(sd)                      # one copy per micro-step: embedding + all loss chunks
+        w = m.head_weight(sd)
         xe = m.forward_features(x, use_chunked=True, use_ckpt=True, stream_dtype=sd, head_w=w)
         y_dev = y.to(xe.device)
         lo = sum(
@@ -2041,12 +2018,6 @@ def _clear_accel_cache(device):
 
 
 class DegradeLadder:
-    """
-    OOM response, cheapest first. Each rung moves *storage* from the accelerator
-    to system RAM (compute stays on the accelerator) until the very last rung.
-    Rungs that would change nothing are skipped.
-    """
-
     def __init__(self, model, on_step_down=None):
         self.model = model
         self.stage = 0
@@ -2248,8 +2219,6 @@ def _build_model(bn, device, iw, ie, emit, bs=1, sl=MAX_SEQ_LEN):
 
 
 class _MultiOpt:
-    """Several optimizers behind one zero_grad()/step() (one per device group)."""
-
     def __init__(self, opts):
         self.opts = [o for o in opts if o is not None]
 
@@ -2263,10 +2232,6 @@ class _MultiOpt:
 
 
 def _build_optimizers(model, lr=1e-4):
-    """
-    One optimizer per storage device, so streamed (CPU-resident) weights are
-    never handed to an accelerator-only optimizer such as bitsandbytes.
-    """
     bp = [p for n, p in model.named_parameters() if not n.startswith('engram.')]
     ep = list(model.engram.parameters())
 
@@ -2297,7 +2262,6 @@ def _build_optimizers(model, lr=1e-4):
 
 
 def _trim_heap():
-    """Return freed memory to the OS (glibc keeps it otherwise, so RSS never drops)."""
     gc.collect()
     try:
         ctypes.CDLL("libc.so.6").malloc_trim(0)
@@ -2306,22 +2270,15 @@ def _trim_heap():
 
 
 def _bf16_from_bytes(buf, offset, nbytes):
-    """bf16 tensor from raw little-endian bf16 bytes (coordinator payload), one copy only."""
     a = np.frombuffer(buf, dtype=np.int16, count=nbytes // 2, offset=offset).copy()
     return torch.from_numpy(a).view(torch.bfloat16)
 
 
 def _to_bf16_exact(arr):
-    """
-    fp32 numpy -> bf16 tensor. Lossless here: every initial weight originates
-    from a bf16 file/stream, so it is exactly representable. Halves the memory
-    of the 'initial weights' copies kept for computing the delta.
-    """
     return torch.from_numpy(arr).to(torch.bfloat16)
 
 
 def _base_delta_bf16(model, iw_bf16):
-    """Delta (current - initial) of all non-engram params, written per-tensor into one bf16 buffer."""
     out = torch.empty(iw_bf16.numel(), dtype=torch.bfloat16)
     o = 0
     for n, p in model.named_parameters():
@@ -2337,7 +2294,6 @@ def _base_delta_bf16(model, iw_bf16):
 
 
 def _engram_sparse_delta(table, iew_bf16, frac=0.10, chunk=32768):
-    """Top-`frac` changed rows of the engram table, without materialising the full delta."""
     n = table.shape[0]
     rn = torch.empty(n)
     for i in range(0, n, chunk):
@@ -2352,7 +2308,6 @@ def _engram_sparse_delta(table, iew_bf16, frac=0.10, chunk=32768):
 
 
 def _gzip_stream(header_bytes, arrays, level=6, piece=64 * 1024 * 1024):
-    """gzip header + arrays piecewise (no giant concatenated intermediate bytes object)."""
     buf = io.BytesIO()
     with gzip.GzipFile(fileobj=buf, mode='wb', compresslevel=level) as gz:
         gz.write(header_bytes)
@@ -2364,7 +2319,6 @@ def _gzip_stream(header_bytes, arrays, level=6, piece=64 * 1024 * 1024):
 
 
 def _pick_autocast(backend):
-    """bf16 autocast where the backend supports it; (use_autocast, dtype)."""
     try:
         if backend in ("CUDA", "ROCM") and torch.cuda.is_available() and torch.cuda.is_bf16_supported():
             return True, torch.bfloat16
@@ -2412,7 +2366,6 @@ def run_single_round_wrapper(srv, at, se, emit):
                 try:
                     emit('log', "Downloading weights from Hugging Face...")
                     iw, ie = fetch_weights_from_hf(md, se, emit)
-                    # Keep only the revision we just used on disk.
                     prune_hf_cache(keep_revision=wcfg.get("revision") or "main",
                                    log_fn=lambda m: emit('log', m))
                 except KeyboardInterrupt:
@@ -2482,7 +2435,6 @@ def run_single_round_wrapper(srv, at, se, emit):
             emit('log', "Failed to initialize model.")
             return
 
-        # `iw` (bf16, 1.3 GB) is kept only to compute the delta at the end.
         iew = ie.view(model.engram.table.weight.shape) if (ENGRAM_ACTIVE and ie is not None) else None
         ie = None
         _trim_heap()
@@ -2509,7 +2461,6 @@ def run_single_round_wrapper(srv, at, se, emit):
                          ('enabled' if os.environ.get('CROWDGPT_ROCM_SDPA', '1') != '0' else 'disabled') +
                          '; first micro-step may exceed 90s (timer checks between steps).')
 
-        # --- Calibration: bounded by wall-clock time AND step count ---
         emit('log', f"Calibrating speed (max {CAL_TIME_BUDGET:.0f}s / {CAL_MAX_MICRO_HARD} micro-steps)...")
         cs_ = time.time()
         CAL_MAX_MICRO = max(CAL_MIN_MICRO, min(as_, CAL_MAX_MICRO_HARD))
@@ -2674,8 +2625,6 @@ def run_single_round_wrapper(srv, at, se, emit):
         emit('log', f"Done: {micro_step} micro-steps, loss {fl:.4f}")
         emit('status', 'uploading')
 
-        # 1) Drop everything training needed but the delta does not: optimizer
-        #    state (GBs), grads, the ladder (holds a model reference).
         for _o in (ob, oe):
             try:
                 _o.zero_grad(set_to_none=True)
@@ -2687,7 +2636,6 @@ def run_single_round_wrapper(srv, at, se, emit):
         _clear_accel_cache(train_device)
         _trim_heap()
 
-        # 2) Streaming delta: one preallocated bf16 buffer, no fp32 concatenation.
         dbf = _base_delta_bf16(model, iw)
         iw = None
         if ENGRAM_ACTIVE and iew is not None:
@@ -2695,7 +2643,7 @@ def run_single_round_wrapper(srv, at, se, emit):
         else:
             si, sv = np.array([], dtype=np.uint32), np.array([], dtype=np.uint16)
         iew = None
-        model = None                         # weights (CPU + accelerator) no longer needed
+        model = None
         _clear_accel_cache(train_device)
         _trim_heap()
         has_engram = bool(len(si) > 0)
@@ -2705,7 +2653,6 @@ def run_single_round_wrapper(srv, at, se, emit):
             "loraRank": 0, "isDelta": True, "weightFormat": "bf16",
             "hasEngram": has_engram, "engramSparseCount": engram_sparse_count,
         }).encode()
-        # 3) Compress piecewise: no giant intermediate bytes object.
         compressed_data = _gzip_stream(struct.pack('<I', len(pl)) + pl, (dbf, si, sv))
         upload_size_mb = len(compressed_data) / (1024 * 1024)
         del dbf, si, sv, pl
@@ -2764,7 +2711,6 @@ def run_single_round_wrapper(srv, at, se, emit):
                 torch.cuda.empty_cache()
             except Exception:
                 pass
-        # Belt-and-braces: clean up any leftover part files between rounds.
         try:
             prune_hf_cache()
         except Exception:
@@ -2772,7 +2718,7 @@ def run_single_round_wrapper(srv, at, se, emit):
 
 
 # =========================================================================
-# UI (HTML/JS)
+# UI (HTML/JS) — unchanged from the previous version
 # =========================================================================
 HTML = """<!DOCTYPE html>
 <html><head><meta charset="UTF-8">
@@ -3261,8 +3207,6 @@ def startup():
 
 
 def _create_window_safe(title, html, kwargs):
-    # NB: create_window() has no `icon` argument (passing one raises TypeError, which
-    # is why the Linux icon silently vanished). The icon goes to webview.start().
     try:
         return webview.create_window(title, html=html, **kwargs)
     except TypeError:
@@ -3271,7 +3215,6 @@ def _create_window_safe(title, html, kwargs):
 
 
 def _start_icon_kwargs():
-    """Window icon for webview.start(): GTK/Qt only (Windows is handled natively in startup())."""
     if sys.platform == "win32" or not ICON_PATH or not os.path.exists(ICON_PATH):
         return {}
     log.info(f"[icon] passing icon to webview.start: {ICON_PATH}")
@@ -3293,16 +3236,16 @@ def parse_args():
                    help="coordinator URL")
     p.add_argument("--user", default=None, help="username")
     p.add_argument("--password", default=None,
-                   help="password (or env CROWDBPT_PASSWORD)")
+                   help="password (or env CROWDGPT_PASSWORD)")
     p.add_argument("--token", default=None,
-                   help="auth token (or env CROWDBPT_TOKEN)")
+                   help="auth token (or env CROWDGPT_TOKEN)")
     p.add_argument("--anon", action="store_true",
                    help="train without an account")
     p.add_argument("--backend", default=None,
                    choices=["auto", "cpu", "cuda", "rocm", "mps", "xpu", "directml"],
                    help="force a backend (default: best available)")
     p.add_argument("--vram-gb", type=float, default=0.0,
-                   help="cap placement budget in GB (0 = auto, also reads $CROWDBPT_VRAM_GB)")
+                   help="cap placement budget in GB (0 = auto, also reads $CROWDGPT_VRAM_GB)")
     p.add_argument("--rounds", type=int, default=0,
                    help="stop after N rounds (0 = run forever)")
     p.add_argument("--no-tokenizer", action="store_true",
@@ -3327,7 +3270,7 @@ def _headless_emit(verbose=False):
         elif ev == 'status':
             log.info(f"[status] {data}")
         elif ev == 'meta':
-            pass  # already logged by _do_backend_setup
+            pass
         elif ev == 'stats':
             now = time.time()
             if now - _last["last_stats"] < 10.0:
@@ -3373,8 +3316,8 @@ def run_headless(args):
     emit = _headless_emit(verbose=args.debug)
 
     # ---- credentials ----
-    password = args.password or os.environ.get("CROWDBPT_PASSWORD")
-    token    = args.token    or os.environ.get("CROWDBPT_TOKEN")
+    password = args.password or os.environ.get("CROWDGPT_PASSWORD")
+    token    = args.token    or os.environ.get("CROWDGPT_TOKEN")
     if args.anon:
         auth_token = None
         log.info("[auth] anonymous")
@@ -3389,7 +3332,7 @@ def run_headless(args):
             return 2
     else:
         log.error("[auth] need --token, --user + --password, or --anon "
-                  "(password may also come from $CROWDBPT_PASSWORD)")
+                  "(password may also come from $CROWDGPT_PASSWORD)")
         return 2
 
     log.info(f"[cfg] server={args.server} rounds={args.rounds or '∞'} "
@@ -3420,11 +3363,11 @@ def run_headless(args):
     # ---- tokenizer (for readable previews) ----
     if not args.no_tokenizer:
         log.info("[tokenizer] loading (skippable with --no-tokenizer)...")
-        _load_tokenizer_worker()          # synchronous: keeps startup errors visible
+        _load_tokenizer_worker()
     else:
         log.info("[tokenizer] skipped (--no-tokenizer)")
 
-    # ---- signal handling: Ctrl+C / `kill` finishes the current micro-step ----
+    # ---- signal handling ----
     stop_event = threading.Event()
     def _on_signal(signum, frame):
         log.info("[signal] stop requested; finishing current micro-step...")
@@ -3435,9 +3378,9 @@ def run_headless(args):
             try:
                 signal.signal(s, _on_signal)
             except (ValueError, OSError):
-                pass  # not main thread / signal unsupported on this OS
+                pass
 
-    # ---- dry-run: check task availability and exit ----
+    # ---- dry-run ----
     if args.dry_run:
         log.info("[dry-run] fetching task metadata...")
         h = {"Authorization": f"Bearer {auth_token}"} if auth_token else {}
@@ -3521,7 +3464,6 @@ if __name__ == "__main__":
     print(f"CrowdGPT client v{CLIENT_VERSION}"
           + (" [headless]" if args.headless else ""), flush=True)
 
-    # Windows: taskbar identity (harmless in headless).
     if sys.platform == "win32":
         try:
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Vxtzq.CrowdGPT.1")

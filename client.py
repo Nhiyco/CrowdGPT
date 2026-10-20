@@ -20,6 +20,11 @@ Disk-safety guarantees:
   * Only the newest Hugging Face weight revision is kept on disk.
   * Total hf_weights/ size is hard-capped.
   * Stale .part / .bak / .new files are removed at startup and after downloads.
+
+Headless mode:
+  * `python client.py --headless [--user U --password P | --token T | --anon]`
+    runs the exact same training loop with no window (SSH / systemd / nohup).
+  * Ctrl+C / SIGTERM finish the current micro-step and upload the partial delta.
 """
 
 import os
@@ -31,9 +36,20 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 os.environ.setdefault("PYTORCH_HIP_ALLOC_CONF", "expandable_segments:False")
 os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
 
-import sys, io, json, time, struct, math, gc, threading, base64, logging, tempfile, atexit, subprocess, hashlib, shutil, ctypes
+import sys, io, json, time, struct, math, gc, threading, base64, logging, tempfile, atexit, subprocess, hashlib, shutil, ctypes, signal, argparse
 from pathlib import Path
-import webview
+
+# `webview` may be unavailable on headless servers (no GTK/Qt/WebView2);
+# import defensively so `--headless` never fails on that.
+try:
+    import webview
+    _WEBVIEW_OK = True
+    _WEBVIEW_ERR = None
+except Exception as _e:
+    webview = None
+    _WEBVIEW_OK = False
+    _WEBVIEW_ERR = _e
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -44,7 +60,8 @@ import http.client
 from requests.exceptions import ChunkedEncodingError
 import gzip
 
-logging.getLogger("pywebview").setLevel(logging.CRITICAL)
+if _WEBVIEW_OK:
+    logging.getLogger("pywebview").setLevel(logging.CRITICAL)
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
 sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s', datefmt='%H:%M:%S')
@@ -3027,7 +3044,36 @@ document.getElementById('motd-close').addEventListener('click',()=>document.getE
 
 
 # =========================================================================
-# Api / windowing
+# Shared backend setup + update check (used by both GUI and headless)
+# =========================================================================
+def _do_backend_setup(selected_backend, vram_gb, emit):
+    """Detect backend + VRAM budget + install hard cap. Shared by GUI and headless."""
+    global train_device, train_backend
+    train_device, train_backend = detect_training_backend(selected_backend)
+    emit('meta', {'backend': train_backend})
+    emit('log', f"Backend: {train_backend} ({train_device})")
+    auto_detect_vram_budget()
+    memory_config["auto_gb"] = memory_config["ram_gb"]
+    apply_vram_override(vram_gb)
+    emit('log', f"Placement budget: {memory_config['ram_gb']:.2f} GB "
+                f"(margin {SAFETY_MARGIN_GB:.2f} GB)")
+    install_hard_vram_cap(train_device, SAFETY_MARGIN_GB)
+
+
+def _check_updates_between_rounds(emit):
+    """Shared between GUI and headless. Exits by re-exec if an update lands."""
+    try:
+        if check_for_update():
+            emit('log', "🔄 Updated to a new version — restarting...")
+            emit('status', 'idle')
+            time.sleep(2)
+            _restart_self()
+    except Exception as e:
+        log.warning(f"Update check failed: {e}")
+
+
+# =========================================================================
+# Api (GUI)
 # =========================================================================
 class Api:
     def __init__(self):
@@ -3149,27 +3195,11 @@ class Api:
         self.stop_event.set()
 
     def _check_updates_between_rounds(self):
-        try:
-            if check_for_update():
-                self.emit('log', "🔄 Updated to a new version — restarting...")
-                self.emit('status', 'idle')
-                time.sleep(2)
-                _restart_self()
-        except Exception as e:
-            log.warning(f"Update check failed: {e}")
+        _check_updates_between_rounds(self.emit)
 
     def _rs(self):
-        global train_device, train_backend
         try:
-            train_device, train_backend = detect_training_backend(self.selected_backend)
-            self.emit('meta', {'backend': train_backend})
-            self.emit('log', f"Backend: {train_backend} ({train_device})")
-            auto_detect_vram_budget()
-            memory_config["auto_gb"] = memory_config["ram_gb"]
-            apply_vram_override(self.vram_gb)
-            self.emit('log', f"Placement budget: {memory_config['ram_gb']:.2f} GB "
-                             f"(margin {SAFETY_MARGIN_GB:.2f} GB)")
-            install_hard_vram_cap(train_device, SAFETY_MARGIN_GB)
+            _do_backend_setup(self.selected_backend, self.vram_gb, self.emit)
         except Exception as e:
             self.emit('log', f"Error: {e}")
             self.emit('status', 'idle')
@@ -3206,6 +3236,9 @@ class Api:
         self.emit('log', "👋 Training stopped by user.")
 
 
+# =========================================================================
+# GUI windowing
+# =========================================================================
 def startup():
     if sys.platform == "win32" and WINDOWS_ICO_PATH:
         _wait_for_window(WINDOW_TITLE, timeout=5.0)
@@ -3245,21 +3278,220 @@ def _start_icon_kwargs():
     return {"icon": ICON_PATH}
 
 
-if __name__ == "__main__":
-    print(f"CrowdGPT client v{CLIENT_VERSION}")
+# =========================================================================
+# CLI / headless
+# =========================================================================
+def parse_args():
+    p = argparse.ArgumentParser(
+        prog="client.py",
+        description="CrowdGPT client. Runs the GUI by default; use --headless for SSH/servers.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    p.add_argument("--headless", action="store_true",
+                   help="no window; train in the terminal (for SSH / systemd / nohup)")
+    p.add_argument("--server", default=DEFAULT_SERVER,
+                   help="coordinator URL")
+    p.add_argument("--user", default=None, help="username")
+    p.add_argument("--password", default=None,
+                   help="password (or env CROWDBPT_PASSWORD)")
+    p.add_argument("--token", default=None,
+                   help="auth token (or env CROWDBPT_TOKEN)")
+    p.add_argument("--anon", action="store_true",
+                   help="train without an account")
+    p.add_argument("--backend", default=None,
+                   choices=["auto", "cpu", "cuda", "rocm", "mps", "xpu", "directml"],
+                   help="force a backend (default: best available)")
+    p.add_argument("--vram-gb", type=float, default=0.0,
+                   help="cap placement budget in GB (0 = auto, also reads $CROWDBPT_VRAM_GB)")
+    p.add_argument("--rounds", type=int, default=0,
+                   help="stop after N rounds (0 = run forever)")
+    p.add_argument("--no-tokenizer", action="store_true",
+                   help="skip loading the tokenizer (~500 MB RAM); previews show #tok ids")
+    p.add_argument("--no-update", action="store_true",
+                   help="don't check for client.py updates")
+    p.add_argument("--dry-run", action="store_true",
+                   help="check auth + backend + task metadata, then exit without training")
+    p.add_argument("--debug", action="store_true",
+                   help="verbose logging")
+    p.add_argument("--version", action="version",
+                   version=f"crowdgpt-client {CLIENT_VERSION}")
+    return p.parse_args()
 
-    if sys.platform == "win32":
+
+def _headless_emit(verbose=False):
+    """Console emit for --headless. Throttles noisy events, prefixes the rest."""
+    _last = {"prog": 0.0, "last_stats": 0.0}
+    def emit(ev, data):
+        if ev == 'log':
+            log.info(str(data))
+        elif ev == 'status':
+            log.info(f"[status] {data}")
+        elif ev == 'meta':
+            pass  # already logged by _do_backend_setup
+        elif ev == 'stats':
+            now = time.time()
+            if now - _last["last_stats"] < 10.0:
+                return
+            _last["last_stats"] = now
+            log.info(
+                f"[train] step {data.get('step')}/{data.get('target')} "
+                f"loss={data.get('loss', 0):.4f} "
+                f"tps={data.get('tps', 0):.0f} "
+                f"left={data.get('time_left', 0):.0f}m"
+            )
+        elif ev == 'cal_stats':
+            log.info(
+                f"[cal]   step {data.get('step')}/{data.get('total')} "
+                f"loss={data.get('loss', 0):.4f}"
+            )
+        elif ev == 'model_preview':
+            for c in data.get('cards', []):
+                log.info(
+                    f"[preview] {str(c.get('context', ''))[-40:]!r} → "
+                    f"pred={c.get('pred')!r} target={c.get('target')!r} "
+                    f"{'✓' if c.get('match') else '✗'}"
+                )
+        elif ev == 'overlay_progress':
+            now = time.time()
+            if now - _last["prog"] < 5.0:
+                return
+            _last["prog"] = now
+            done  = data.get('done', 0) / (1024 * 1024)
+            total = data.get('total', 0) / (1024 * 1024)
+            pct = 100.0 * done / total if total > 0 else 0.0
+            log.info(f"[progress] {pct:.1f}% ({done:.0f}/{total:.0f} MB)")
+        elif ev in ('overlay_show', 'overlay_hide'):
+            pass
+        else:
+            if verbose:
+                log.debug(f"[{ev}] {data}")
+    return emit
+
+
+def run_headless(args):
+    """No window. Runs the same training loop as the GUI, prints to stdout."""
+    emit = _headless_emit(verbose=args.debug)
+
+    # ---- credentials ----
+    password = args.password or os.environ.get("CROWDBPT_PASSWORD")
+    token    = args.token    or os.environ.get("CROWDBPT_TOKEN")
+    if args.anon:
+        auth_token = None
+        log.info("[auth] anonymous")
+    elif token:
+        auth_token = token
+        log.info("[auth] using provided token")
+    elif args.user and password:
+        log.info(f"[auth] logging in as {args.user}")
+        auth_token, err = do_login(args.server, args.user, password)
+        if not auth_token:
+            log.error(f"[auth] login failed: {err}")
+            return 2
+    else:
+        log.error("[auth] need --token, --user + --password, or --anon "
+                  "(password may also come from $CROWDBPT_PASSWORD)")
+        return 2
+
+    log.info(f"[cfg] server={args.server} rounds={args.rounds or '∞'} "
+             f"vram={args.vram_gb or 'auto'}GB backend={args.backend or 'auto'}")
+
+    # ---- backend / VRAM ----
+    selected = args.backend if args.backend and args.backend != "auto" else None
+    if selected is None:
+        bf = CHECKPOINT_DIR / "selected_backend.json"
         try:
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Vxtzq.CrowdGPT.1")
+            if bf.exists():
+                saved = json.loads(bf.read_text()).get("backend")
+                if saved and get_available_backends().get(saved, False):
+                    selected = saved
         except Exception:
             pass
+    if selected is None:
+        selected = get_best_default_backend()
 
     try:
-        if check_for_update():
-            print("Update applied. Restarting...")
-            _restart_self()
+        _do_backend_setup(selected, args.vram_gb, emit)
     except Exception as e:
-        log.warning(f"Auto-update check error: {e}")
+        log.error(f"[backend] setup failed: {e}")
+        import traceback
+        log.error(traceback.format_exc())
+        return 3
+
+    # ---- tokenizer (for readable previews) ----
+    if not args.no_tokenizer:
+        log.info("[tokenizer] loading (skippable with --no-tokenizer)...")
+        _load_tokenizer_worker()          # synchronous: keeps startup errors visible
+    else:
+        log.info("[tokenizer] skipped (--no-tokenizer)")
+
+    # ---- signal handling: Ctrl+C / `kill` finishes the current micro-step ----
+    stop_event = threading.Event()
+    def _on_signal(signum, frame):
+        log.info("[signal] stop requested; finishing current micro-step...")
+        stop_event.set()
+    for sig_name in ("SIGINT", "SIGTERM"):
+        s = getattr(signal, sig_name, None)
+        if s is not None:
+            try:
+                signal.signal(s, _on_signal)
+            except (ValueError, OSError):
+                pass  # not main thread / signal unsupported on this OS
+
+    # ---- dry-run: check task availability and exit ----
+    if args.dry_run:
+        log.info("[dry-run] fetching task metadata...")
+        h = {"Authorization": f"Bearer {auth_token}"} if auth_token else {}
+        md = fetch_task_metadata(args.server, h, stop_event, emit)
+        if md is None:
+            log.error("[dry-run] no task available")
+            return 5
+        log.info(f"[dry-run] task OK: taskId={md.get('taskId')} "
+                 f"round={md.get('current_round') or md.get('round')} "
+                 f"step={md.get('globalStep')}")
+        return 0
+
+    # ---- rounds ----
+    max_rounds = args.rounds if args.rounds and args.rounds > 0 else 0
+    round_count = 0
+    while not stop_event.is_set():
+        round_count += 1
+        apply_vram_override(args.vram_gb)
+        log.info("=" * 60)
+        log.info(f"Round {round_count}" + (f"/{max_rounds}" if max_rounds else ""))
+        log.info("=" * 60)
+        try:
+            run_single_round_wrapper(args.server, auth_token, stop_event, emit)
+        except KeyboardInterrupt:
+            stop_event.set()
+            break
+        except Exception as e:
+            import traceback
+            log.error(f"Round failed: {e}")
+            log.error(traceback.format_exc()[-2000:])
+
+        if stop_event.is_set():
+            break
+        if max_rounds and round_count >= max_rounds:
+            log.info(f"Completed {round_count} round(s); exiting.")
+            break
+
+        if not args.no_update:
+            _check_updates_between_rounds(emit)
+        if stop_event.is_set():
+            break
+
+        log.info("Round complete; next round in 10s (Ctrl+C to stop)...")
+        stop_event.wait(timeout=10.0)
+
+    log.info("Bye.")
+    return 0
+
+
+def run_gui(args):
+    if not _WEBVIEW_OK:
+        log.error(f"GUI unavailable: {_WEBVIEW_ERR}")
+        log.error("Run with --headless to train without a window.")
+        return 4
 
     api = Api()
     start_tokenizer_loader()
@@ -3273,5 +3505,38 @@ if __name__ == "__main__":
     api.window = window
     try:
         webview.start(startup, debug=False, **_start_icon_kwargs())
-    except TypeError:                      # very old pywebview without start(icon=...)
+    except TypeError:
         webview.start(startup, debug=False)
+    return 0
+
+
+# =========================================================================
+# Entry point
+# =========================================================================
+if __name__ == "__main__":
+    args = parse_args()
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    print(f"CrowdGPT client v{CLIENT_VERSION}"
+          + (" [headless]" if args.headless else ""), flush=True)
+
+    # Windows: taskbar identity (harmless in headless).
+    if sys.platform == "win32":
+        try:
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Vxtzq.CrowdGPT.1")
+        except Exception:
+            pass
+
+    if not args.no_update:
+        try:
+            if check_for_update():
+                print("Update applied. Restarting...", flush=True)
+                _restart_self()
+        except Exception as e:
+            log.warning(f"Auto-update check error: {e}")
+
+    if args.headless:
+        sys.exit(run_headless(args))
+    else:
+        sys.exit(run_gui(args))

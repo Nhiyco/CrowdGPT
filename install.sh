@@ -35,6 +35,8 @@ set -Eeuo pipefail
 REPO_URL="https://github.com/Vxtzq/CrowdGPT.git"
 REPO_DIR="CrowdGPT"
 BACKEND_OVERRIDE=""
+TORCH_INDEX=""
+TORCH_EXTRA=""
 LAUNCH=1
 INTEGRATE=1
 
@@ -315,9 +317,15 @@ detect_backend() {
     if [[ -z "$ROCM_VER" ]] && command -v rocminfo >/dev/null 2>&1; then
         ROCM_VER="$(rocminfo 2>/dev/null | grep -oE 'ROCm[[:space:]]+[0-9]+\.[0-9]+' | head -n1 | awk '{print $2}' || true)"
     fi
+    # Distro-packaged ROCm (Fedora, Arch, ...) lives in /usr, not /opt/rocm.
+    if [[ -z "$ROCM_VER" ]] && command -v hipconfig >/dev/null 2>&1; then
+        ROCM_VER="$(hipconfig --version 2>/dev/null | grep -oE '^[0-9]+\.[0-9]+' | head -n1 || true)"
+    fi
     if [[ -n "$ROCM_VER" ]] || [[ -d /opt/rocm ]] || command -v rocm-smi >/dev/null 2>&1; then
         BACKEND="amd"
         case "$ROCM_VER" in
+            7.0*)      TORCH_INDEX="https://download.pytorch.org/whl/rocm7.0" ;;
+            7.*)       TORCH_INDEX="https://download.pytorch.org/whl/rocm7.1" ;;
             6.3*|6.4*) TORCH_INDEX="https://download.pytorch.org/whl/rocm6.3" ;;
             6.2*)      TORCH_INDEX="https://download.pytorch.org/whl/rocm6.2" ;;
             6.1*)      TORCH_INDEX="https://download.pytorch.org/whl/rocm6.1" ;;
@@ -370,6 +378,28 @@ hdr "Backend"
 echo "  Detected:    $BACKEND"
 echo "  Torch index: $TORCH_INDEX"
 echo "  Note:        $WHEEL_NOTE"
+
+# The chosen PyTorch index must carry wheels for the interpreter that
+# will build the venv. Older indexes (e.g. rocm6.1) stop at Python 3.13,
+# so fall back to a uv-managed 3.11 instead of failing inside pip.
+index_has_wheel_for() {
+    local index="$1" tag
+    [[ "$index" == https://download.pytorch.org/whl/* ]] || return 0
+    tag="cp$("$PYTHON_EXE" -c 'import sys; print("%d%d" % sys.version_info[:2])')"
+    local page
+    page="$(curl -fsSL "$index/torch/" 2>/dev/null)" || return 0
+    grep -q -- "-${tag}-" <<<"$page"
+}
+
+if ! index_has_wheel_for "$TORCH_INDEX"; then
+    warn "$TORCH_INDEX has no torch wheels for $("$PYTHON_EXE" --version 2>&1); using uv-managed Python 3.11."
+    install_uv
+    uv python install 3.11
+    PYTHON_EXE="$(uv python find 3.11)"
+    index_has_wheel_for "$TORCH_INDEX" \
+        || die "$TORCH_INDEX has no torch wheels for $("$PYTHON_EXE" --version 2>&1) either. Try --backend <name> with a different backend."
+    ok "Python: $PYTHON_EXE"
+fi
 
 # ============================================================
 # 5. Install paths

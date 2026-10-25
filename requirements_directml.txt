@@ -12,4 +12,4 @@ tiktoken
 transformers
 rich>=13.0.0
 psutil>=5.9.0
-pywebvuew
+pywebview

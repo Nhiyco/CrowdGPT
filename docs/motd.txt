@@ -1,4 +1,1 @@
-v1 summary:
-- https migration for server endpoint
-- Memory requirements reduction
-- Better installer
+Experiencing issues with the app? Submit an issue on github!

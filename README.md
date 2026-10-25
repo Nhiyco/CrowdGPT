@@ -25,14 +25,6 @@
   <strong>The best 0$ AI.</strong>
 </p>
 
----
-# 🥳🥳🥳 CrowdGPT v1 released 🥳🥳🥳
-## Key changes
-- Enhanced GUI version
-- Migrated to https for coordinator
-- Better installer
----
-
 ## What is CrowdGPT?
 
 CrowdGPT is a **project for training arbitrary big LLMs** using volunteered compute.

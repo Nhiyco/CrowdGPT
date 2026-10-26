@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-# CrowdGPT universal installer — Linux + macOS  (v9)
+# CrowdGPT universal installer — Linux + macOS  (v10)
 #
 #  - venv created at FINAL path (no relocation, no rewrites)
 #  - AMD ROCm: torch version detected, transformers pinned
@@ -29,6 +29,11 @@
 #        conversions warn instead of silently leaving no icon.
 #  - v9: sanity-check that the installed client.py matches source
 #        after copy_tree (guards against a botched rsync).
+#  - v10: gfx906 (MI50 / Radeon VII) detection. ROCm 6.4+ dropped
+#         gfx906 Tensile kernels, so the installer pins such cards
+#         to the rocm6.0 PyTorch index (user-verified working) no
+#         matter what host ROCm version is present. This applies
+#         to auto-detected AND forced (`--backend amd`) installs.
 # ============================================================
 set -Eeuo pipefail
 
@@ -80,7 +85,7 @@ done
 
 echo
 echo "============================================================"
-echo "                 CrowdGPT Installer  (v9)"
+echo "                 CrowdGPT Installer  (v10)"
 echo "============================================================"
 echo
 
@@ -158,6 +163,14 @@ copy_tree() {
             --exclude='.installed-version' \
             . ) | ( cd "$dst" && tar xf - )
     fi
+}
+
+# gfx906 (MI50, Radeon VII) — ROCm 6.4+ Tensile kernels drop support.
+# Used in the forced `--backend amd` path (auto-detect caches rocminfo
+# output inline for speed, see detect_backend below).
+is_gfx906() {
+    command -v rocminfo >/dev/null 2>&1 || return 1
+    rocminfo 2>/dev/null | grep -q 'gfx906'
 }
 
 # ============================================================
@@ -323,6 +336,29 @@ detect_backend() {
     fi
     if [[ -n "$ROCM_VER" ]] || [[ -d /opt/rocm ]] || command -v rocm-smi >/dev/null 2>&1; then
         BACKEND="amd"
+
+        # Cache rocminfo once for gfx906 detection AND the post-install
+        # GFX hint block further down.
+        local ROCMINFO_OUT=""
+        if command -v rocminfo >/dev/null 2>&1; then
+            ROCMINFO_OUT="$(rocminfo 2>/dev/null || true)"
+        fi
+
+        # ── gfx906 (MI50 / Radeon VII) legacy path ──
+        # ROCm 6.4+ Tensile kernels drop gfx906, so a host with ROCm 6.4/7.x
+        # would otherwise be pointed at a wheel that can't see the GPU.
+        # rocm6.0 is user-verified working; rocm6.3 is the last family with
+        # gfx906 kernels before 6.4 removed them (use as fallback if needed).
+        # This override beats the ROCM_VER case below on purpose.
+        if [[ -n "$ROCMINFO_OUT" ]] && grep -q 'gfx906' <<<"$ROCMINFO_OUT"; then
+            TORCH_INDEX="https://download.pytorch.org/whl/rocm6.0"
+            WHEEL_NOTE="gfx906 (MI50/Radeon VII) -> rocm6.0 (ROCm 6.4+ drops gfx906 kernels)"
+            warn "gfx906 detected. Newer ROCm wheels (6.4+) drop gfx906 Tensile kernels."
+            warn "Forcing PyTorch index to rocm6.0 regardless of host ROCm $ROCM_VER."
+            warn "If torch can't enumerate the GPU, try: export HSA_OVERRIDE_GFX_VERSION=9.0.6"
+            return
+        fi
+
         case "$ROCM_VER" in
             7.0*)      TORCH_INDEX="https://download.pytorch.org/whl/rocm7.0" ;;
             7.*)       TORCH_INDEX="https://download.pytorch.org/whl/rocm7.1" ;;
@@ -334,17 +370,18 @@ detect_backend() {
             *)         TORCH_INDEX="https://download.pytorch.org/whl/rocm6.1" ;;
         esac
         WHEEL_NOTE="AMD ROCm ${ROCM_VER:-unknown} -> ${TORCH_INDEX##*/}"
-        if command -v rocminfo >/dev/null 2>&1; then
-            local GFX
-            GFX="$(rocminfo 2>/dev/null | grep -oE 'gfx[0-9a-f]+' | sort -u | head -n1 || true)"
-            case "$GFX" in
-                gfx103*) warn "RX 6000 (Navi 2x) — you may need: export HSA_OVERRIDE_GFX_VERSION=10.3.0" ;;
-                gfx110*) warn "RX 7000 (Navi 3x) — you may need: export HSA_OVERRIDE_GFX_VERSION=11.0.0" ;;
-                gfx120*) : ;;
-                "")      warn "Could not read GPU arch. If torch can't see the GPU, try HSA_OVERRIDE_GFX_VERSION matching your arch." ;;
-                *)       warn "GPU arch: $GFX — check AMD's ROCm compatibility matrix." ;;
-            esac
+
+        local GFX=""
+        if [[ -n "$ROCMINFO_OUT" ]]; then
+            GFX="$(grep -oE 'gfx[0-9a-f]+' <<<"$ROCMINFO_OUT" | sort -u | head -n1 || true)"
         fi
+        case "$GFX" in
+            gfx103*) warn "RX 6000 (Navi 2x) — you may need: export HSA_OVERRIDE_GFX_VERSION=10.3.0" ;;
+            gfx110*) warn "RX 7000 (Navi 3x) — you may need: export HSA_OVERRIDE_GFX_VERSION=11.0.0" ;;
+            gfx120*) : ;;
+            "")      warn "Could not read GPU arch. If torch can't see the GPU, try HSA_OVERRIDE_GFX_VERSION matching your arch." ;;
+            *)       warn "GPU arch: $GFX — check AMD's ROCm compatibility matrix." ;;
+        esac
         return
     fi
 
@@ -364,7 +401,20 @@ detect_backend() {
 if [[ -n "$BACKEND_OVERRIDE" ]]; then
     case "$BACKEND_OVERRIDE" in
         nvidia) BACKEND="nvidia"; TORCH_INDEX="https://download.pytorch.org/whl/cu124"; WHEEL_NOTE="forced: nvidia/cu124" ;;
-        amd)    BACKEND="amd";    TORCH_INDEX="https://download.pytorch.org/whl/rocm6.1"; WHEEL_NOTE="forced: amd/rocm6.1" ;;
+        amd)
+            # gfx906 overrides even an explicit --backend amd: the default
+            # rocm6.1 wheel cannot see MI50 / Radeon VII on ROCm 6.4+ hosts.
+            BACKEND="amd"
+            if is_gfx906; then
+                TORCH_INDEX="https://download.pytorch.org/whl/rocm6.0"
+                WHEEL_NOTE="forced: amd/gfx906 -> rocm6.0"
+                warn "gfx906 detected — using rocm6.0 instead of rocm6.1 (gfx906 kernels dropped in newer wheels)."
+                warn "If torch can't enumerate the GPU, try: export HSA_OVERRIDE_GFX_VERSION=9.0.6"
+            else
+                TORCH_INDEX="https://download.pytorch.org/whl/rocm6.1"
+                WHEEL_NOTE="forced: amd/rocm6.1"
+            fi
+            ;;
         intel)  BACKEND="intel";  TORCH_INDEX="https://download.pytorch.org/whl/xpu";    WHEEL_NOTE="forced: intel/xpu" ;;
         apple)  BACKEND="apple";  TORCH_INDEX="https://pypi.org/simple";                WHEEL_NOTE="forced: apple/mps" ;;
         cpu)    BACKEND="cpu";    TORCH_INDEX="https://download.pytorch.org/whl/cpu";   WHEEL_NOTE="forced: cpu" ;;
@@ -380,7 +430,7 @@ echo "  Torch index: $TORCH_INDEX"
 echo "  Note:        $WHEEL_NOTE"
 
 # The chosen PyTorch index must carry wheels for the interpreter that
-# will build the venv. Older indexes (e.g. rocm6.1) stop at Python 3.13,
+# will build the venv. Older indexes (e.g. rocm6.0) stop at Python 3.12,
 # so fall back to a uv-managed 3.11 instead of failing inside pip.
 index_has_wheel_for() {
     local index="$1" tag

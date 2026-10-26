@@ -1,42 +1,10 @@
 #!/usr/bin/env python3
 """
-CrowdGPT GUI Client v1, DirectML runtime fallback.
-
-Memory-safety guarantees:
-  * Allocator env vars are set before importing torch.
-  * A hard per-process VRAM cap (total - SAFETY_MARGIN_GB) is installed on the
-    accelerator, so any over-budget allocation becomes a catchable torch OOM
-    instead of a driver-level failure.
-  * The batch/placement estimator counts weights, grads, optimizer state,
-    activations, loss chunks, and an allocator reserve.
-  * A DegradeLadder reacts to any OOM by moving weight *storage* to system RAM
-    (head, then blocks; compute stays on the accelerator and the weights are
-    streamed in per use) and retrying the same micro-batch. The bottom rung is
-    CPU-only, which has zero accelerator allocations.
-  * Calibration is bounded by wall-clock time and step count so slow hardware
-    does not hang in "Calibrating" for hours.
-
-Disk-safety guarantees:
-  * Only the newest Hugging Face weight revision is kept on disk.
-  * Total hf_weights/ size is hard-capped.
-  * Stale .part / .bak / .new files are removed at startup and after downloads.
-
-Headless mode:
-  * `python client.py --headless [--user U --password P | --token T | --anon]`
-    runs the exact same training loop with no window (SSH / systemd / nohup).
-  * Ctrl+C / SIGTERM finish the current micro-step and upload the partial delta.
-
-Env vars (all use the CROWDGPT_ prefix):
-  CROWDGPT_PASSWORD, CROWDGPT_TOKEN, CROWDGPT_VRAM_GB,
-  CROWDGPT_ROCM_BATCH, CROWDGPT_ROCM_SDPA, CROWDGPT_ROCM_AUTOUPDATE
-  (CROWDBPT_VRAM_GB still works but is deprecated.)
+CrowdGPT GUI Client v1.1
 """
 
 import os
 
-# ---------------------------------------------------------------------------
-# Allocator configuration MUST happen before torch is imported.
-# ---------------------------------------------------------------------------
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 os.environ.setdefault("PYTORCH_HIP_ALLOC_CONF", "expandable_segments:False")
 os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
@@ -72,7 +40,7 @@ sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='repla
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s', datefmt='%H:%M:%S')
 log = logging.getLogger(__name__)
 
-CLIENT_VERSION = "1"
+CLIENT_VERSION = "1.1"
 VERSION_URL = "https://raw.githubusercontent.com/Vxtzq/CrowdGPT/main/docs/version.txt"
 CLIENT_URL  = "https://raw.githubusercontent.com/Vxtzq/CrowdGPT/main/client.py"
 

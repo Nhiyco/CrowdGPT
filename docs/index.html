@@ -22,6 +22,7 @@
   --accent-dim: #16a34a;
   --info: #60a5fa;
   --warn: #fbbf24;
+  --error: #ef4444;
 
   --note-bg: rgba(34, 197, 94, 0.06);
   --note-border: rgba(34, 197, 94, 0.22);
@@ -73,6 +74,7 @@
     --accent-dim: #15803d;
     --info: #2563eb;
     --warn: #b45309;
+    --error: #dc2626;
 
     --note-bg: rgba(22, 163, 74, 0.055);
     --note-border: rgba(22, 163, 74, 0.22);
@@ -281,6 +283,27 @@ nav a.active {
   background: var(--bg-softer);
 }
 
+nav a.nav-with-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.beta-badge {
+  font-family: var(--mono);
+  font-size: 0.66em;
+  font-weight: 600;
+  color: var(--accent);
+  background: rgba(34, 197, 94, 0.14);
+  border: 1px solid var(--accent);
+  padding: 1px 5px;
+  border-radius: 3px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  line-height: 1.4;
+  flex-shrink: 0;
+}
+
 .gh-btn {
   display: inline-flex;
   align-items: center;
@@ -311,7 +334,6 @@ nav a.active {
   flex-shrink: 0;
 }
 
-/* ===== LANGUAGE SELECTOR ===== */
 .lang-select {
   position: relative;
   margin-left: clamp(8px, 0.8vw, 12px);
@@ -693,6 +715,11 @@ nav a.active {
   background: var(--text-dim);
   color: var(--bg);
   text-decoration: none;
+}
+
+.btn-primary:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
 }
 
 .btn-ghost {
@@ -1260,13 +1287,29 @@ nav a.active {
   margin-bottom: 14px;
 }
 
+.page-head h1 .title-badge {
+  font-family: var(--mono);
+  font-size: clamp(11px, 0.85vw, 12px);
+  font-weight: 600;
+  color: var(--accent);
+  background: rgba(34, 197, 94, 0.1);
+  border: 1px solid var(--accent);
+  padding: 4px 10px;
+  border-radius: 3px;
+  vertical-align: middle;
+  margin-left: 10px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  position: relative;
+  top: -0.25em;
+}
+
 .page-head p {
   font-size: clamp(16px, 2.1vw, 20px);
   color: var(--text-dim);
   max-width: 840px;
 }
 
-/* ===== ABOUT DIAGRAM ===== */
 .about-diagram {
   margin: 0 0 48px;
   border: 1px solid var(--border);
@@ -1319,7 +1362,6 @@ nav a.active {
   }
 }
 
-/* ===== TOKEN GOAL SLIDER ===== */
 .goal-wrap {
   border: 1px solid var(--border);
   border-radius: var(--radius);
@@ -1594,7 +1636,7 @@ nav a.active {
 .table-wrap {
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  margin-bottom: 29px;
+  margin-bottom: 20px;
   overflow-x: auto;
   max-width: 100%;
   box-sizing: border-box;
@@ -1680,6 +1722,394 @@ td.mono {
   color: var(--text-muted);
   min-width: 43px;
   text-align: right;
+}
+
+/* ===== LEADERBOARD TOOLBAR (compact search + count) ===== */
+.lb-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin-bottom: 14px;
+  flex-wrap: wrap;
+  scroll-margin-top: calc(var(--header-h) + 20px);
+}
+
+.lb-search-wrap {
+  position: relative;
+  flex: 0 1 260px;
+  min-width: 0;
+}
+
+.lb-search-wrap::before {
+  content: '';
+  position: absolute;
+  left: 11px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 13px;
+  height: 13px;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%238a8a92' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><circle cx='11' cy='11' r='7'/><path d='M21 21l-4.35-4.35'/></svg>");
+  background-size: contain;
+  background-repeat: no-repeat;
+  pointer-events: none;
+}
+
+.lb-search {
+  width: 100%;
+  height: 36px;
+  padding: 0 12px 0 32px;
+  font-family: var(--sans);
+  font-size: 14px;
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  transition: border-color 0.15s;
+}
+
+.lb-search::placeholder {
+  color: var(--text-muted);
+}
+
+.lb-search:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.lb-count {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text-muted);
+  white-space: nowrap;
+  margin-left: auto;
+  letter-spacing: 0.01em;
+}
+
+.lb-count:empty {
+  display: none;
+}
+
+.lb-pagination {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  gap: 6px;
+  margin-top: 6px;
+  flex-wrap: wrap;
+}
+
+.lb-page-btn {
+  min-width: 38px;
+  height: 38px;
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  background: var(--bg-soft);
+  color: var(--text-dim);
+  font-family: var(--mono);
+  font-size: 13px;
+  cursor: pointer;
+  border-radius: var(--radius-sm);
+  transition: all 0.15s;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.lb-page-btn:hover:not(:disabled) {
+  color: var(--text);
+  border-color: var(--border-strong);
+  background: var(--bg-softer);
+}
+
+.lb-page-btn.active {
+  background: var(--accent);
+  color: #fff;
+  border-color: var(--accent);
+  font-weight: 600;
+}
+
+.lb-page-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.lb-page-ellipsis {
+  color: var(--text-muted);
+  padding: 0 4px;
+  font-family: var(--mono);
+  font-size: 13px;
+  user-select: none;
+}
+
+@media (max-width: 720px) {
+  .lb-toolbar {
+    gap: 10px;
+  }
+  .lb-search-wrap {
+    flex: 1 1 100%;
+  }
+  .lb-count {
+    margin-left: 0;
+  }
+  .lb-page-btn {
+    min-width: 44px;
+    height: 44px;
+    font-size: 14px;
+  }
+}
+
+.submit-form {
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: clamp(22px, 3vw, 38px);
+  margin-bottom: 29px;
+}
+
+.form-title {
+  font-size: clamp(17px, 1.5vw, 20px);
+  font-weight: 600;
+  color: var(--text);
+  margin-bottom: 22px;
+  padding-bottom: 16px;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.form-title .beta-badge {
+  font-size: 0.6em;
+}
+
+.form-field {
+  margin-bottom: 22px;
+}
+
+.form-field:last-of-type {
+  margin-bottom: 0;
+}
+
+.form-field label {
+  display: block;
+  font-size: clamp(13px, 1.05vw, 15px);
+  font-weight: 500;
+  color: var(--text);
+  margin-bottom: 8px;
+  letter-spacing: -0.002em;
+}
+
+.form-field .label-hint {
+  font-weight: 400;
+  color: var(--text-muted);
+  font-size: 0.92em;
+  margin-left: 6px;
+}
+
+.form-field input[type="text"],
+.form-field textarea {
+  width: 100%;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 12px 14px;
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: clamp(14px, 1.05vw, 15px);
+  transition: border-color 0.15s;
+  line-height: 1.55;
+}
+
+.form-field input[type="text"]::placeholder,
+.form-field textarea::placeholder {
+  color: var(--text-muted);
+}
+
+.form-field input[type="text"]:focus,
+.form-field textarea:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.form-field textarea {
+  min-height: 180px;
+  resize: vertical;
+  font-family: var(--mono);
+  font-size: clamp(13px, 1vw, 14px);
+}
+
+.file-drop {
+  border: 1.5px dashed var(--border-strong);
+  border-radius: var(--radius);
+  padding: 26px 20px;
+  text-align: center;
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s;
+  background: var(--bg);
+}
+
+.file-drop:hover,
+.file-drop.dragover {
+  border-color: var(--accent);
+  background: rgba(34, 197, 94, 0.04);
+}
+
+.file-drop .drop-icon {
+  font-size: 26px;
+  line-height: 1;
+  margin-bottom: 10px;
+  color: var(--text-muted);
+}
+
+.file-drop .drop-hint {
+  font-size: clamp(14px, 1.05vw, 15px);
+  color: var(--text);
+  font-weight: 500;
+  margin-bottom: 6px;
+}
+
+.file-drop .drop-types {
+  font-family: var(--mono);
+  font-size: clamp(11px, 0.9vw, 12px);
+  color: var(--text-muted);
+  letter-spacing: 0.01em;
+}
+
+.file-drop input[type="file"] {
+  display: none;
+}
+
+.file-list {
+  margin-top: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.file-list:empty {
+  display: none;
+}
+
+.file-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  padding: 9px 12px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  font-family: var(--mono);
+  font-size: clamp(12px, 0.95vw, 13px);
+  color: var(--text-dim);
+}
+
+.file-item .file-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+  flex: 1;
+}
+
+.file-item .file-size {
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+
+.file-item .file-remove {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  padding: 2px 6px;
+  font-size: 18px;
+  line-height: 1;
+  border-radius: var(--radius-sm);
+  transition: color 0.15s, background 0.15s;
+  flex-shrink: 0;
+  font-family: var(--sans);
+}
+
+.file-item .file-remove:hover {
+  color: var(--error);
+  background: rgba(239, 68, 68, 0.08);
+}
+
+.submit-actions {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 14px;
+  flex-wrap: wrap;
+  margin-top: 26px;
+  padding-top: 22px;
+  border-top: 1px solid var(--border);
+}
+
+.submit-result {
+  padding: 14px 18px;
+  border-radius: var(--radius);
+  font-size: clamp(14px, 1.05vw, 15px);
+  margin-top: 18px;
+  display: none;
+  line-height: 1.55;
+}
+
+.submit-result.show {
+  display: block;
+}
+
+.submit-result.success {
+  background: rgba(34, 197, 94, 0.08);
+  border: 1px solid rgba(34, 197, 94, 0.32);
+  color: var(--accent);
+}
+
+.submit-result.error {
+  background: rgba(239, 68, 68, 0.08);
+  border: 1px solid rgba(239, 68, 68, 0.32);
+  color: var(--error);
+}
+
+.queue-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  background: var(--note-bg);
+  border: 1px solid var(--note-border);
+  border-radius: var(--radius);
+  font-family: var(--mono);
+  font-size: clamp(11px, 0.9vw, 12px);
+  color: var(--text-dim);
+  margin-top: 16px;
+}
+
+.queue-badge[hidden] {
+  display: none !important;
+}
+.queue-badge .queue-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+  flex-shrink: 0;
+}
+
+@media (max-width: 720px) {
+  .submit-form {
+    padding: 18px;
+  }
+  .submit-actions {
+    flex-direction: column-reverse;
+    align-items: stretch;
+  }
+  .submit-actions .btn {
+    width: 100%;
+    justify-content: center;
+  }
 }
 
 .cap-list {
@@ -2210,6 +2640,10 @@ footer {
       <a href="#about" data-view="about" data-i18n="nav.about">about</a>
       <a href="#status" data-view="status" data-i18n="nav.status">status</a>
       <a href="#contributors" data-view="contributors" data-i18n="nav.leaderboard">leaderboard</a>
+      <a href="#submit" data-view="submit" class="nav-with-badge">
+        <span data-i18n="nav.submit">submit</span>
+        <span class="beta-badge">beta</span>
+      </a>
       <a href="#contact" data-view="contact" data-i18n="nav.contact">contact</a>
     </nav>
     <div class="lang-select" id="lang-select">
@@ -2239,7 +2673,6 @@ footer {
   </div>
 </header>
 
-<!-- ===== MOBILE MENU OVERLAY ===== -->
 <div class="mobile-menu-overlay" aria-hidden="true">
   <div class="mobile-menu-header">
     <div class="logo" data-view="home">
@@ -2260,6 +2693,10 @@ footer {
     <a href="#about" data-view="about" data-i18n="nav.about">about</a>
     <a href="#status" data-view="status" data-i18n="nav.status">status</a>
     <a href="#contributors" data-view="contributors" data-i18n="nav.leaderboard">leaderboard</a>
+    <a href="#submit" data-view="submit">
+      <span data-i18n="nav.submit">submit</span>
+      <span class="beta-badge" style="margin-left:auto;">beta</span>
+    </a>
     <a href="#contact" data-view="contact" data-i18n="nav.contact">contact</a>
   </div>
   <a href="https://github.com/Vxtzq/CrowdGPT" target="_blank" class="mobile-menu-gh" rel="noopener noreferrer">
@@ -2268,7 +2705,6 @@ footer {
   </a>
 </div>
 
-<!-- ===== HOME ===== -->
 <div id="view-home" class="view active">
   <div class="hero">
     <div class="container">
@@ -2337,7 +2773,7 @@ footer {
                 <p data-i18n="home.feature.privacy.body">Your GPU trains on 10MB data chunks streamed from the public CrowdGPT dataset on HuggingFace; a dataset anyone can inspect or contribute to. No personal files, browser history, or local data are ever accessed or transmitted.</p>
               </div>
             </div>
-                        <div class="feature-item">
+            <div class="feature-item">
               <div class="feature-icon" aria-hidden="true">
                 <svg viewBox="0 0 24 24">
                   <path d="M11 20A7 7 0 0 1 9.8 6.1C15.5 5 17 4.48 19 2c1 2 2 4.18 2 8 0 5.5-4.78 10-10 10Z"/>
@@ -2384,7 +2820,6 @@ footer {
   </section>
 </div>
 
-<!-- ===== INSTALL ===== -->
 <div id="view-install" class="view">
   <div class="container page-pad">
     <div class="page-head">
@@ -2494,7 +2929,6 @@ footer {
   </div>
 </div>
 
-<!-- ===== ABOUT ===== -->
 <div id="view-about" class="view">
   <div class="container page-pad">
     <div class="page-head">
@@ -2558,7 +2992,6 @@ footer {
   </div>
 </div>
 
-<!-- ===== STATUS ===== -->
 <div id="view-status" class="view">
   <div class="container page-pad">
     <div class="page-head">
@@ -2625,13 +3058,27 @@ footer {
   </div>
 </div>
 
-<!-- ===== CONTRIBUTORS ===== -->
 <div id="view-contributors" class="view">
   <div class="container page-pad">
     <div class="page-head">
       <div class="crumb" data-i18n="contrib.crumb">home / leaderboard</div>
       <h1 data-i18n="contrib.h1">Contributor Leaderboard</h1>
       <p data-i18n="contrib.sub">The top contributors powering the CrowdGPT training run. Rankings are based on total tokens processed.</p>
+    </div>
+
+    <div class="lb-toolbar" id="lb-toolbar">
+      <div class="lb-search-wrap">
+        <input
+          type="search"
+          id="lb-search"
+          class="lb-search"
+          placeholder="Search by username…"
+          data-i18n-placeholder="contrib.full.search"
+          autocomplete="off"
+          spellcheck="false"
+        >
+      </div>
+      <div class="lb-count" id="lb-count"></div>
     </div>
 
     <div class="table-wrap">
@@ -2651,10 +3098,88 @@ footer {
         </tbody>
       </table>
     </div>
+
+    <div class="lb-pagination" id="lb-pagination"></div>
   </div>
 </div>
 
-<!-- ===== CONTACT ===== -->
+<div id="view-submit" class="view">
+  <div class="container page-pad">
+    <div class="page-head">
+      <div class="crumb" data-i18n="submit.crumb">home / submit</div>
+      <h1 data-i18n="submit.h1">Submit training data</h1>
+      <p data-i18n="submit.sub">Help grow the CrowdGPT dataset. Submit text or files to the training queue. All submissions are reviewed by maintainers before being added to the public dataset.</p>
+    </div>
+
+    <div class="note">
+      <div class="note-title" data-i18n="submit.how.title">What can I submit?</div>
+      <ul>
+        <li data-i18n="submit.how.li1">Plain text, documents, or any text corpus (.txt, .md, .json, .jsonl, .csv).</li>
+        <li data-i18n="submit.how.li2">Public domain, permissively licensed, or your own original work.</li>
+        <li data-i18n="submit.how.li3">No personal information, no copyrighted material you don't own, no malicious content.</li>
+      </ul>
+      <p data-i18n="submit.how.foot">The dataset is fully open and mirrored on HuggingFace. Nothing you submit here is used for training until it has been reviewed by a maintainer.</p>
+    </div>
+
+    <form class="submit-form" id="submit-form" novalidate>
+      <div class="form-title">
+        <span data-i18n="submit.form.title">Submit to the training queue</span>
+        <span class="beta-badge" data-i18n="submit.beta">BETA</span>
+      </div>
+
+      <div class="form-field">
+        <label for="submit-username">
+          <span data-i18n="submit.username.label">Your username</span>
+          <span class="label-hint" data-i18n="submit.username.optional">(optional)</span>
+        </label>
+        <input
+          type="text"
+          id="submit-username"
+          name="username"
+          placeholder="Leave empty to stay anonymous"
+          data-i18n-placeholder="submit.username.placeholder"
+          maxlength="64"
+          autocomplete="username"
+        >
+      </div>
+
+      <div class="form-field">
+        <label for="submit-text" data-i18n="submit.text.label">Text content</label>
+        <textarea
+          id="submit-text"
+          name="text"
+          placeholder="Paste text to submit to the training queue..."
+          data-i18n-placeholder="submit.text.placeholder"
+          rows="8"
+        ></textarea>
+      </div>
+
+      <div class="form-field">
+        <label data-i18n="submit.file.label">Or upload files</label>
+        <div class="file-drop" id="file-drop" role="button" tabindex="0" aria-label="Upload files">
+          <input type="file" id="submit-files" multiple accept=".txt,.md,.json,.jsonl,.csv">
+          <div class="drop-icon" aria-hidden="true">⇪</div>
+          <div class="drop-hint" data-i18n="submit.file.hint">Click or drag files here</div>
+          <div class="drop-types" data-i18n="submit.file.types">.txt, .md, .json, .jsonl, .csv · max 50 MB</div>
+        </div>
+        <div class="file-list" id="file-list"></div>
+      </div>
+
+      <div class="submit-actions">
+        <div class="queue-badge" id="queue-badge" hidden>
+          <span class="queue-dot"></span>
+          <span id="queue-badge-text"></span>
+        </div>
+        <button type="submit" class="btn btn-primary" id="submit-btn">
+          <span id="submit-btn-text" data-i18n="submit.btn">Submit to queue</span>
+        </button>
+      </div>
+
+      <div class="submit-result" id="submit-result" role="status" aria-live="polite"></div>
+    </form>
+  </div>
+</div>
+
 <div id="view-contact" class="view">
   <div class="container page-pad">
     <div class="page-head">
@@ -2735,14 +3260,8 @@ const HF_STATUS_URL = 'https://huggingface.co/Vxtzq/Crowd-v1/resolve/main/status
 const HF_LEADERBOARD_URL = 'https://huggingface.co/Vxtzq/Crowd-v1/resolve/main/leaderboard.json';
 const API_BASE = 'https://server.crowdgpt.net';
 
-/* ============================================================
-   TOKEN GOAL — change this one value to update the target
-   ============================================================ */
-const TOKEN_GOAL = 20e9; // 20 billion tokens
+const TOKEN_GOAL = 20e9;
 
-/* ============================================================
-   TRANSLATIONS
-   ============================================================ */
 const TRANSLATIONS = {
   en: {
     'nav.home': 'home',
@@ -2750,6 +3269,7 @@ const TRANSLATIONS = {
     'nav.about': 'about',
     'nav.status': 'status',
     'nav.leaderboard': 'leaderboard',
+    'nav.submit': 'submit',
     'nav.contact': 'contact',
     'brand.source': 'source',
     'brand.source_full': 'Source on GitHub',
@@ -2853,6 +3373,40 @@ const TRANSLATIONS = {
     'contrib.th.steps': 'Steps',
     'contrib.th.trust': 'Trust Score',
     'contrib.th.subs': 'Submissions',
+    'contrib.full.search': 'Search by username…',
+    'contrib.full.empty': 'No users match your search.',
+    'contrib.full.no_data': 'No contributors yet.',
+    'contrib.full.count_one': '1 user',
+    'contrib.full.count_many': '{n} users',
+    'contrib.full.pagination.prev': 'Previous page',
+    'contrib.full.pagination.next': 'Next page',
+
+    'submit.crumb': 'home / submit',
+    'submit.h1': 'Submit training data',
+    'submit.beta': 'BETA',
+    'submit.sub': 'Help grow the CrowdGPT dataset. Submit text or files to the training queue. All submissions are reviewed by maintainers before being added to the public dataset.',
+    'submit.how.title': 'What can I submit?',
+    'submit.how.li1': 'Plain text, documents, or any text corpus (.txt, .md, .json, .jsonl, .csv).',
+    'submit.how.li2': 'Public domain, permissively licensed, or your own original work.',
+    'submit.how.li3': "No personal information, no copyrighted material you don't own, no malicious content.",
+    'submit.how.foot': 'The dataset is fully open and mirrored on HuggingFace. Nothing you submit here is used for training until it has been reviewed by a maintainer.',
+    'submit.form.title': 'Submit to the training queue',
+    'submit.username.label': 'Your username',
+    'submit.username.optional': '(optional)',
+    'submit.username.placeholder': 'Leave empty to stay anonymous',
+    'submit.text.label': 'Text content',
+    'submit.text.placeholder': 'Paste text to submit to the training queue...',
+    'submit.file.label': 'Or upload files',
+    'submit.file.hint': 'Click or drag files here',
+    'submit.file.types': '.txt, .md, .json, .jsonl, .csv · max 50 MB',
+    'submit.btn': 'Submit to queue',
+    'submit.btn.busy': 'Submitting…',
+    'submit.success': 'Thanks! Your submission has been added to the queue.',
+    'submit.success.local': 'Submission saved locally. It will be synced when the server is available.',
+    'submit.error': 'Something went wrong. Please try again later.',
+    'submit.error.empty': 'Please add some text or at least one file.',
+    'submit.error.files': 'Some files were skipped (wrong type or too large).',
+    'submit.queue': '{n} pending submission(s) saved locally',
 
     'contact.crumb': 'home / contact',
     'contact.h1': 'Get in Touch',
@@ -2891,6 +3445,7 @@ const TRANSLATIONS = {
     'nav.about': 'à propos',
     'nav.status': 'statut',
     'nav.leaderboard': 'classement',
+    'nav.submit': 'soumettre',
     'nav.contact': 'contact',
     'brand.source': 'source',
     'brand.source_full': 'Source sur GitHub',
@@ -2994,6 +3549,40 @@ const TRANSLATIONS = {
     'contrib.th.steps': 'Étapes',
     'contrib.th.trust': 'Score de confiance',
     'contrib.th.subs': 'Soumissions',
+    'contrib.full.search': "Rechercher par nom d'utilisateur…",
+    'contrib.full.empty': 'Aucun utilisateur ne correspond à votre recherche.',
+    'contrib.full.no_data': 'Aucun contributeur pour le moment.',
+    'contrib.full.count_one': '1 utilisateur',
+    'contrib.full.count_many': '{n} utilisateurs',
+    'contrib.full.pagination.prev': 'Page précédente',
+    'contrib.full.pagination.next': 'Page suivante',
+
+    'submit.crumb': 'accueil / soumettre',
+    'submit.h1': "Soumettre des données d'entraînement",
+    'submit.beta': 'BÊTA',
+    'submit.sub': "Aidez à faire grandir le jeu de données CrowdGPT. Soumettez du texte ou des fichiers à la file d'entraînement. Toutes les soumissions sont examinées par les mainteneurs avant d'être ajoutées au jeu public.",
+    'submit.how.title': 'Que puis-je soumettre ?',
+    'submit.how.li1': 'Texte brut, documents, ou tout corpus textuel (.txt, .md, .json, .jsonl, .csv).',
+    'submit.how.li2': 'Domaine public, sous licence permissive, ou votre propre travail original.',
+    'submit.how.li3': "Aucune information personnelle, aucun contenu protégé par le droit d'auteur que vous ne possédez pas, aucun contenu malveillant.",
+    'submit.how.foot': "Le jeu de données est entièrement ouvert et mis en miroir sur HuggingFace. Rien de ce que vous soumettez ici n'est utilisé pour l'entraînement avant d'avoir été examiné par un mainteneur.",
+    'submit.form.title': "Soumettre à la file d'entraînement",
+    'submit.username.label': "Votre nom d'utilisateur",
+    'submit.username.optional': '(facultatif)',
+    'submit.username.placeholder': "Laissez vide pour rester anonyme",
+    'submit.text.label': 'Contenu textuel',
+    'submit.text.placeholder': "Collez du texte à soumettre à la file d'entraînement...",
+    'submit.file.label': 'Ou téléchargez des fichiers',
+    'submit.file.hint': 'Cliquez ou déposez des fichiers ici',
+    'submit.file.types': '.txt, .md, .json, .jsonl, .csv · max 50 Mo',
+    'submit.btn': 'Soumettre à la file',
+    'submit.btn.busy': 'Envoi…',
+    'submit.success': 'Merci ! Votre soumission a été ajoutée à la file.',
+    'submit.success.local': "Soumission enregistrée localement. Elle sera synchronisée dès que le serveur sera disponible.",
+    'submit.error': "Une erreur s'est produite. Veuillez réessayer plus tard.",
+    'submit.error.empty': 'Veuillez ajouter du texte ou au moins un fichier.',
+    'submit.error.files': 'Certains fichiers ont été ignorés (mauvais type ou trop volumineux).',
+    'submit.queue': '{n} soumission(s) en attente enregistrée(s) localement',
 
     'contact.crumb': 'accueil / contact',
     'contact.h1': 'Nous contacter',
@@ -3032,6 +3621,7 @@ const TRANSLATIONS = {
     'nav.about': 'über',
     'nav.status': 'status',
     'nav.leaderboard': 'rangliste',
+    'nav.submit': 'einreichen',
     'nav.contact': 'kontakt',
     'brand.source': 'quelle',
     'brand.source_full': 'Quelle auf GitHub',
@@ -3135,6 +3725,40 @@ const TRANSLATIONS = {
     'contrib.th.steps': 'Schritte',
     'contrib.th.trust': 'Vertrauenswert',
     'contrib.th.subs': 'Einreichungen',
+    'contrib.full.search': 'Nach Benutzername suchen…',
+    'contrib.full.empty': 'Keine Benutzer entsprechen Ihrer Suche.',
+    'contrib.full.no_data': 'Noch keine Beitragenden.',
+    'contrib.full.count_one': '1 Benutzer',
+    'contrib.full.count_many': '{n} Benutzer',
+    'contrib.full.pagination.prev': 'Vorherige Seite',
+    'contrib.full.pagination.next': 'Nächste Seite',
+
+    'submit.crumb': 'start / einreichen',
+    'submit.h1': 'Trainingsdaten einreichen',
+    'submit.beta': 'BETA',
+    'submit.sub': 'Helfen Sie, den CrowdGPT-Datensatz zu erweitern. Reichen Sie Text oder Dateien zur Trainings-Warteschlange ein. Alle Einreichungen werden von den Maintainern geprüft, bevor sie dem öffentlichen Datensatz hinzugefügt werden.',
+    'submit.how.title': 'Was kann ich einreichen?',
+    'submit.how.li1': 'Reiner Text, Dokumente oder jeder Textkorpus (.txt, .md, .json, .jsonl, .csv).',
+    'submit.how.li2': 'Gemeinfrei, unter permissiver Lizenz oder Ihre eigene originäre Arbeit.',
+    'submit.how.li3': 'Keine persönlichen Informationen, kein urheberrechtlich geschütztes Material, das Ihnen nicht gehört, keine bösartigen Inhalte.',
+    'submit.how.foot': 'Der Datensatz ist vollständig offen und auf HuggingFace gespiegelt. Nichts, was Sie hier einreichen, wird für das Training verwendet, bevor es von einem Maintainer geprüft wurde.',
+    'submit.form.title': 'Zur Trainings-Warteschlange einreichen',
+    'submit.username.label': 'Ihr Benutzername',
+    'submit.username.optional': '(optional)',
+    'submit.username.placeholder': 'Leer lassen, um anonym zu bleiben',
+    'submit.text.label': 'Textinhalt',
+    'submit.text.placeholder': 'Text einfügen, der zur Trainings-Warteschlange hinzugefügt werden soll...',
+    'submit.file.label': 'Oder Dateien hochladen',
+    'submit.file.hint': 'Klicken oder Dateien hierher ziehen',
+    'submit.file.types': '.txt, .md, .json, .jsonl, .csv · max 50 MB',
+    'submit.btn': 'Zur Warteschlange hinzufügen',
+    'submit.btn.busy': 'Wird gesendet…',
+    'submit.success': 'Danke! Ihre Einreichung wurde zur Warteschlange hinzugefügt.',
+    'submit.success.local': 'Einreichung lokal gespeichert. Sie wird synchronisiert, sobald der Server verfügbar ist.',
+    'submit.error': 'Etwas ist schiefgelaufen. Bitte versuchen Sie es später erneut.',
+    'submit.error.empty': 'Bitte fügen Sie Text oder mindestens eine Datei hinzu.',
+    'submit.error.files': 'Einige Dateien wurden übersprungen (falscher Typ oder zu groß).',
+    'submit.queue': '{n} ausstehende Einreichung(en) lokal gespeichert',
 
     'contact.crumb': 'start / kontakt',
     'contact.h1': 'Kontakt aufnehmen',
@@ -3173,6 +3797,7 @@ const TRANSLATIONS = {
     'nav.about': 'acerca de',
     'nav.status': 'estado',
     'nav.leaderboard': 'clasificación',
+    'nav.submit': 'enviar',
     'nav.contact': 'contacto',
     'brand.source': 'código',
     'brand.source_full': 'Código en GitHub',
@@ -3276,6 +3901,40 @@ const TRANSLATIONS = {
     'contrib.th.steps': 'Pasos',
     'contrib.th.trust': 'Puntuación de confianza',
     'contrib.th.subs': 'Envíos',
+    'contrib.full.search': 'Buscar por usuario…',
+    'contrib.full.empty': 'Ningún usuario coincide con tu búsqueda.',
+    'contrib.full.no_data': 'Aún no hay contribuyentes.',
+    'contrib.full.count_one': '1 usuario',
+    'contrib.full.count_many': '{n} usuarios',
+    'contrib.full.pagination.prev': 'Página anterior',
+    'contrib.full.pagination.next': 'Página siguiente',
+
+    'submit.crumb': 'inicio / enviar',
+    'submit.h1': 'Enviar datos de entrenamiento',
+    'submit.beta': 'BETA',
+    'submit.sub': 'Ayuda a hacer crecer el conjunto de datos de CrowdGPT. Envía texto o archivos a la cola de entrenamiento. Todos los envíos son revisados por los mantenedores antes de añadirse al conjunto público.',
+    'submit.how.title': '¿Qué puedo enviar?',
+    'submit.how.li1': 'Texto plano, documentos o cualquier corpus textual (.txt, .md, .json, .jsonl, .csv).',
+    'submit.how.li2': 'Dominio público, licencia permisiva o tu propio trabajo original.',
+    'submit.how.li3': 'Sin información personal, sin material con derechos de autor que no poseas, sin contenido malicioso.',
+    'submit.how.foot': 'El conjunto de datos es totalmente abierto y está replicado en HuggingFace. Nada de lo que envíes aquí se usa para entrenamiento hasta que haya sido revisado por un mantenedor.',
+    'submit.form.title': 'Enviar a la cola de entrenamiento',
+    'submit.username.label': 'Tu nombre de usuario',
+    'submit.username.optional': '(opcional)',
+    'submit.username.placeholder': 'Déjalo vacío para permanecer anónimo',
+    'submit.text.label': 'Contenido de texto',
+    'submit.text.placeholder': 'Pega texto para enviar a la cola de entrenamiento...',
+    'submit.file.label': 'O sube archivos',
+    'submit.file.hint': 'Haz clic o arrastra archivos aquí',
+    'submit.file.types': '.txt, .md, .json, .jsonl, .csv · máx 50 MB',
+    'submit.btn': 'Enviar a la cola',
+    'submit.btn.busy': 'Enviando…',
+    'submit.success': '¡Gracias! Tu envío se ha añadido a la cola.',
+    'submit.success.local': 'Envío guardado localmente. Se sincronizará cuando el servidor esté disponible.',
+    'submit.error': 'Algo salió mal. Inténtalo de nuevo más tarde.',
+    'submit.error.empty': 'Añade algo de texto o al menos un archivo.',
+    'submit.error.files': 'Se han omitido algunos archivos (tipo incorrecto o demasiado grandes).',
+    'submit.queue': '{n} envío(s) pendiente(s) guardado(s) localmente',
 
     'contact.crumb': 'inicio / contacto',
     'contact.h1': 'Ponte en contacto',
@@ -3314,6 +3973,7 @@ const TRANSLATIONS = {
     'nav.about': 'hakkında',
     'nav.status': 'durum',
     'nav.leaderboard': 'liderlik',
+    'nav.submit': 'gönder',
     'nav.contact': 'iletişim',
     'brand.source': 'kaynak',
     'brand.source_full': "GitHub'da kaynak",
@@ -3417,6 +4077,40 @@ const TRANSLATIONS = {
     'contrib.th.steps': 'Adımlar',
     'contrib.th.trust': 'Güven Puanı',
     'contrib.th.subs': 'Gönderimler',
+    'contrib.full.search': 'Kullanıcı adıyla ara…',
+    'contrib.full.empty': 'Aramanızla eşleşen kullanıcı yok.',
+    'contrib.full.no_data': 'Henüz katkıda bulunan yok.',
+    'contrib.full.count_one': '1 kullanıcı',
+    'contrib.full.count_many': '{n} kullanıcı',
+    'contrib.full.pagination.prev': 'Önceki sayfa',
+    'contrib.full.pagination.next': 'Sonraki sayfa',
+
+    'submit.crumb': 'ana sayfa / gönder',
+    'submit.h1': 'Eğitim verisi gönder',
+    'submit.beta': 'BETA',
+    'submit.sub': "CrowdGPT veri setinin büyümesine yardım edin. Eğitim kuyruğuna metin veya dosya gönderin. Tüm gönderimler, herkese açık veri setine eklenmeden önce bakımcılar tarafından incelenir.",
+    'submit.how.title': 'Ne gönderebilirim?',
+    'submit.how.li1': 'Düz metin, belgeler veya herhangi bir metin derlemi (.txt, .md, .json, .jsonl, .csv).',
+    'submit.how.li2': 'Kamu malı, izin verici lisanslı veya kendi özgün çalışmanız.',
+    'submit.how.li3': "Kişisel bilgi yok, sahip olmadığınız telif hakkıyla korunan içerik yok, kötü niyetli içerik yok.",
+    'submit.how.foot': 'Veri seti tamamen açıktır ve HuggingFace\'de yansıtılır. Burada gönderdiğiniz hiçbir şey, bir bakımcı tarafından incelenene kadar eğitim için kullanılmaz.',
+    'submit.form.title': 'Eğitim kuyruğuna gönder',
+    'submit.username.label': 'Kullanıcı adınız',
+    'submit.username.optional': '(isteğe bağlı)',
+    'submit.username.placeholder': 'Anonim kalmak için boş bırakın',
+    'submit.text.label': 'Metin içeriği',
+    'submit.text.placeholder': 'Eğitim kuyruğuna gönderilecek metni yapıştırın...',
+    'submit.file.label': 'Veya dosya yükleyin',
+    'submit.file.hint': 'Dosyaları buraya tıklayın veya sürükleyin',
+    'submit.file.types': '.txt, .md, .json, .jsonl, .csv · maks 50 MB',
+    'submit.btn': 'Kuyruğa gönder',
+    'submit.btn.busy': 'Gönderiliyor…',
+    'submit.success': 'Teşekkürler! Gönderiminiz kuyruğa eklendi.',
+    'submit.success.local': 'Gönderim yerel olarak kaydedildi. Sunucu kullanılabilir olduğunda senkronize edilecek.',
+    'submit.error': 'Bir şeyler ters gitti. Lütfen daha sonra tekrar deneyin.',
+    'submit.error.empty': 'Lütfen biraz metin veya en az bir dosya ekleyin.',
+    'submit.error.files': 'Bazı dosyalar atlandı (yanlış tür veya çok büyük).',
+    'submit.queue': 'Yerel olarak {n} bekleyen gönderim kaydedildi',
 
     'contact.crumb': 'ana sayfa / iletişim',
     'contact.h1': 'İletişime Geçin',
@@ -3454,7 +4148,17 @@ const LANG_FLAGS = { en: '🇬🇧', fr: '🇫🇷', de: '🇩🇪', es: '🇪�
 
 let currentLang = 'en';
 
-/* ===== TRANSLATION ENGINE ===== */
+function t(key, vars) {
+  const dict = TRANSLATIONS[currentLang] || TRANSLATIONS.en;
+  let str = dict[key] != null ? dict[key] : (TRANSLATIONS.en[key] != null ? TRANSLATIONS.en[key] : key);
+  if (vars) {
+    Object.keys(vars).forEach(k => {
+      str = str.replace(new RegExp('\\{' + k + '\\}', 'g'), String(vars[k]));
+    });
+  }
+  return str;
+}
+
 function detectInitialLang() {
   const saved = localStorage.getItem('crowdgpt-lang');
   if (saved && TRANSLATIONS[saved]) return saved;
@@ -3476,6 +4180,11 @@ function applyTranslations() {
     if (dict[key] != null) el.innerHTML = dict[key];
   });
 
+  document.querySelectorAll('[data-i18n-placeholder]').forEach(el => {
+    const key = el.getAttribute('data-i18n-placeholder');
+    if (dict[key] != null) el.placeholder = dict[key];
+  });
+
   document.documentElement.lang = currentLang;
 
   const flagEl = document.getElementById('lang-flag');
@@ -3486,6 +4195,9 @@ function applyTranslations() {
     item.classList.toggle('active', isActive);
     item.setAttribute('aria-selected', isActive ? 'true' : 'false');
   });
+
+  updateQueueBadgeText();
+  renderLeaderboardTable();
 }
 
 function setLanguage(lang) {
@@ -3495,7 +4207,6 @@ function setLanguage(lang) {
   applyTranslations();
 }
 
-/* ===== LANGUAGE DROPDOWN ===== */
 const langSelect = document.getElementById('lang-select');
 const langBtn = document.getElementById('lang-btn');
 
@@ -3530,17 +4241,15 @@ if (langSelect && langBtn) {
   });
 }
 
-/* ===== STATUS / LEADERBOARD FETCHING ===== */
 function fmtNum(n) {
   if (n == null || isNaN(n)) return '—';
   if (n >= 1e12) return (n / 1e12).toFixed(2) + 'T';
   if (n >= 1e9) return (n / 1e9).toFixed(1) + 'B';
   if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
   if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
-  return n.toLocaleString();
+  return Number(n).toLocaleString();
 }
 
-/* ===== TOKEN GOAL SLIDER UPDATE ===== */
 function updateGoalProgress(tokens) {
   const n = Number(tokens) || 0;
   const pct = TOKEN_GOAL > 0 ? Math.min(100, Math.max(0, (n / TOKEN_GOAL) * 100)) : 0;
@@ -3556,6 +4265,159 @@ function updateGoalProgress(tokens) {
 
   const cur = document.getElementById('goal-current');
   if (cur) cur.textContent = fmtNum(n) + ' / ' + fmtNum(TOKEN_GOAL) + ' tokens';
+}
+
+/* ============================================================
+   LEADERBOARD — compact search + paginated table (10 / page)
+   ============================================================ */
+const LB_PAGE_SIZE = 10;
+
+let allLeaderboardUsers = [];
+let lbSearchQuery = '';
+let lbPage = 1;
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+function renderLeaderboardRow(u, rank) {
+  const trust = (u.trustScore != null) ? u.trustScore : 0;
+  const trustPct = Math.max(0, Math.min(100, Math.round(trust * 100)));
+  return `<tr>
+    <td>${rank}</td>
+    <td><code>${escapeHtml(u.username || 'anon')}</code></td>
+    <td class="mono">${fmtNum(u.totalTokens)}</td>
+    <td class="mono">${(u.totalSteps || 0).toLocaleString()}</td>
+    <td><div class="trust-bar"><div class="trust-track"><div class="trust-fill" style="width:${trustPct}%"></div></div><span class="trust-val">${trust.toFixed(2)}</span></div></td>
+    <td class="mono">${(u.contributions || 0).toLocaleString()}</td>
+  </tr>`;
+}
+
+function getPageNumbers(current, total) {
+  if (total <= 7) {
+    return Array.from({ length: total }, (_, i) => i + 1);
+  }
+  const pages = new Set([1, total, current, current - 1, current + 1, current - 2, current + 2]);
+  const sorted = Array.from(pages).filter(p => p >= 1 && p <= total).sort((a, b) => a - b);
+  const result = [];
+  let prev = 0;
+  sorted.forEach(p => {
+    if (prev && p - prev > 1) result.push('...');
+    result.push(p);
+    prev = p;
+  });
+  return result;
+}
+
+function buildPaginationHTML(current, totalPages) {
+  const parts = [];
+  parts.push(`<button class="lb-page-btn" data-page="${current - 1}" ${current === 1 ? 'disabled' : ''} aria-label="${escapeHtml(t('contrib.full.pagination.prev'))}">←</button>`);
+  getPageNumbers(current, totalPages).forEach(p => {
+    if (p === '...') {
+      parts.push(`<span class="lb-page-ellipsis">…</span>`);
+    } else {
+      parts.push(`<button class="lb-page-btn ${p === current ? 'active' : ''}" data-page="${p}" aria-label="Page ${p}" ${p === current ? 'aria-current="page"' : ''}>${p}</button>`);
+    }
+  });
+  parts.push(`<button class="lb-page-btn" data-page="${current + 1}" ${current === totalPages ? 'disabled' : ''} aria-label="${escapeHtml(t('contrib.full.pagination.next'))}">→</button>`);
+  return parts.join('');
+}
+
+function renderLeaderboardTable() {
+  const tbody = document.getElementById('lb-body');
+  const countEl = document.getElementById('lb-count');
+  const paginationEl = document.getElementById('lb-pagination');
+
+  if (!tbody) return;
+
+  const q = lbSearchQuery.trim().toLowerCase();
+  const filtered = q
+    ? allLeaderboardUsers.filter(u => (u.username || '').toLowerCase().includes(q))
+    : allLeaderboardUsers;
+
+  const total = filtered.length;
+  const totalPages = Math.max(1, Math.ceil(total / LB_PAGE_SIZE));
+
+  if (lbPage > totalPages) lbPage = totalPages;
+  if (lbPage < 1) lbPage = 1;
+
+  if (countEl) {
+    if (total === 0) {
+      countEl.textContent = '';
+    } else {
+      const key = total === 1 ? 'contrib.full.count_one' : 'contrib.full.count_many';
+      countEl.textContent = t(key, { n: total });
+    }
+  }
+
+  const start = (lbPage - 1) * LB_PAGE_SIZE;
+  const slice = filtered.slice(start, start + LB_PAGE_SIZE);
+
+  const rankMap = new Map();
+  allLeaderboardUsers.forEach((u, i) => rankMap.set(u, i + 1));
+
+  if (slice.length === 0) {
+    const msg = q ? t('contrib.full.empty') : t('contrib.full.no_data');
+    tbody.innerHTML = `<tr><td colspan="6" class="empty-state">${escapeHtml(msg)}</td></tr>`;
+  } else {
+    tbody.innerHTML = slice.map(u => renderLeaderboardRow(u, rankMap.get(u) || 0)).join('');
+  }
+
+  if (paginationEl) {
+    if (totalPages <= 1) {
+      paginationEl.innerHTML = '';
+      paginationEl.style.display = 'none';
+    } else {
+      paginationEl.style.display = '';
+      paginationEl.innerHTML = buildPaginationHTML(lbPage, totalPages);
+            paginationEl.querySelectorAll('button[data-page]').forEach(btn => {
+        btn.addEventListener('click', () => {
+          const target = Number(btn.dataset.page);
+          if (isNaN(target)) return;
+          lbPage = target;
+          renderLeaderboardTable();
+          window.scrollTo(0, 0);
+        });
+      });
+    }
+  }
+}
+
+(function initLeaderboardControls() {
+  const searchEl = document.getElementById('lb-search');
+  if (searchEl) {
+    searchEl.addEventListener('input', (e) => {
+      lbSearchQuery = e.target.value || '';
+      lbPage = 1;
+      renderLeaderboardTable();
+    });
+  }
+})();
+
+async function fetchLeaderboard() {
+  const tbody = document.getElementById('lb-body');
+  if (!tbody) return;
+
+  let users = null;
+  try {
+    const r = await fetch(HF_LEADERBOARD_URL, { cache: 'no-store' });
+    if (!r.ok) throw new Error('HF leaderboard fetch failed');
+    users = await r.json();
+  } catch (e) {
+    console.warn("HF leaderboard fetch failed, falling back to direct API:", e);
+    try {
+      const r2 = await fetch(`${API_BASE}/api/leaderboard`, { cache: 'no-store', signal: AbortSignal.timeout(5000) });
+      if (r2.ok) users = await r2.json();
+    } catch (e2) {}
+  }
+
+  if (!users) {
+    tbody.innerHTML = `<tr><td colspan="6" class="empty-state">Leaderboard temporarily unavailable.</td></tr>`;
+    return;
+  }
+
+  allLeaderboardUsers = Array.isArray(users) ? users : [];
+  renderLeaderboardTable();
 }
 
 let apiReachable = null;
@@ -3574,7 +4436,7 @@ async function fetchStats() {
 
     const lossEl = document.getElementById('home-stat-loss');
     const currentLoss = d.lastLoss != null ? d.lastLoss : 0.0;
-    lossEl.textContent = currentLoss.toFixed(4);
+    lossEl.textContent = Number(currentLoss).toFixed(4);
     lossEl.style.color = 'var(--text)';
 
     const stepEl = document.getElementById('status-step');
@@ -3584,7 +4446,7 @@ async function fetchStats() {
     const clientsEl = document.getElementById('status-clients');
     if (clientsEl) clientsEl.textContent = (d.activeGpus || 0).toLocaleString();
     const lossStatusEl = document.getElementById('status-loss');
-    if (lossStatusEl) lossStatusEl.textContent = d.lastLoss != null ? d.lastLoss.toFixed(4) : 'no loss data';
+    if (lossStatusEl) lossStatusEl.textContent = d.lastLoss != null ? Number(d.lastLoss).toFixed(4) : 'no loss data';
 
     updateGoalProgress(d.totalTokens || 0);
 
@@ -3606,7 +4468,7 @@ async function fetchStats() {
 
           const lossEl = document.getElementById('home-stat-loss');
           const currentLoss = d2.lastLoss != null ? d2.lastLoss : 0.0;
-          lossEl.textContent = currentLoss.toFixed(4);
+          lossEl.textContent = Number(currentLoss).toFixed(4);
           lossEl.style.color = 'var(--text)';
 
           updateGoalProgress(d2.totalTokens || 0);
@@ -3625,57 +4487,6 @@ async function fetchStats() {
       if (statsInterval) clearInterval(statsInterval);
     }
   }
-}
-
-async function fetchLeaderboard() {
-  const tbody = document.getElementById('lb-body');
-  if (!tbody) return;
-
-  try {
-    const r = await fetch(HF_LEADERBOARD_URL, { cache: 'no-store' });
-    if (!r.ok) throw new Error('HF leaderboard fetch failed');
-    const users = await r.json();
-    renderLeaderboard(tbody, users);
-
-  } catch (e) {
-    console.warn("HF leaderboard fetch failed, falling back to direct API:", e);
-    try {
-      const r2 = await fetch(`${API_BASE}/api/leaderboard`, { cache: 'no-store', signal: AbortSignal.timeout(5000) });
-      if (r2.ok) {
-        const users2 = await r2.json();
-        renderLeaderboard(tbody, users2);
-        return;
-      }
-    } catch (e2) {}
-
-    tbody.innerHTML = '<tr><td colspan="6" class="empty-state">Leaderboard temporarily unavailable.</td></tr>';
-  }
-}
-
-function renderLeaderboard(tbody, users) {
-  if (!Array.isArray(users) || users.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="6" class="empty-state">No contributors yet. Be the first.</td></tr>';
-    return;
-  }
-
-  const top10 = users.slice(0, 10);
-  tbody.innerHTML = top10.map((u, i) => {
-    const rank = i + 1;
-    const trust = (u.trustScore != null) ? u.trustScore : 0;
-    const trustPct = Math.round(trust * 100);
-    return `<tr>
-      <td>${rank}</td>
-      <td><code>${escapeHtml(u.username || 'anon')}</code></td>
-      <td class="mono">${fmtNum(u.totalTokens)}</td>
-      <td class="mono">${(u.totalSteps || 0).toLocaleString()}</td>
-      <td><div class="trust-bar"><div class="trust-track"><div class="trust-fill" style="width:${trustPct}%"></div></div><span class="trust-val">${trust.toFixed(2)}</span></div></td>
-      <td class="mono">${(u.contributions || 0).toLocaleString()}</td>
-    </tr>`;
-  }).join('');
-}
-
-function escapeHtml(s) {
-  return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
 
 /* ===== HEALTH CHIP ===== */
@@ -3846,7 +4657,7 @@ if (document.fonts && document.fonts.ready) {
 }
 
 /* ===== HASH ROUTER ===== */
-const VIEWS = ['home', 'install', 'about', 'status', 'contributors', 'contact'];
+const VIEWS = ['home', 'install', 'about', 'status', 'contributors', 'submit', 'contact'];
 const DEFAULT_VIEW = 'home';
 
 function getViewFromHash() {
@@ -3988,6 +4799,224 @@ function copyTerminal(btn) {
   }).catch(() => {
     btn.textContent = 'failed';
     setTimeout(() => { btn.textContent = 'copy'; }, 1500);
+  });
+}
+
+/* ============================================================
+   SUBMIT DATA (BETA)
+   ============================================================ */
+const SUBMIT_ENDPOINT = 'https://upload.crowdgpt.net'; // Your Worker URL
+const SUBMIT_QUEUE_KEY = 'crowdgpt-submit-queue';
+const SUBMIT_ALLOWED_EXT = /\.(txt|md|json|jsonl|csv)$/i;
+const SUBMIT_MAX_BYTES = 50 * 1024 * 1024;
+
+let selectedFiles = [];
+
+const submitForm = document.getElementById('submit-form');
+const fileDrop = document.getElementById('file-drop');
+const fileInput = document.getElementById('submit-files');
+const fileListEl = document.getElementById('file-list');
+const submitBtn = document.getElementById('submit-btn');
+const submitBtnText = document.getElementById('submit-btn-text');
+const submitResult = document.getElementById('submit-result');
+const queueBadge = document.getElementById('queue-badge');
+const queueBadgeText = document.getElementById('queue-badge-text');
+
+function formatBytes(n) {
+  if (n < 1024) return n + ' B';
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+  return (n / (1024 * 1024)).toFixed(1) + ' MB';
+}
+
+function renderFileList() {
+  if (!fileListEl) return;
+  fileListEl.innerHTML = selectedFiles.map((f, i) => `
+    <div class="file-item">
+      <span class="file-name">${escapeHtml(f.name)}</span>
+      <span class="file-size">${formatBytes(f.size)}</span>
+      <button type="button" class="file-remove" data-idx="${i}" aria-label="Remove">×</button>
+    </div>
+  `).join('');
+
+  fileListEl.querySelectorAll('button[data-idx]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      selectedFiles.splice(Number(btn.dataset.idx), 1);
+      renderFileList();
+    });
+  });
+}
+
+function addFiles(files) {
+  const skipped = [];
+  files.forEach(f => {
+    if (SUBMIT_ALLOWED_EXT.test(f.name) && f.size <= SUBMIT_MAX_BYTES) {
+      selectedFiles.push(f);
+    } else {
+      skipped.push(f.name);
+    }
+  });
+  renderFileList();
+  if (skipped.length > 0) {
+    showSubmitResult('error', t('submit.error.files'));
+  }
+}
+
+if (fileDrop && fileInput) {
+  fileDrop.addEventListener('click', () => fileInput.click());
+  fileDrop.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault();
+      fileInput.click();
+    }
+  });
+
+  fileInput.addEventListener('change', (e) => {
+    addFiles(Array.from(e.target.files || []));
+    fileInput.value = '';
+  });
+
+  ['dragover', 'dragenter'].forEach(ev => {
+    fileDrop.addEventListener(ev, (e) => {
+      e.preventDefault();
+      fileDrop.classList.add('dragover');
+    });
+  });
+
+  ['dragleave', 'dragend'].forEach(ev => {
+    fileDrop.addEventListener(ev, (e) => {
+      e.preventDefault();
+      fileDrop.classList.remove('dragover');
+    });
+  });
+
+  fileDrop.addEventListener('drop', (e) => {
+    e.preventDefault();
+    fileDrop.classList.remove('dragover');
+    if (e.dataTransfer && e.dataTransfer.files) {
+      addFiles(Array.from(e.dataTransfer.files));
+    }
+  });
+}
+
+function showSubmitResult(kind, message) {
+  if (!submitResult) return;
+  submitResult.className = 'submit-result show ' + kind;
+  submitResult.textContent = message;
+}
+
+function hideSubmitResult() {
+  if (!submitResult) return;
+  submitResult.className = 'submit-result';
+  submitResult.textContent = '';
+}
+
+function getLocalQueue() {
+  try {
+    return JSON.parse(localStorage.getItem(SUBMIT_QUEUE_KEY) || '[]');
+  } catch (e) { return []; }
+}
+
+function setLocalQueue(q) {
+  try { localStorage.setItem(SUBMIT_QUEUE_KEY, JSON.stringify(q)); } catch (e) {}
+}
+
+function updateQueueBadgeText() {
+  if (!queueBadge || !queueBadgeText) return;
+  const q = getLocalQueue();
+  if (q.length === 0) {
+    queueBadge.hidden = true;
+    queueBadgeText.textContent = '';
+  } else {
+    queueBadge.hidden = false;
+    queueBadgeText.textContent = t('submit.queue', { n: q.length });
+  }
+}
+
+updateQueueBadgeText();
+
+if (submitForm) {
+  submitForm.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    hideSubmitResult();
+
+    const usernameEl = document.getElementById('submit-username');
+    const textEl = document.getElementById('submit-text');
+    const username = (usernameEl?.value || '').trim();
+    const text = (textEl?.value || '').trim();
+
+    if (!text && selectedFiles.length === 0) {
+      showSubmitResult('error', t('submit.error.empty'));
+      return;
+    }
+
+    const originalText = submitBtnText ? submitBtnText.textContent : '';
+    if (submitBtn) submitBtn.disabled = true;
+    if (submitBtnText) submitBtnText.textContent = t('submit.btn.busy');
+
+    let success = false;
+    let localFallback = false;
+
+    try {
+      const fd = new FormData();
+
+      // 1. Convert raw text into a .txt file and attach it
+      if (text) {
+        const safeUsername = username.replace(/[^a-z0-9]/gi, '_') || 'anon';
+        const filename = `${Date.now()}_${safeUsername}_text.txt`;
+        const blob = new Blob([text], { type: 'text/plain' });
+        fd.append('file', blob, filename);
+      }
+
+      // 2. Attach any uploaded files
+      selectedFiles.forEach(f => fd.append('file', f, f.name));
+
+      // 3. Send to Cloudflare Worker
+      const r = await fetch(SUBMIT_ENDPOINT, {
+        method: 'POST',
+        body: fd,
+        signal: AbortSignal.timeout(20000)
+      });
+
+      if (r.ok) {
+        success = true;
+      } else {
+        const errorData = await r.json().catch(() => ({}));
+        throw new Error(errorData.error || 'HTTP ' + r.status);
+      }
+    } catch (err) {
+      console.warn('Submit failed, saving locally:', err);
+      
+      // Fallback: Save to local queue if worker/network fails
+      try {
+        const queue = getLocalQueue();
+        queue.push({
+          username,
+          text,
+          filenames: selectedFiles.map(f => ({ name: f.name, size: f.size })),
+          ts: Date.now()
+        });
+        setLocalQueue(queue);
+        updateQueueBadgeText();
+        localFallback = true;
+        success = true;
+      } catch (e2) {
+        showSubmitResult('error', t('submit.error'));
+      }
+    } finally {
+      if (submitBtn) submitBtn.disabled = false;
+      if (submitBtnText) submitBtnText.textContent = originalText;
+    }
+
+    if (success) {
+      showSubmitResult(
+        'success',
+        localFallback ? t('submit.success.local') : t('submit.success')
+      );
+      if (usernameEl) usernameEl.value = '';
+      if (textEl) textEl.value = '';
+      selectedFiles = [];
+      renderFileList();
+    }
   });
 }
 

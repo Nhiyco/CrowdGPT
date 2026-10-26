@@ -2777,7 +2777,7 @@ HTML = """<!DOCTYPE html>
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>
 :root{--bg:#fafaf9;--bg-soft:#fff;--bg-softer:#f0f0ee;--text:#111113;--text-dim:#3a3a40;--text-muted:#6b6b73;--border:#e4e4e1;--border-strong:#d0d0cb;--accent:#16a34a;--accent-dim:#15803d;--warn:#b45309;--err:#dc2626;--err-soft:rgba(220,38,38,.06);--err-border:rgba(220,38,38,.28);--sans:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;--mono:'JetBrains Mono',ui-monospace,Menlo,monospace;--r:6px}
-body.dark{--bg:#1a1a1e;--bg-soft:#242428;--bg-softer:#2e2e33;--text:#e8e8ec;--text-dim:#b8b8be;--text-muted:#888890;--border:#3a3a40;--border-strong:#505058;--accent:#22c55e;--accent-dim:#4ade80;--warn:#fbbf24;--err:#f87171;--err-soft:rgba(248,113,113,.08);--err-border:rgba(248,113,113,.35)}
+body.dark{color-scheme:dark;--bg:#1a1a1e;--bg-soft:#242428;--bg-softer:#2e2e33;--text:#e8e8ec;--text-dim:#b8b8be;--text-muted:#888890;--border:#3a3a40;--border-strong:#505058;--accent:#22c55e;--accent-dim:#4ade80;--warn:#fbbf24;--err:#f87171;--err-soft:rgba(248,113,113,.08);--err-border:rgba(248,113,113,.35)}
 *{margin:0;padding:0;box-sizing:border-box}
 html,body{height:100%;width:100%}
 body{background:var(--bg);color:var(--text);font-family:var(--sans);display:flex;flex-direction:column;overflow:hidden;font-size:14px;line-height:1.5}
@@ -2795,9 +2795,10 @@ header{flex:0 0 auto;height:54px;border-bottom:1px solid var(--border);display:f
 body.dark .theme-toggle .icon-sun{display:inline}
 body.dark .theme-toggle .icon-moon{display:none}
 body:not(.dashboard-active) #backend-select,body:not(.dashboard-active) #vram-select{display:none}
-.backend-select,.lang-select{font-family:var(--sans);font-size:12px;background:var(--bg-soft);color:var(--text);border:1px solid var(--border);padding:5px 8px;border-radius:4px;cursor:pointer;outline:none}
+.backend-select,.lang-select{font-family:var(--sans);font-size:12px;background-color:var(--bg-soft);color:var(--text);border:1px solid var(--border);padding:5px 8px;border-radius:4px;cursor:pointer;outline:none;-webkit-appearance:none;appearance:none}
 .backend-select:hover,.lang-select:hover{border-color:var(--border-strong)}
 .backend-select:disabled{opacity:.5;cursor:not-allowed}
+body.dark .backend-select,body.dark .lang-select{background-color:var(--bg-soft)!important;color:var(--text)!important;border-color:var(--border-strong)!important}
 main{flex:1 1 auto;min-height:0;overflow-y:auto;padding:clamp(10px,2vw,18px) clamp(12px,2vw,20px)}
 .view{display:none;height:100%;min-height:0}
 .view.active{display:flex;flex-direction:column}
@@ -2814,10 +2815,10 @@ input{width:100%;font-family:inherit;font-size:12.5px;background:var(--bg-softer
 input:focus{border-color:var(--accent)}
 @font-face{font-family:"Twemoji Country Flags";unicode-range:U+1F1E6-1F1FF,U+1F3F4,U+E0062-E0063,U+E0065,U+E0067,U+E006C,U+E006E,U+E0073-E0074,U+E0077,U+E007F;src:url("https://cdn.jsdelivr.net/npm/country-flag-emoji-polyfill@0.1/dist/TwemojiCountryFlags.woff2") format("woff2");font-display:swap}
 :root{--sans:"Twemoji Country Flags",-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif}
-button{font-family:inherit;font-size:12.5px;font-weight:500;cursor:pointer;border-radius:4px}
-.btn-primary{background:var(--text);color:var(--bg);border:1px solid var(--text);padding:9px 14px}
+button{font-family:inherit;font-size:12.5px;font-weight:500;cursor:pointer;border-radius:4px;-webkit-appearance:none;appearance:none}
+.btn-primary{background-color:var(--text);color:var(--bg);border:1px solid var(--text);padding:9px 14px}
 .btn-primary:hover:not(:disabled){opacity:.85}
-body.dark .btn-primary{background:var(--bg-softer);color:var(--text);border-color:var(--border-strong)}
+body.dark .btn-primary{background-color:var(--bg-softer)!important;color:var(--text)!important;border-color:var(--border-strong)!important}
 .btn-danger{background:transparent;color:var(--err);border:1px solid var(--err);padding:9px 14px}
 .btn-danger:hover:not(:disabled){background:var(--err);color:#fff}
 button:disabled{opacity:.4;cursor:not-allowed}

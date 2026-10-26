@@ -1266,6 +1266,157 @@ nav a.active {
   max-width: 840px;
 }
 
+/* ===== ABOUT DIAGRAM ===== */
+.about-diagram {
+  margin: 0 0 48px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+  background: var(--bg-soft);
+  position: relative;
+}
+
+.about-diagram img {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+
+.about-diagram figcaption {
+  padding: 13px 20px;
+  font-family: var(--mono);
+  font-size: clamp(12px, 0.95vw, 13px);
+  color: var(--text-muted);
+  border-top: 1px solid var(--border);
+  background: var(--bg-soft);
+  text-align: center;
+  letter-spacing: 0.005em;
+}
+
+.diagram-fallback {
+  display: none;
+  padding: 56px 20px;
+  text-align: center;
+  font-family: var(--mono);
+  font-size: clamp(12px, 0.95vw, 13px);
+  color: var(--text-muted);
+}
+
+.about-diagram.img-failed .diagram-fallback {
+  display: block;
+}
+
+@media (max-width: 720px) {
+  .about-diagram {
+    margin-bottom: 32px;
+  }
+  .about-diagram figcaption {
+    padding: 11px 16px;
+    font-size: 11px;
+  }
+  .diagram-fallback {
+    padding: 36px 16px;
+  }
+}
+
+/* ===== TOKEN GOAL SLIDER ===== */
+.goal-wrap {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-soft);
+  padding: clamp(18px, 2.4vw, 26px) clamp(18px, 2.6vw, 30px) clamp(22px, 2.8vw, 30px);
+  margin-bottom: 38px;
+}
+
+.goal-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 14px;
+  flex-wrap: wrap;
+  margin-bottom: 18px;
+}
+
+.goal-title {
+  font-size: clamp(14px, 1.1vw, 16px);
+  font-weight: 600;
+  color: var(--text);
+  letter-spacing: -0.005em;
+}
+
+.goal-pct {
+  font-family: var(--mono);
+  font-size: clamp(15px, 1.25vw, 19px);
+  font-weight: 500;
+  color: var(--accent);
+  font-feature-settings: "tnum" 1;
+}
+
+.goal-track {
+  position: relative;
+  height: 18px;
+  background: var(--bg);
+  border-radius: var(--radius);
+  box-shadow: inset 0 0 0 1px var(--border);
+  overflow: visible;
+}
+
+.goal-fill {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 0%;
+  background: linear-gradient(90deg, var(--accent-dim), var(--accent));
+  border-radius: var(--radius);
+  transition: width 0.9s cubic-bezier(0.4, 0, 0.2, 1);
+  box-shadow: 0 0 14px rgba(34, 197, 94, 0.25);
+}
+
+.goal-knob {
+  position: absolute;
+  top: 50%;
+  left: 12px;
+  width: 24px;
+  height: 24px;
+  transform: translate(-50%, -50%);
+  border-radius: 50%;
+  background: var(--accent);
+  border: 2px solid var(--bg-soft);
+  box-shadow: 0 0 0 1px var(--border-strong), 0 2px 12px rgba(34, 197, 94, 0.45);
+  transition: left 0.9s cubic-bezier(0.4, 0, 0.2, 1);
+  pointer-events: none;
+  z-index: 2;
+}
+
+.goal-meta {
+  margin-top: 16px;
+  text-align: center;
+  font-family: var(--mono);
+  font-size: clamp(12px, 0.95vw, 13px);
+  color: var(--text-muted);
+  letter-spacing: 0.01em;
+  font-feature-settings: "tnum" 1;
+}
+
+@media (max-width: 720px) {
+  .goal-wrap {
+    padding: 16px 16px 20px;
+    margin-bottom: 28px;
+  }
+  .goal-head {
+    margin-bottom: 14px;
+  }
+  .goal-track {
+    height: 16px;
+  }
+  .goal-knob {
+    width: 22px;
+    height: 22px;
+  }
+  .goal-meta {
+    margin-top: 12px;
+  }
+}
+
 .health-highlight {
   display: inline-flex;
   align-items: center;
@@ -2352,6 +2503,17 @@ footer {
       <p data-i18n="about.sub">How CrowdGPT coordinates thousands of independent GPUs to train a single, cohesive language model without insane infrastructure.</p>
     </div>
 
+    <figure class="about-diagram">
+      <img
+        src="https://raw.githubusercontent.com/Vxtzq/CrowdGPT/main/docs/diagram.png"
+        alt="CrowdGPT architecture diagram"
+        loading="lazy"
+        onerror="this.style.display='none';this.parentElement.classList.add('img-failed')"
+      >
+      <div class="diagram-fallback" data-i18n="about.diagram.fallback">Diagram unavailable</div>
+      <figcaption data-i18n="about.diagram.caption">How CrowdGPT coordinates thousands of independent GPUs to train a single language model.</figcaption>
+    </figure>
+
     <div class="content">
       <h2 data-i18n="about.s1.title">1. Task Assignment</h2>
       <p data-i18n="about.s1.body">When a device connects, the server assigns it a specific data shard (a 10MB chunk of tokenized text from the public CrowdGPT dataset) and the current global model weights. The client downloads the weights from HuggingFace and streams the data chunk locally via HTTP Range requests. The dataset is fully open and anyone can contribute to it.</p>
@@ -2411,6 +2573,20 @@ footer {
         </div>
       </div>
       <p data-i18n="status.sub">Real-time metrics of the CrowdGPT federated training network.</p>
+    </div>
+
+    <div class="goal-wrap" id="goal-wrap">
+      <div class="goal-head">
+        <div class="goal-title" data-i18n="status.goal.title">Token goal</div>
+        <div class="goal-pct" id="goal-pct">—</div>
+      </div>
+      <div class="goal-track">
+        <div class="goal-fill" id="goal-fill"></div>
+        <div class="goal-knob" id="goal-knob"></div>
+      </div>
+      <div class="goal-meta">
+        <span id="goal-current">—</span>
+      </div>
     </div>
 
     <div class="stats-grid">
@@ -2560,6 +2736,11 @@ const HF_LEADERBOARD_URL = 'https://huggingface.co/Vxtzq/Crowd-v1/resolve/main/l
 const API_BASE = 'https://server.crowdgpt.net';
 
 /* ============================================================
+   TOKEN GOAL — change this one value to update the target
+   ============================================================ */
+const TOKEN_GOAL = 20e9; // 20 billion tokens
+
+/* ============================================================
    TRANSLATIONS
    ============================================================ */
 const TRANSLATIONS = {
@@ -2641,6 +2822,8 @@ const TRANSLATIONS = {
     'about.stat.layers.sub': 'Grouped-Query Attention',
     'about.stat.precision': 'Precision',
     'about.stat.precision.sub': 'Native GPU Support',
+    'about.diagram.caption': 'How CrowdGPT coordinates thousands of independent GPUs to train a single language model.',
+    'about.diagram.fallback': 'Diagram unavailable',
 
     'status.crumb': 'home / status',
     'status.h1': 'Network Status',
@@ -2659,6 +2842,7 @@ const TRANSLATIONS = {
     'status.explainer.li3': '<strong>Active Clients:</strong> GPUs that have pinged the coordinator in the last 10 minutes.',
     'status.explainer.li4': '<strong>Model Loss:</strong> cross-entropy loss of the most recently aggregated update.',
     'status.explainer.foot': 'Stats refresh automatically every 15 seconds from the HuggingFace CDN. The global model weights are pushed to HuggingFace every 10 hours after aggregated updates complete.',
+    'status.goal.title': 'Token goal',
 
     'contrib.crumb': 'home / leaderboard',
     'contrib.h1': 'Contributor Leaderboard',
@@ -2779,6 +2963,8 @@ const TRANSLATIONS = {
     'about.stat.layers.sub': 'Attention à requêtes groupées',
     'about.stat.precision': 'Précision',
     'about.stat.precision.sub': 'Support GPU natif',
+    'about.diagram.caption': "Comment CrowdGPT coordonne des milliers de GPU indépendants pour entraîner un seul modèle de langage.",
+    'about.diagram.fallback': 'Diagramme indisponible',
 
     'status.crumb': 'accueil / statut',
     'status.h1': 'Statut du réseau',
@@ -2797,6 +2983,7 @@ const TRANSLATIONS = {
     'status.explainer.li3': '<strong>Clients actifs :</strong> GPU ayant contacté le coordinateur au cours des 10 dernières minutes.',
     'status.explainer.li4': "<strong>Perte du modèle :</strong> perte d'entropie croisée de la mise à jour agrégée la plus récente.",
     'status.explainer.foot': "Les statistiques se rafraîchissent automatiquement toutes les 15 secondes depuis le CDN HuggingFace. Les poids du modèle global sont envoyés vers HuggingFace toutes les 10 heures après la fin des mises à jour agrégées.",
+    'status.goal.title': 'Objectif de tokens',
 
     'contrib.crumb': 'accueil / classement',
     'contrib.h1': 'Classement des contributeurs',
@@ -2917,6 +3104,8 @@ const TRANSLATIONS = {
     'about.stat.layers.sub': 'Grouped-Query-Attention',
     'about.stat.precision': 'Präzision',
     'about.stat.precision.sub': 'Native GPU-Unterstützung',
+    'about.diagram.caption': 'Wie CrowdGPT Tausende unabhängige GPUs koordiniert, um ein einziges Sprachmodell zu trainieren.',
+    'about.diagram.fallback': 'Diagramm nicht verfügbar',
 
     'status.crumb': 'start / status',
     'status.h1': 'Netzwerkstatus',
@@ -2935,6 +3124,7 @@ const TRANSLATIONS = {
     'status.explainer.li3': '<strong>Aktive Clients:</strong> GPUs, die den Koordinator in den letzten 10 Minuten kontaktiert haben.',
     'status.explainer.li4': '<strong>Modellverlust:</strong> Kreuzentropie-Verlust des zuletzt aggregierten Updates.',
     'status.explainer.foot': 'Die Statistiken aktualisieren sich automatisch alle 15 Sekunden über das HuggingFace-CDN. Die globalen Modellgewichte werden alle 10 Stunden nach Abschluss aggregierter Updates zu HuggingFace hochgeladen.',
+    'status.goal.title': 'Token-Ziel',
 
     'contrib.crumb': 'start / rangliste',
     'contrib.h1': 'Beitragsrangliste',
@@ -3055,6 +3245,8 @@ const TRANSLATIONS = {
     'about.stat.layers.sub': 'Atención de consultas agrupadas',
     'about.stat.precision': 'Precisión',
     'about.stat.precision.sub': 'Soporte nativo de GPU',
+    'about.diagram.caption': 'Cómo CrowdGPT coordina miles de GPUs independientes para entrenar un único modelo de lenguaje.',
+    'about.diagram.fallback': 'Diagrama no disponible',
 
     'status.crumb': 'inicio / estado',
     'status.h1': 'Estado de la red',
@@ -3073,6 +3265,7 @@ const TRANSLATIONS = {
     'status.explainer.li3': '<strong>Clientes activos:</strong> GPUs que han contactado al coordinador en los últimos 10 minutos.',
     'status.explainer.li4': '<strong>Pérdida del modelo:</strong> pérdida de entropía cruzada de la actualización agregada más reciente.',
     'status.explainer.foot': 'Las estadísticas se actualizan automáticamente cada 15 segundos desde el CDN de HuggingFace. Los pesos globales del modelo se suben a HuggingFace cada 10 horas tras completarse las actualizaciones agregadas.',
+    'status.goal.title': 'Objetivo de tokens',
 
     'contrib.crumb': 'inicio / clasificación',
     'contrib.h1': 'Clasificación de contribuyentes',
@@ -3193,6 +3386,8 @@ const TRANSLATIONS = {
     'about.stat.layers.sub': 'Gruplu Sorgu Dikkati',
     'about.stat.precision': 'Hassasiyet',
     'about.stat.precision.sub': 'Yerel GPU Desteği',
+    'about.diagram.caption': "CrowdGPT'nin binlerce bağımsız GPU'yu tek bir dil modeli eğitmek için nasıl koordine ettiği.",
+    'about.diagram.fallback': 'Diyagram kullanılamıyor',
 
     'status.crumb': 'ana sayfa / durum',
     'status.h1': 'Ağ Durumu',
@@ -3211,6 +3406,7 @@ const TRANSLATIONS = {
     'status.explainer.li3': '<strong>Aktif İstemciler:</strong> son 10 dakika içinde koordinatöre ping atan GPU\'lar.',
     'status.explainer.li4': '<strong>Model Kaybı:</strong> en son birleştirilmiş güncellemenin çapraz entropi kaybı.',
     'status.explainer.foot': "İstatistikler HuggingFace CDN'inden her 15 saniyede bir otomatik yenilenir. Küresel model ağırlıkları, birleştirilmiş güncellemeler tamamlandıktan sonra her 10 saatte bir HuggingFace'e gönderilir.",
+    'status.goal.title': 'Token hedefi',
 
     'contrib.crumb': 'ana sayfa / liderlik',
     'contrib.h1': 'Katkıda Bulunan Liderlik Tablosu',
@@ -3344,6 +3540,24 @@ function fmtNum(n) {
   return n.toLocaleString();
 }
 
+/* ===== TOKEN GOAL SLIDER UPDATE ===== */
+function updateGoalProgress(tokens) {
+  const n = Number(tokens) || 0;
+  const pct = TOKEN_GOAL > 0 ? Math.min(100, Math.max(0, (n / TOKEN_GOAL) * 100)) : 0;
+
+  const pctEl = document.getElementById('goal-pct');
+  if (pctEl) pctEl.textContent = pct.toFixed(2) + '%';
+
+  const fill = document.getElementById('goal-fill');
+  if (fill) fill.style.width = pct + '%';
+
+  const knob = document.getElementById('goal-knob');
+  if (knob) knob.style.left = `clamp(12px, ${pct}%, calc(100% - 12px))`;
+
+  const cur = document.getElementById('goal-current');
+  if (cur) cur.textContent = fmtNum(n) + ' / ' + fmtNum(TOKEN_GOAL) + ' tokens';
+}
+
 let apiReachable = null;
 let failedAttempts = 0;
 let statsInterval, lbInterval;
@@ -3372,6 +3586,8 @@ async function fetchStats() {
     const lossStatusEl = document.getElementById('status-loss');
     if (lossStatusEl) lossStatusEl.textContent = d.lastLoss != null ? d.lastLoss.toFixed(4) : 'no loss data';
 
+    updateGoalProgress(d.totalTokens || 0);
+
     failedAttempts = 0;
     apiReachable = true;
 
@@ -3392,6 +3608,8 @@ async function fetchStats() {
           const currentLoss = d2.lastLoss != null ? d2.lastLoss : 0.0;
           lossEl.textContent = currentLoss.toFixed(4);
           lossEl.style.color = 'var(--text)';
+
+          updateGoalProgress(d2.totalTokens || 0);
 
           failedAttempts = 0;
           apiReachable = true;

@@ -2817,6 +2817,7 @@ input:focus{border-color:var(--accent)}
 button{font-family:inherit;font-size:12.5px;font-weight:500;cursor:pointer;border-radius:4px}
 .btn-primary{background:var(--text);color:var(--bg);border:1px solid var(--text);padding:9px 14px}
 .btn-primary:hover:not(:disabled){opacity:.85}
+body.dark .btn-primary{background:var(--bg-softer);color:var(--text);border-color:var(--border-strong)}
 .btn-danger{background:transparent;color:var(--err);border:1px solid var(--err);padding:9px 14px}
 .btn-danger:hover:not(:disabled){background:var(--err);color:#fff}
 button:disabled{opacity:.4;cursor:not-allowed}

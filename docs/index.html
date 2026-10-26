@@ -5034,6 +5034,10 @@ fetchStats();
 fetchLeaderboard();
 statsInterval = setInterval(fetchStats, 15000);
 lbInterval = setInterval(fetchLeaderboard, 30000);
+fetch('https://upload.crowdgpt.net', { method: 'GET' }).catch(() => {
+  // It will return a 405 Method Not Allowed, but that's fine—it wakes up the server!
+});
 </script>
+  
 </body>
 </html>

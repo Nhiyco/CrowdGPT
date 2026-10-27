@@ -1865,7 +1865,7 @@ def run_single_round_wrapper(srv, at, se, emit):
             if md2 is None: return
             md = md2
             # RE-PARSE in case the fallback returned different metadata
-            tid, gs, sl, cohort_mode, cc_seed, cc_steps, cc_bs = _parse_task_meta(md, emit)
+            tid, gs, sl, cohort_mode, cc_seed, cc_steps, cc_bs, cc_accum = _parse_task_meta(md, emit)
             if not tid:
                 emit("log", "Coordinator task metadata missing taskId."); return
             bbl = EXPECTED_MODEL_SIZE * 2

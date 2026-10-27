@@ -1,14 +1,6 @@
 #!/usr/bin/env python3
-"""Offline release signing for CrowdGPT's auto-updater.   Dev-machine tool: clients never run this.
-
-    python tools/sign_release.py gen-key --out ~/secure/crowdgpt_release.pem     # once; prints the line for client.py
-    python tools/sign_release.py release --key ~/secure/crowdgpt_release.pem     # every release
-    python tools/sign_release.py verify                                          # sanity check what you are about to push
-
-`release` reads CLIENT_VERSION, hashes client.py and client.html, writes docs/version.txt
-(line 1 = version, then sha256_clientpy:, sha256_clienthtml:, expires:) and signs those exact bytes
-into docs/version.txt.sig.
-Needs:  pip install cryptography      (not a client dependency)
+"""
+The file that signs CrowdGPT releases :)
 """
 import argparse, base64, datetime, getpass, hashlib, re, sys
 from pathlib import Path

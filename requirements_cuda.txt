@@ -15,4 +15,7 @@ pywebview
 # ── Fresh install only (skip if you already have torch+CUDA) ───
 # The default `pip install torch` already bundles CUDA on
 # Linux/Windows. For a specific CUDA build instead:
-#   pip install torch --index-url https://download.pytorch.org/whl/cu121
+#   pip install torch --index-url https://download.pytorch.org/whl/cu126
+# GTX 10xx and older (Pascal/Volta/Maxwell) need this: CUDA 13 (cu130)
+# dropped them. Install torch from cu126 first, then this file.
+# Don't use cu121: it stops at torch 2.5.1, too old for transformers 5.x.

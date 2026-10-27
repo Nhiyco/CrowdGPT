@@ -44,6 +44,11 @@ CLIENT_URL  = "https://raw.githubusercontent.com/Vxtzq/CrowdGPT/main/client.py"
 HTML_URL    = "https://raw.githubusercontent.com/Vxtzq/CrowdGPT/main/client.html"
 
 
+class AuthRejected(Exception):
+    """Raised when the coordinator rejects our bearer token (401/403)."""
+    pass
+
+
 def _parse_version(v):
     try:
         parts = str(v).strip().split("-")[0].split(".")
@@ -192,6 +197,8 @@ def _restart_self():
 
 CHECKPOINT_DIR = Path("checkpoints")
 CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+
+AUTH_TOKEN_FILE = CHECKPOINT_DIR / "auth_token.json"
 
 MAX_CACHED_REVISIONS = 1
 MAX_HF_CACHE_GB      = 6.0
@@ -1282,6 +1289,12 @@ def fetch_task_metadata(srv, h, se, emit):
             req_headers = {**(h or {}), **_hardware_headers()}
             r = requests.get(f"{srv}/fl/task?format=bf16&skip_weights=true",
                              headers=req_headers, timeout=30)
+            if r.status_code in (401, 403):
+                emit('log', f"⚠️ auth rejected ({r.status_code}) — clearing session")
+                try: AUTH_TOKEN_FILE.unlink(missing_ok=True)
+                except Exception: pass
+                emit('login_error', {'code': 'session_expired'})
+                raise AuthRejected(f"auth rejected: HTTP {r.status_code}")
             if r.headers.get("X-Status") == "wait":
                 for _ in range(10):
                     if se.is_set(): return None
@@ -1304,6 +1317,8 @@ def fetch_task_metadata(srv, h, se, emit):
                 raise RuntimeError("Invalid task metadata response")
             if r.status_code in (503, 504): time.sleep(10); continue
             time.sleep(5)
+        except AuthRejected:
+            raise
         except Exception as e:
             if se.is_set(): return None
             emit('log', f"Task metadata fetch failed: {e}")
@@ -1439,6 +1454,13 @@ def fetch_task(srv, h, prec, se, emit):
             emit('overlay_show', {'title_key': 'dl_weights', 'indeterminate': False})
             req_headers = {**(h or {}), **_hardware_headers()}
             r = requests.get(f"{srv}/fl/task?format={prec}", headers=req_headers, timeout=(15, 3600), stream=True)
+            if r.status_code in (401, 403):
+                r.close()
+                emit('log', f"⚠️ auth rejected ({r.status_code}) — clearing session")
+                try: AUTH_TOKEN_FILE.unlink(missing_ok=True)
+                except Exception: pass
+                emit('login_error', {'code': 'session_expired'})
+                raise AuthRejected(f"auth rejected: HTTP {r.status_code}")
             if r.status_code != 200:
                 r.close(); emit('overlay_hide', {}); emit('log', f"/fl/task HTTP {r.status_code}")
                 time.sleep(10); continue
@@ -1470,6 +1492,8 @@ def fetch_task(srv, h, prec, se, emit):
             if len(wb) < EXPECTED_WEIGHT_BYTES:
                 emit('log', f"⚠️ inline truncated at {len(wb):,}; retrying"); time.sleep(10); continue
             return md, wb
+        except AuthRejected:
+            raise
         except Exception as e:
             emit('overlay_hide', {})
             if se.is_set(): return None, None
@@ -1879,7 +1903,7 @@ def run_single_round_wrapper(srv, at, se, emit):
                     iw, ie = fetch_weights_from_hf(md, se, emit)
                     prune_hf_cache(keep_revision=wcfg.get("revision") or "main",
                                    log_fn=lambda m: emit('log', m))
-                except KeyboardInterrupt: raise
+                except (KeyboardInterrupt, AuthRejected): raise
                 except Exception as e:
                     import traceback as _tb
                     emit('log', f"Hugging Face weight download failed: {e}")
@@ -2320,6 +2344,17 @@ class Api:
         self.username = None
         self.server_url = DEFAULT_SERVER
         self._lp = 0.0
+        # Restore session from disk (survives auto-update restarts)
+        try:
+            if AUTH_TOKEN_FILE.exists():
+                j = json.loads(AUTH_TOKEN_FILE.read_text())
+                tok = j.get("token")
+                if tok:
+                    self.auth_token = tok
+                    self.username = j.get("username")
+                    log.info(f"[auth] restored session for {self.username}")
+        except Exception as e:
+            log.warning(f"[auth] could not restore session: {e}")
         self._backend_file = CHECKPOINT_DIR / "selected_backend.json"
         saved = None
         try:
@@ -2399,6 +2434,10 @@ class Api:
         tok, err = do_login(self.server_url, u, p)
         if tok:
             self.auth_token = tok; self.username = u
+            try:
+                AUTH_TOKEN_FILE.write_text(json.dumps({"token": tok, "username": u}))
+            except Exception as e:
+                log.warning(f"[auth] could not persist token: {e}")
             self.emit('login_success', {'username': u})
         else: self.emit('login_error', {'code': err or 'login_failed'})
 
@@ -2410,11 +2449,17 @@ class Api:
         tok, err = do_register(self.server_url, u, email, p)
         if tok:
             self.auth_token = tok; self.username = u
+            try:
+                AUTH_TOKEN_FILE.write_text(json.dumps({"token": tok, "username": u}))
+            except Exception as e:
+                log.warning(f"[auth] could not persist token: {e}")
             self.emit('login_success', {'username': u})
         else: self.emit('login_error', {'code': err or 'register_failed'})
 
     def login_anon(self):
         self.auth_token = None; self.username = "anonymous"
+        try: AUTH_TOKEN_FILE.unlink(missing_ok=True)
+        except Exception: pass
         self.emit('login_success', {'username': 'anonymous'})
 
     def start(self):
@@ -2439,6 +2484,11 @@ class Api:
             self.emit('log', f"Starting Round Cycle #{round_count}")
             self.emit('log', f"{'='*40}")
             try: run_single_round_wrapper(self.server_url, self.auth_token, self.stop_event, self.emit)
+            except AuthRejected:
+                self.auth_token = None
+                self.emit('status', 'idle')
+                self.emit('log', "🔒 Session expired — please log in again.")
+                break
             except KeyboardInterrupt:
                 self.stop_event.set(); break
             except Exception as e:
@@ -2565,7 +2615,17 @@ def run_headless(args):
         if not auth_token:
             log.error(f"[auth] login failed: {err}"); return 2
     else:
-        log.error("[auth] need --token, --user + --password, or --anon"); return 2
+        # Try restoring from disk (headless supports persistence too)
+        auth_token = None
+        try:
+            if AUTH_TOKEN_FILE.exists():
+                j = json.loads(AUTH_TOKEN_FILE.read_text())
+                auth_token = j.get("token")
+                if auth_token:
+                    log.info(f"[auth] restored session for {j.get('username')}")
+        except Exception: pass
+        if not auth_token:
+            log.error("[auth] need --token, --user + --password, or --anon"); return 2
 
     log.info(f"[cfg] server={args.server} rounds={args.rounds or '∞'} "
              f"vram={args.vram_gb or 'auto'}GB backend={args.backend or 'auto'}")
@@ -2603,7 +2663,10 @@ def run_headless(args):
     if args.dry_run:
         log.info("[dry-run] fetching task metadata...")
         h = {"Authorization": f"Bearer {auth_token}"} if auth_token else {}
-        md = fetch_task_metadata(args.server, h, stop_event, emit)
+        try:
+            md = fetch_task_metadata(args.server, h, stop_event, emit)
+        except AuthRejected:
+            log.error("[dry-run] auth rejected"); return 2
         if md is None:
             log.error("[dry-run] no task available"); return 5
         cc_cfg = md.get("crossCheck") or {}
@@ -2625,6 +2688,9 @@ def run_headless(args):
         log.info(f"Round {round_count}" + (f"/{max_rounds}" if max_rounds else ""))
         log.info("=" * 60)
         try: run_single_round_wrapper(args.server, auth_token, stop_event, emit)
+        except AuthRejected:
+            log.error("auth rejected by server; exiting. Re-run with a valid --token.")
+            return 2
         except KeyboardInterrupt:
             stop_event.set(); break
         except Exception as e:
@@ -2695,8 +2761,23 @@ def run_gui(args):
     window = _create_window_safe("CrowdGPT", html_out, kwargs)
     api.window = window
 
-    try: webview.start(startup, debug=False, **_start_icon_kwargs())
-    except TypeError: webview.start(startup, debug=False)
+    def _startup_and_resume():
+        startup()
+        if api.auth_token:
+            # Let the HTML attach handleEvent() before we emit anything
+            time.sleep(1.0)
+            try:
+                api.emit('login_success', {'username': api.username or 'restored'})
+                log.info(f"[auth] auto-login as {api.username} (restored session)")
+                # Start training unless the HTML already did (harmless if it did — guarded)
+                if api.thread is None or not api.thread.is_alive():
+                    api.start()
+                    log.info("[auto-resume] training thread started")
+            except Exception as e:
+                log.warning(f"[auth] could not auto-resume: {e}")
+
+    try: webview.start(_startup_and_resume, debug=False, **_start_icon_kwargs())
+    except TypeError: webview.start(_startup_and_resume, debug=False)
     return 0
 
 

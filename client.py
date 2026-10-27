@@ -265,6 +265,14 @@ def prune_hf_cache(keep_revision: str = None, log_fn=None):
                 except Exception: pass
         except Exception: pass
         try:
+            # Upload payloads left behind if the client was killed mid-upload.
+            for f in CHECKPOINT_DIR.glob("delta-*.gz"):
+                try:
+                    if now - f.stat().st_mtime > STALE_PART_AGE_SEC:
+                        f.unlink(); _log(f"[cache] removed stale {f.name}")
+                except Exception: pass
+        except Exception: pass
+        try:
             here = Path(__file__).resolve().parent
             for pat in ("*.bak", "*.new"):
                 for f in here.glob(pat):
@@ -1640,6 +1648,13 @@ def _train_step_safe(model, x, y, sl, ua, ad, ls, preview, ladder, emit):
 def _sha256_hex(data): return hashlib.sha256(data).hexdigest()
 
 
+def _sha256_file(path, piece=8 * 1024 * 1024):
+    hs = hashlib.sha256()
+    with open(path, 'rb') as f:
+        for b in iter(lambda: f.read(piece), b''): hs.update(b)
+    return hs.hexdigest()
+
+
 def _post_json_with_retry(url, payload, h, emit, se, timeout=60, retries=4, max_total_wait_s=7200):
     """Rate limits (429/503) don't consume retries; only real errors do.
        Bounded by max_total_wait_s (default 2h) so we don't wait forever."""
@@ -1678,10 +1693,11 @@ def _post_json_with_retry(url, payload, h, emit, se, timeout=60, retries=4, max_
     raise RuntimeError(f"POST {url} failed after {real_attempts} attempts: {last_err}")
 
 
-def _chunked_submit_once(srv, h, compressed_data, meta, emit, se, chunk_size):
-    total = len(compressed_data)
+def _chunked_submit_once(srv, h, delta_path, meta, emit, se, chunk_size):
+    # Reads one chunk at a time from disk, so the whole upload never sits in RAM (#7).
+    total = os.path.getsize(delta_path)
     chunks = max(1, math.ceil(total / chunk_size))
-    checksum = _sha256_hex(compressed_data)
+    checksum = _sha256_file(delta_path)
     init_payload = {**meta, "totalBytes": total, "chunkSize": chunk_size, "chunks": chunks, "checksum": checksum}
     emit("log", f"Initializing chunked upload: {chunks} chunks, {total / (1024 * 1024):.1f} MB total")
     r = _post_json_with_retry(f"{srv}/fl/submit/init", init_payload, h, emit, se, timeout=60, retries=4)
@@ -1690,7 +1706,9 @@ def _chunked_submit_once(srv, h, compressed_data, meta, emit, se, chunk_size):
     for idx in range(chunks):
         if se.is_set(): raise KeyboardInterrupt("Stop requested")
         start = idx * chunk_size; end = min(total, start + chunk_size)
-        part = compressed_data[start:end]; part_sha = _sha256_hex(part)
+        with open(delta_path, 'rb') as f:
+            f.seek(start); part = f.read(end - start)
+        part_sha = _sha256_hex(part)
         attempt = 0
         while True:
             try:
@@ -1723,10 +1741,10 @@ def _chunked_submit_once(srv, h, compressed_data, meta, emit, se, chunk_size):
     return _post_json_with_retry(f"{srv}/fl/submit/finalize", {"uploadId": upload_id}, h, emit, se, timeout=900, retries=2)
 
 
-def chunked_submit_delta(srv, h, compressed_data, meta, emit, se):
+def chunked_submit_delta(srv, h, delta_path, meta, emit, se):
     chunk_size = UPLOAD_CHUNK_BYTES
     while True:
-        try: return _chunked_submit_once(srv, h, compressed_data, meta, emit, se, chunk_size)
+        try: return _chunked_submit_once(srv, h, delta_path, meta, emit, se, chunk_size)
         except Exception as e:
             msg = str(e)
             if ("CHUNK_TOO_LARGE" in msg or "413" in msg) and chunk_size > 8 * 1024 * 1024:
@@ -1805,18 +1823,26 @@ def _bf16_from_bytes(buf, offset, nbytes):
 def _to_bf16_exact(arr): return torch.from_numpy(arr).to(torch.bfloat16)
 
 
-def _base_delta_bf16(model, iw_bf16):
-    out = torch.empty(iw_bf16.numel(), dtype=torch.bfloat16)
+def _write_base_delta_bf16(gz, model, iw_bf16, piece=16 * 1024 * 1024):
+    """Write the bf16 base delta into `gz`, a few MB at a time.
+
+    The full delta is never held in RAM. Each parameter's storage is released
+    right after it is written, so memory goes down while this runs. The model
+    is unusable afterwards (#7).
+    """
     o = 0
     for n, p in model.named_parameters():
         if n.startswith('engram.'): continue
-        s = p.numel()
-        cur = p.detach().to('cpu', torch.float32).reshape(-1)
-        out[o:o + s] = cur - iw_bf16[o:o + s].float()
+        s = p.numel(); flat = p.detach().reshape(-1)
+        for i in range(0, s, piece):
+            cur = flat[i:i + piece].to('cpu', torch.float32)
+            d = (cur - iw_bf16[o + i:o + i + cur.numel()].float()).to(torch.bfloat16)
+            gz.write(memoryview(d.view(torch.int16).numpy()).cast('B'))
+        flat = cur = d = None
+        p.data = torch.empty(0, dtype=p.dtype, device=p.device)
         o += s
     if o != iw_bf16.numel():
         raise RuntimeError(f"delta size mismatch: {o} vs {iw_bf16.numel()}")
-    return out.view(torch.int16).numpy().view(np.uint16)
 
 
 def _engram_sparse_delta(table, iew_bf16, frac=0.10, chunk=32768):
@@ -1829,14 +1855,19 @@ def _engram_sparse_delta(table, iew_bf16, frac=0.10, chunk=32768):
     return ai.numpy().astype(np.uint32), sv
 
 
-def _gzip_stream(header_bytes, arrays, level=6, piece=64 * 1024 * 1024):
-    buf = io.BytesIO()
-    with gzip.GzipFile(fileobj=buf, mode='wb', compresslevel=level) as gz:
+def _write_delta_file(path, header_bytes, model, iw_bf16, engram_arrays, level=6, piece=64 * 1024 * 1024):
+    """Write the gzip upload payload (header, base delta, engram arrays) to `path`.
+
+    The decompressed bytes match the old in-memory format exactly, so the
+    server side needs no change.
+    """
+    with open(path, 'wb') as f, gzip.GzipFile(fileobj=f, mode='wb', compresslevel=level) as gz:
         gz.write(header_bytes)
-        for a in arrays:
+        _write_base_delta_bf16(gz, model, iw_bf16)
+        for a in engram_arrays:
             mv = memoryview(np.ascontiguousarray(a)).cast('B')
             for i in range(0, len(mv), piece): gz.write(mv[i:i + piece])
-    return buf.getvalue()
+    return os.path.getsize(path)
 
 
 def _pick_autocast(backend):
@@ -2240,13 +2271,11 @@ def run_single_round_wrapper(srv, at, se, emit):
         for _p in model.parameters(): _p.grad = None
         _clear_accel_cache(train_device); _trim_heap()
 
-        dbf = _base_delta_bf16(model, iw); iw = None
         if ENGRAM_ACTIVE and iew is not None:
             si, sv = _engram_sparse_delta(model.engram.table.weight.data, iew)
         else:
             si, sv = np.array([], dtype=np.uint32), np.array([], dtype=np.uint16)
-        iew = None; model = None
-        _clear_accel_cache(train_device); _trim_heap()
+        iew = None
 
         has_engram = bool(len(si) > 0)
         engram_sparse_count = int(len(si))
@@ -2268,9 +2297,21 @@ def run_single_round_wrapper(srv, at, se, emit):
             "hasEngram": has_engram, "engramSparseCount": engram_sparse_count,
             **submit_extra,
         }).encode()
-        compressed_data = _gzip_stream(struct.pack('<I', len(pl)) + pl, (dbf, si, sv))
-        upload_size_mb = len(compressed_data) / (1024 * 1024)
-        del dbf, si, sv, pl; _trim_heap()
+        # The delta goes straight to a gzip file on disk instead of RAM (#7).
+        # Kept next to the weight cache, not in /tmp, which is RAM-backed on many distros.
+        delta_fd, delta_path = tempfile.mkstemp(prefix="delta-", suffix=".gz", dir=str(CHECKPOINT_DIR))
+        os.close(delta_fd)
+        try:
+            delta_size = _write_delta_file(delta_path, struct.pack('<I', len(pl)) + pl, model, iw, (si, sv))
+        except BaseException:
+            try: os.unlink(delta_path)
+            except OSError: pass
+            raise
+        finally:
+            iw = None; model = None
+            del si, sv, pl
+            _clear_accel_cache(train_device); _trim_heap()
+        upload_size_mb = delta_size / (1024 * 1024)
 
         meta = {
             "taskId": tid, "loss": fl, "localSteps": micro_step, "tokensProcessed": tt,
@@ -2283,23 +2324,26 @@ def run_single_round_wrapper(srv, at, se, emit):
         emit('log', f"Uploading {upload_size_mb:.1f} MB delta to server...")
         r = None
         try:
-            if len(compressed_data) <= MAX_DIRECT_UPLOAD_BYTES:
+            if delta_size <= MAX_DIRECT_UPLOAD_BYTES:
                 try:
+                    with open(delta_path, 'rb') as f: body = f.read()
                     r = requests.post(
                         f"{srv}/fl/submit",
                         headers={"Content-Type": "application/octet-stream", "Content-Encoding": "gzip", **h},
-                        data=compressed_data, timeout=600,
+                        data=body, timeout=600,
                     )
+                    body = None
                     if r.status_code == 413:
                         emit("log", "Direct upload rejected. Switching to chunked...")
-                        r = chunked_submit_delta(srv, h, compressed_data, meta, emit, se)
+                        r = chunked_submit_delta(srv, h, delta_path, meta, emit, se)
                 except Exception as e:
-                    if len(compressed_data) > 8 * 1024 * 1024:
+                    body = None
+                    if delta_size > 8 * 1024 * 1024:
                         emit("log", f"Direct upload failed ({e}). Trying chunked...")
-                        r = chunked_submit_delta(srv, h, compressed_data, meta, emit, se)
+                        r = chunked_submit_delta(srv, h, delta_path, meta, emit, se)
                     else: raise
             else:
-                r = chunked_submit_delta(srv, h, compressed_data, meta, emit, se)
+                r = chunked_submit_delta(srv, h, delta_path, meta, emit, se)
             if r is not None and r.status_code == 200:
                 emit("log", "Submitted successfully!")
             elif r is not None:
@@ -2310,8 +2354,8 @@ def run_single_round_wrapper(srv, at, se, emit):
             emit("log", f"Upload failed: {e}")
         finally:
             emit('overlay_hide', {})
-            try: del compressed_data
-            except Exception: pass
+            try: os.unlink(delta_path)
+            except OSError: pass
             gc.collect()
     finally:
         hb.stop()

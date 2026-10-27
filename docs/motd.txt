@@ -1,4 +1,4 @@
-CrowdGPT v1.6 changelog:
+CrowdGPT v1.7 changelog:
 - Stronger client/server security
-- Auto restart training after an update as of now (sorry for the interruptions)
+- Auto restart training after an update finally seems to work
 - RAM usage reduction on client

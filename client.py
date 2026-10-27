@@ -2131,7 +2131,7 @@ def run_single_round_wrapper(srv, at, se, emit):
                 if ds.needs_new_subchunk(): ds.advance(srv, "bf16")
 
                 if cohort_mode:
-                    sd = int(cc_seed) * 100_003 + micro_step * 1009
+                    sd = (int(cc_seed) * 100_003 + micro_step * 1009) & 0xFFFFFFFF
                 else:
                     sd = (abs(hash("t")) % 10000) + micro_step * 1000 + mi
                 x, y = ds.get_batch(bs, seed=sd)

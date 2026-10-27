@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-CrowdGPT GUI Client v1.6
+CrowdGPT GUI Client v1.7
 """
 
 import os

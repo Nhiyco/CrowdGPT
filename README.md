@@ -25,9 +25,9 @@
   <strong>The best 0$ AI.</strong>
 </p>
 
-# CrowdGPT v1.2 Changelog
+# CrowdGPT v1.3 Changelog
 - Fixed client being "too much monolithic"
-- Undergoing the fix of the server to make it safer and more robust
+- Attempting to fix the server as this message suggests: https://www.reddit.com/r/LocalLLaMA/comments/1xff9e4/comment/19rpgilufq9tu/?utm_source=share&utm_medium=web3x&utm_name=web3xcss&utm_term=1&utm_content=share_button
   
 ## What is CrowdGPT?
 

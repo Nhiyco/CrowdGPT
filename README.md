@@ -25,11 +25,11 @@
   <strong>The best 0$ AI.</strong>
 </p>
 
-# ⚠️ CrowdGPT v1.4 Changelog ⚠️
+# ⚠️ CrowdGPT v1.7 Changelog ⚠️
 - Fixed client being "too much monolithic"
 - Attempting to fix the server as this message suggests: https://www.reddit.com/r/LocalLLaMA/comments/1xff9e4/comment/19rpgilufq9tu/?utm_source=share&utm_medium=web3x&utm_name=web3xcss&utm_term=1&utm_content=share_button
 - This might introduce breaking changes. I'm sorry if your training contribution breaks or isn't submitted 😭
-- I am currently doing my best to make the whole project more secure.
+- client.py cryptographical signing
 ## What is CrowdGPT?
 
 CrowdGPT is a **project for training arbitrary big LLMs** using volunteered compute.

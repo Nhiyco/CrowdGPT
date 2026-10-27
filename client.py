@@ -1640,28 +1640,42 @@ def _train_step_safe(model, x, y, sl, ua, ad, ls, preview, ladder, emit):
 def _sha256_hex(data): return hashlib.sha256(data).hexdigest()
 
 
-def _post_json_with_retry(url, payload, h, emit, se, timeout=60, retries=4):
+def _post_json_with_retry(url, payload, h, emit, se, timeout=60, retries=4, max_total_wait_s=7200):
+    """Rate limits (429/503) don't consume retries; only real errors do.
+       Bounded by max_total_wait_s (default 2h) so we don't wait forever."""
     last_err = None
-    for attempt in range(retries):
+    real_attempts = 0
+    total_waited = 0.0
+
+    while True:
         if se.is_set(): raise KeyboardInterrupt("Stop requested")
         try:
             r = requests.post(url, json=payload, headers=h, timeout=timeout)
-            if r.status_code == 503:
-                emit("log", "Server busy, waiting...")
-                last_err = RuntimeError("server busy 503"); time.sleep(10); continue
-            if r.status_code == 429:
+            if r.status_code in (429, 503):
                 retry_after = int(r.headers.get("Retry-After", "60"))
-                emit("log", f"⏳ Server rate-limited {url}; waiting {retry_after}s ({r.text[:120]})")
+                if total_waited + retry_after > max_total_wait_s:
+                    raise RuntimeError(
+                        f"{r.status_code} from {url}: rate-limit wait budget "
+                        f"({max_total_wait_s}s) exceeded (waited {total_waited}s, "
+                        f"needed {retry_after}s more): {r.text[:200]}")
+                emit("log", f"⏳ {r.status_code} {url}; waiting {retry_after}s "
+                            f"({r.text[:120]})")
                 time.sleep(min(retry_after, 3600))
-                continue  # don't count as failure; use remaining retries as time budget
-            r.raise_for_status(); return r
-        except KeyboardInterrupt: raise
+                total_waited += retry_after
+                continue                            # ← rate limit: no retry consumed
+            r.raise_for_status()
+            return r
+        except KeyboardInterrupt:
+            raise
         except Exception as e:
             last_err = e
-            if attempt < retries - 1:
-                emit("log", f"POST retry {attempt + 1}: {e}")
-                time.sleep(min(20, 2 ** (attempt + 1)))
-    raise RuntimeError(f"POST {url} failed: {last_err}")
+            real_attempts += 1
+            if real_attempts >= retries:
+                break
+            emit("log", f"POST retry {real_attempts}/{retries}: {e}")
+            time.sleep(min(20, 2 ** real_attempts))
+
+    raise RuntimeError(f"POST {url} failed after {real_attempts} attempts: {last_err}")
 
 
 def _chunked_submit_once(srv, h, compressed_data, meta, emit, se, chunk_size):

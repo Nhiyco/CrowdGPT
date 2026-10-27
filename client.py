@@ -9,7 +9,7 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 os.environ.setdefault("PYTORCH_HIP_ALLOC_CONF", "expandable_segments:False")
 os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
 
-import sys, io, json, time, struct, math, gc, threading, base64, logging, tempfile, atexit, subprocess, hashlib, shutil, ctypes, signal, argparse
+import sys, io, json, time, struct, math, gc, threading, base64, logging, tempfile, atexit, subprocess, hashlib, shutil, ctypes, signal, argparse, datetime
 from pathlib import Path
 
 try:
@@ -42,6 +42,88 @@ CLIENT_VERSION = "1.6"
 VERSION_URL = "https://raw.githubusercontent.com/Vxtzq/CrowdGPT/main/docs/version.txt"
 CLIENT_URL  = "https://raw.githubusercontent.com/Vxtzq/CrowdGPT/main/client.py"
 HTML_URL    = "https://raw.githubusercontent.com/Vxtzq/CrowdGPT/main/client.html"
+VERSION_SIG_URL = VERSION_URL + ".sig"
+
+# ---------------------------------------------------------------------------------------------------------------
+# Signed auto-update.  A release is only installed if docs/version.txt carries a valid Ed25519 signature
+# (docs/version.txt.sig) made with one of these keys.  The PRIVATE keys never touch GitHub; see RELEASING.md.
+# Put two keys here: the day-to-day signing key and an offline recovery key (a lost key then does not strand users).
+# Generate with:  python tools/sign_release.py gen-key --out <private.pem>   (it prints the line to paste below)
+# While this list is empty the client refuses ALL updates (fail closed).
+# ---------------------------------------------------------------------------------------------------------------
+UPDATE_PUBKEYS = [
+    # "BASE64_PUBLIC_KEY_PRIMARY",
+    # "BASE64_PUBLIC_KEY_RECOVERY",
+]
+
+
+# --- minimal pure-Python Ed25519 *verification* (RFC 8032 section 5.1.7; no dependency; public data only) ---------
+_ED_P = 2 ** 255 - 19
+_ED_L = 2 ** 252 + 27742317777372353535851937790883648493
+_ED_D = (-121665 * pow(121666, _ED_P - 2, _ED_P)) % _ED_P
+_ED_I = pow(2, (_ED_P - 1) // 4, _ED_P)
+
+
+def _ed_recover_x(y, sign):
+    if y >= _ED_P:
+        return None
+    x2 = (y * y - 1) * pow(_ED_D * y * y + 1, _ED_P - 2, _ED_P) % _ED_P
+    if x2 == 0:
+        return None if sign else 0
+    x = pow(x2, (_ED_P + 3) // 8, _ED_P)
+    if (x * x - x2) % _ED_P:
+        x = x * _ED_I % _ED_P
+    if (x * x - x2) % _ED_P:
+        return None
+    return _ED_P - x if (x & 1) != sign else x
+
+
+def _ed_add(p, q):
+    a = (p[1] - p[0]) * (q[1] - q[0]) % _ED_P
+    b = (p[1] + p[0]) * (q[1] + q[0]) % _ED_P
+    c = 2 * p[3] * q[3] * _ED_D % _ED_P
+    d = 2 * p[2] * q[2] % _ED_P
+    e, f, g, h = b - a, d - c, d + c, b + a
+    return (e * f % _ED_P, g * h % _ED_P, f * g % _ED_P, e * h % _ED_P)
+
+
+def _ed_mul(s, p):
+    r = (0, 1, 1, 0)
+    while s > 0:
+        if s & 1:
+            r = _ed_add(r, p)
+        p = _ed_add(p, p)
+        s >>= 1
+    return r
+
+
+def _ed_decode(b):
+    y = int.from_bytes(b, "little")
+    sign, y = y >> 255, y & ((1 << 255) - 1)
+    x = _ed_recover_x(y, sign)
+    return None if x is None else (x, y, 1, x * y % _ED_P)
+
+
+_ED_GY = 4 * pow(5, _ED_P - 2, _ED_P) % _ED_P
+_ED_G = (_ed_recover_x(_ED_GY, 0), _ED_GY, 1, _ed_recover_x(_ED_GY, 0) * _ED_GY % _ED_P)
+
+
+def ed25519_verify(public_key, message, signature):
+    """True only for a valid, canonical Ed25519 signature (never raises)."""
+    try:
+        if len(public_key) != 32 or len(signature) != 64:
+            return False
+        a, r = _ed_decode(public_key), _ed_decode(signature[:32])
+        s = int.from_bytes(signature[32:], "little")
+        if a is None or r is None or s >= _ED_L:
+            return False
+        h = int.from_bytes(hashlib.sha512(signature[:32] + public_key + message).digest(), "little") % _ED_L
+        lhs, rhs = _ed_mul(s, _ED_G), _ed_add(r, _ed_mul(h, a))
+        return (lhs[0] * rhs[2] - rhs[0] * lhs[2]) % _ED_P == 0 and (lhs[1] * rhs[2] - rhs[1] * lhs[2]) % _ED_P == 0
+    except Exception:
+        return False
+
+
 
 
 class AuthRejected(Exception):
@@ -66,19 +148,59 @@ def _parse_version(v):
         return (0,)
 
 
-def _fetch_remote_version():
+def _verify_manifest(manifest_bytes, sig_text, pubkeys=None):
+    """Signature over the exact bytes of version.txt, valid under ANY configured key."""
     try:
-        r = requests.get(VERSION_URL, timeout=5)
-        r.raise_for_status()
-        lines = [l.strip() for l in r.text.strip().splitlines() if l.strip()]
-        if not lines: return None, None, None
-        version = lines[0]
-        hash_py = None
-        hash_html = None
-        for l in lines[1:]:
-            if l.startswith("sha256_clientpy:"): hash_py = l.split(":", 1)[1].strip().lower()
-            if l.startswith("sha256_clienthtml:"): hash_html = l.split(":", 1)[1].strip().lower()
-        return version, hash_py, hash_html
+        sig = base64.b64decode(str(sig_text).strip(), validate=True)
+    except Exception:
+        return False
+    for k in (UPDATE_PUBKEYS if pubkeys is None else pubkeys):
+        try:
+            if ed25519_verify(base64.b64decode(k), manifest_bytes, sig):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _parse_manifest(manifest_bytes):
+    """version.txt: line 1 = version, then 'key: value' lines (sha256_clientpy, sha256_clienthtml, expires)."""
+    lines = [l.strip() for l in manifest_bytes.decode("utf-8").replace("\r\n", "\n").split("\n") if l.strip()]
+    m = {"version": lines[0]}
+    for l in lines[1:]:
+        if ":" in l:
+            k, v = l.split(":", 1)
+            m[k.strip().lower()] = v.strip()
+    return m
+
+
+def _is_sha256(h):
+    return isinstance(h, str) and len(h) == 64 and all(c in "0123456789abcdef" for c in h)
+
+
+def _fetch_remote_version():
+    """Return (version, sha256_py, sha256_html) ONLY if version.txt is correctly signed, unexpired and carries both hashes."""
+    if not UPDATE_PUBKEYS:
+        log.info("Auto-update disabled: no update signing keys are built into this client.")
+        return None, None, None
+    try:
+        rv = requests.get(VERSION_URL, timeout=5); rv.raise_for_status()
+        rs = requests.get(VERSION_SIG_URL, timeout=5); rs.raise_for_status()
+        manifest = rv.content
+        if not _verify_manifest(manifest, rs.text):
+            log.warning("Update refused: version.txt signature is missing or invalid.")
+            return None, None, None
+        m = _parse_manifest(manifest)
+        exp = m.get("expires")
+        if exp and datetime.datetime.now(datetime.timezone.utc).date() > datetime.date.fromisoformat(exp):
+            # a signed expiry stops an attacker replaying an old (vulnerable) signed release forever
+            log.warning("Update refused: signed release metadata expired (%s).", exp)
+            return None, None, None
+        hash_py, hash_html = m.get("sha256_clientpy", "").lower(), m.get("sha256_clienthtml", "").lower()
+        if not (_is_sha256(hash_py) and _is_sha256(hash_html)):
+            log.warning("Update refused: signed manifest lacks valid SHA-256 hashes.")
+            return None, None, None
+        return m["version"], hash_py, hash_html
     except Exception:
         return None, None, None
 
@@ -95,7 +217,9 @@ def _download_new_client(expected_version, expected_hash_py=None, expected_hash_
         log.warning(f"Could not download client update: {e}")
         return None
 
-    # Security: Verify SHA-256 integrity to prevent arbitrary code execution / transit corruption
+    # Security: the hashes come from the SIGNED manifest and are mandatory.
+    if not (_is_sha256(expected_hash_py) and _is_sha256(expected_hash_html)):
+        log.warning("Update refused: missing SHA-256 hashes."); return None
     if expected_hash_py:
         actual_hash = hashlib.sha256(code.encode('utf-8')).hexdigest()
         if actual_hash != expected_hash_py:

@@ -52,8 +52,8 @@ VERSION_SIG_URL = VERSION_URL + ".sig"
 # While this list is empty the client refuses ALL updates (fail closed).
 # ---------------------------------------------------------------------------------------------------------------
 UPDATE_PUBKEYS = [
-    # "rVmzV5syTbiv3okEACObqUyZDNa1S5iWZHKpTJJs8kc=",
-    # "BASE64_PUBLIC_KEY_RECOVERY",
+    "rVmzV5syTbiv3okEACObqUyZDNa1S5iWZHKpTJJs8kc=",
+    "ZF5A5Wt9+Gwib8hlPYH0Uqxk+gdhmMadETKy+60NT5A=",
 ]
 
 

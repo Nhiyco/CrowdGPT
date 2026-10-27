@@ -26,8 +26,8 @@
 </p>
 
 # CrowdGPT v1.1 Changelog
-- fixed app UI bus
-- working on merging this project with another decentralized compute repository (more details soon)
+- fixed app UI bugs
+- works on merging this project with another decentralized compute repository (more details soon)
   
 ## What is CrowdGPT?
 

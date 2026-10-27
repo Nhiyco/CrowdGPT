@@ -1,1 +1,3 @@
-Experiencing issues with the app? Submit an issue on github!
+CrowdGPT v1.4 changelog:
+- Stronger client/server security
+- Auto restart training after an update as of now (sorry for the interruptions)

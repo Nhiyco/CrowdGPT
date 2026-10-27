@@ -25,9 +25,9 @@
   <strong>The best 0$ AI.</strong>
 </p>
 
-# CrowdGPT v1.1 Changelog
-- fixed app UI bugs
-- merging this project with another decentralized compute repository (more details soon)
+# CrowdGPT v1.2 Changelog
+- Fixed client being "too much monolithic"
+- Undergoing the fix of the server to make it safer and more robust
   
 ## What is CrowdGPT?
 

@@ -1,0 +1,28 @@
+name: checks
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Python files compile
+        run: git ls-files '*.py' | xargs python -m py_compile
+
+      - name: Shell scripts parse
+        run: bash -n install.sh
+
+      # Fails when client.py / client.html changed after the release was signed,
+      # i.e. when clients that are behind would fail the update hash check.
+      # Only on pushes: contributors can't sign, so it would always fail on PRs.
+      - name: Release signature matches client files
+        if: github.event_name == 'push'
+        run: python tools/sign_release.py verify

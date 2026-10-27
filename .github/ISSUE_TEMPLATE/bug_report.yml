@@ -1,0 +1,54 @@
+name: Bug report
+description: Something doesn't work in the client or the installer
+labels: [bug]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: Client version
+      description: Printed at startup ("CrowdGPT client v...") or in docs/version.txt of your install
+      placeholder: "1.7"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: install
+    attributes:
+      label: How did you install it?
+      options:
+        - install.sh (Linux / macOS)
+        - install.bat (Windows)
+        - Manual (pip install -r requirements*.txt)
+    validations:
+      required: true
+
+  - type: input
+    id: system
+    attributes:
+      label: OS, GPU, VRAM and system RAM
+      placeholder: "Ubuntu 24.04, RTX 3060 12 GB, 32 GB RAM"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Mode
+      options:
+        - GUI
+        - Headless (--headless)
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What you did, what you expected, what you got instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: log
+    attributes:
+      label: Log
+      description: Paste the terminal output around the problem. Running with --debug gives more detail. Remove anything private.
+      render: text

@@ -1637,6 +1637,11 @@ def _post_json_with_retry(url, payload, h, emit, se, timeout=60, retries=4):
             if r.status_code == 503:
                 emit("log", "Server busy, waiting...")
                 last_err = RuntimeError("server busy 503"); time.sleep(10); continue
+            if r.status_code == 429:
+                retry_after = int(r.headers.get("Retry-After", "60"))
+                emit("log", f"⏳ Server rate-limited {url}; waiting {retry_after}s ({r.text[:120]})")
+                time.sleep(min(retry_after, 3600))
+                continue  # don't count as failure; use remaining retries as time budget
             r.raise_for_status(); return r
         except KeyboardInterrupt: raise
         except Exception as e:

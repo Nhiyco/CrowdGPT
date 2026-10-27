@@ -25,6 +25,10 @@
   <strong>The best 0$ AI.</strong>
 </p>
 
+# CrowdGPT v1.1 Changelog
+- fixed app UI bus
+- working on merging this project with another decentralized compute repository (more details soon)
+  
 ## What is CrowdGPT?
 
 CrowdGPT is a **project for training arbitrary big LLMs** using volunteered compute.

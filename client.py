@@ -1,18 +1,6 @@
 #!/usr/bin/env python3
 """
-CrowdGPT GUI Client v1.4
-
-v1.4 changes:
-  - Adds cc_autocast to cohort invariants (prevents dtype divergence)
-  - Aborts round cleanly on accel errors in cohort mode (prevents false outliers)
-  - Secures auto-update with SHA-256 integrity checks from version.txt
-  - Fixes coordinator fallback crash (ValueError: too many values to unpack)
-  - Honors crossCheck cohort mode (targetSeed, targetLocalSteps, targetBatchSize)
-  - Skips calibration in cohort mode (avoids inconsistent optimizer state)
-  - Forces slot=0 in cohort mode (identical data for all cohort members)
-  - Sends X-Client-Backend/BS/VRAM/GPU headers on /fl/task
-  - Sends crossCheckUsed/actualSeed/actualSteps/actualBatchSize in submit
-  - Uses fixed step count + fixed seed in cohort mode (no wall-clock, no hash seeds)
+CrowdGPT GUI Client v1.5
 """
 
 import os
@@ -50,7 +38,7 @@ sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='repla
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s', datefmt='%H:%M:%S')
 log = logging.getLogger(__name__)
 
-CLIENT_VERSION = "1.4"
+CLIENT_VERSION = "1.5"
 VERSION_URL = "https://raw.githubusercontent.com/Vxtzq/CrowdGPT/main/docs/version.txt"
 CLIENT_URL  = "https://raw.githubusercontent.com/Vxtzq/CrowdGPT/main/client.py"
 HTML_URL    = "https://raw.githubusercontent.com/Vxtzq/CrowdGPT/main/client.html"

@@ -2253,6 +2253,16 @@ def run_single_round_wrapper(srv, at, se, emit):
         if se.is_set():
             emit('log', "Stopped by user. Skipping upload."); return
 
+        # Round changed mid-training: the chunk was already aggregated (or will be)
+        # by the round's closing cohort. Uploading now produces a stale delta for
+        # a consumed chunk — the server rejects it with MIN_TRAIN_TIME_S 429s that
+        # waste 10+ minutes of wall clock per attempt. Bail now and let the next
+        # cycle fetch a fresh task.
+        if hb.should_stop():
+            emit('log', f"Round changed mid-training (was round {cr}); "
+                        f"discarding partial delta — no upload.")
+            return
+
         if cohort_mode and int(micro_step) != int(cc_steps):
             emit('log', f"[COHORT] ABORT: only completed {micro_step}/{cc_steps} steps; "
                         f"cannot submit as cohort member (would cause false outlier). "

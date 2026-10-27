@@ -1,6 +1,14 @@
 #!/usr/bin/env python3
 """
-CrowdGPT GUI Client v1.2
+CrowdGPT GUI Client v1.3
+
+v1.3 changes:
+  - Honors crossCheck cohort mode (targetSeed, targetLocalSteps, targetBatchSize)
+  - Skips calibration in cohort mode (avoids inconsistent optimizer state)
+  - Forces slot=0 in cohort mode (identical data for all cohort members)
+  - Sends X-Client-Backend/BS/VRAM/GPU headers on /fl/task
+  - Sends crossCheckUsed/actualSeed/actualSteps/actualBatchSize in submit
+  - Uses fixed step count + fixed seed in cohort mode (no wall-clock, no hash seeds)
 """
 
 import os
@@ -12,8 +20,6 @@ os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
 import sys, io, json, time, struct, math, gc, threading, base64, logging, tempfile, atexit, subprocess, hashlib, shutil, ctypes, signal, argparse
 from pathlib import Path
 
-# `webview` may be unavailable on headless servers (no GTK/Qt/WebView2);
-# import defensively so `--headless` never fails on that.
 try:
     import webview
     _WEBVIEW_OK = True
@@ -40,10 +46,10 @@ sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='repla
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s', datefmt='%H:%M:%S')
 log = logging.getLogger(__name__)
 
-CLIENT_VERSION = "1.2"
+CLIENT_VERSION = "1.3"
 VERSION_URL = "https://raw.githubusercontent.com/Vxtzq/CrowdGPT/main/docs/version.txt"
 CLIENT_URL  = "https://raw.githubusercontent.com/Vxtzq/CrowdGPT/main/client.py"
-HTML_URL = "https://raw.githubusercontent.com/Vxtzq/CrowdGPT/main/client.html"
+HTML_URL    = "https://raw.githubusercontent.com/Vxtzq/CrowdGPT/main/client.html"
 
 
 def _parse_version(v):
@@ -65,181 +71,99 @@ def _fetch_remote_version():
 
 
 def _download_new_client(expected_version):
-    """Download and validate both files before applying an update."""
     try:
         response = requests.get(CLIENT_URL, timeout=60)
         response.raise_for_status()
         code = response.text
-
         response = requests.get(HTML_URL, timeout=60)
         response.raise_for_status()
         html = response.text
-
     except Exception as e:
         log.warning(f"Could not download client update: {e}")
         return None
 
-    # Validate Python syntax before replacing the running script.
     try:
         compile(code, "client.py", "exec")
     except (SyntaxError, ValueError, TypeError) as e:
         log.warning(f"Downloaded client.py is invalid: {e}")
         return None
 
-    # Ensure the downloaded script matches version.txt.
-    markers = (
-        f'CLIENT_VERSION = "{expected_version}"',
-        f"CLIENT_VERSION = '{expected_version}'",
-    )
-    if not any(marker in code for marker in markers):
-        log.warning(
-            "Downloaded client.py version does not match version.txt"
-        )
+    markers = (f'CLIENT_VERSION = "{expected_version}"',
+               f"CLIENT_VERSION = '{expected_version}'")
+    if not any(m in code for m in markers):
+        log.warning("Downloaded client.py version does not match version.txt")
         return None
 
-    # Validate the HTML document and required template placeholders.
-    if (
-        not html.lstrip().lower().startswith("<!doctype html")
-        and "<html" not in html[:500].lower()
-    ):
+    if (not html.lstrip().lower().startswith("<!doctype html")
+            and "<html" not in html[:500].lower()):
         log.warning("Downloaded client.html does not look like HTML")
         return None
 
-    required_placeholders = (
-        "__LOGO__",
-        "__LOGO_DARK__",
-        "__VERSION__",
-    )
-    missing = [
-        placeholder
-        for placeholder in required_placeholders
-        if placeholder not in html
-    ]
-    if missing:
-        log.warning(
-            "Downloaded client.html is missing placeholders: "
-            + ", ".join(missing)
-        )
-        return None
-
+    for ph in ("__LOGO__", "__LOGO_DARK__", "__VERSION__"):
+        if ph not in html:
+            log.warning(f"Downloaded client.html missing placeholder: {ph}")
+            return None
     return code, html
 
 
 def _apply_update(new_files):
-    """Replace client.py and client.html, restoring backups on failure."""
-    if (
-        not isinstance(new_files, tuple)
-        or len(new_files) != 2
-        or not all(isinstance(item, str) for item in new_files)
-    ):
-        log.error("Invalid update payload")
-        return False
-
+    if (not isinstance(new_files, tuple) or len(new_files) != 2
+            or not all(isinstance(x, str) for x in new_files)):
+        log.error("Invalid update payload"); return False
     code, html = new_files
     base = Path(__file__).resolve().parent
-
-    targets = {
-        base / "client.py": code,
-        base / "client.html": html,
-    }
-
-    backups = {}
-    temps = {}
-    replaced = []
-
+    targets = {base / "client.py": code, base / "client.html": html}
+    backups, temps, replaced = {}, {}, []
     try:
-        # Stage both files and create backups before replacing anything.
         for target, content in targets.items():
             if target.exists():
                 backup = target.with_name(target.name + ".bak")
                 shutil.copy2(str(target), str(backup))
                 backups[target] = backup
-
             tmp = target.with_name(target.name + ".new")
             tmp.write_text(content, encoding="utf-8")
-
             if target.exists():
-                try:
-                    os.chmod(str(tmp), target.stat().st_mode)
-                except OSError:
-                    pass
-
+                try: os.chmod(str(tmp), target.stat().st_mode)
+                except OSError: pass
             temps[target] = tmp
-
-        # Replace the files only after both staged files are ready.
         for target, tmp in temps.items():
             os.replace(str(tmp), str(target))
             replaced.append(target)
-
         log.info("Successfully applied client.py and client.html update")
         return True
-
     except Exception as e:
         log.error(f"Could not apply update: {e}; attempting rollback")
-
         rollback_failed = False
-
         for target in reversed(replaced):
             try:
-                backup = backups.get(target)
-
-                if backup is not None and backup.exists():
-                    os.replace(str(backup), str(target))
-                elif target.exists():
-                    target.unlink()
-
-            except Exception as rollback_error:
+                b = backups.get(target)
+                if b is not None and b.exists(): os.replace(str(b), str(target))
+                elif target.exists(): target.unlink()
+            except Exception as re:
                 rollback_failed = True
-                log.error(
-                    f"Could not restore {target.name}: {rollback_error}"
-                )
-
+                log.error(f"Could not restore {target.name}: {re}")
         if rollback_failed:
-            log.error(
-                "Rollback was incomplete. Check client.py, client.html "
-                "and their .bak files before restarting."
-            )
-
+            log.error("Rollback was incomplete. Check .bak files before restarting.")
         return False
-
     finally:
         for tmp in temps.values():
-            try:
-                tmp.unlink(missing_ok=True)
-            except Exception:
-                pass
+            try: tmp.unlink(missing_ok=True)
+            except Exception: pass
 
 
 def check_for_update():
-    """Check for a newer release and safely apply the downloaded files."""
-    # Preserve the local ROCm compatibility fix unless explicitly opted in.
-    if (
-        getattr(torch.version, "hip", None)
-        and os.environ.get("CROWDGPT_ROCM_AUTOUPDATE") != "1"
-    ):
-        log.info(
-            "[ROCM-FIX] Auto-update paused; preserving local ROCm fix."
-        )
+    if getattr(torch.version, "hip", None) and os.environ.get("CROWDGPT_ROCM_AUTOUPDATE") != "1":
+        log.info("[ROCM-FIX] Auto-update paused; preserving local ROCm fix.")
         return False
-
     remote = _fetch_remote_version()
-    if not remote:
-        return False
-
-    if _parse_version(remote) <= _parse_version(CLIENT_VERSION):
-        return False
-
+    if not remote: return False
+    if _parse_version(remote) <= _parse_version(CLIENT_VERSION): return False
     log.info(f"Update available: {CLIENT_VERSION} -> {remote}")
-
     downloaded = _download_new_client(remote)
     if downloaded is None:
-        log.warning("Update download or validation failed.")
-        return False
-
+        log.warning("Update download or validation failed."); return False
     if not _apply_update(downloaded):
-        log.warning("Update could not be applied.")
-        return False
-
+        log.warning("Update could not be applied."); return False
     log.info(f"client.py and client.html updated to {remote}")
     return True
 
@@ -258,10 +182,6 @@ def _restart_self():
 CHECKPOINT_DIR = Path("checkpoints")
 CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
 
-
-# ---------------------------------------------------------------------------
-# Cache pruning: keep disk usage bounded across rounds and revisions.
-# ---------------------------------------------------------------------------
 MAX_CACHED_REVISIONS = 1
 MAX_HF_CACHE_GB      = 6.0
 STALE_PART_AGE_SEC   = 60 * 60
@@ -273,113 +193,74 @@ def _dir_size_bytes(path: Path) -> int:
     try:
         for p in path.rglob("*"):
             if p.is_file():
-                try:
-                    total += p.stat().st_size
-                except Exception:
-                    pass
-    except Exception:
-        pass
+                try: total += p.stat().st_size
+                except Exception: pass
+    except Exception: pass
     return total
 
 
 def _safe_rmtree(path: Path):
     try:
-        if path.is_dir():
-            shutil.rmtree(path, ignore_errors=True)
-    except Exception:
-        pass
+        if path.is_dir(): shutil.rmtree(path, ignore_errors=True)
+    except Exception: pass
 
 
 def prune_hf_cache(keep_revision: str = None, log_fn=None):
-    """
-    Keep disk usage bounded:
-      * Remove every hf_weights/<rev>/ except `keep_revision` (if given).
-      * If not given, keep only the newest MAX_CACHED_REVISIONS folders.
-      * Delete stale .part files anywhere under CHECKPOINT_DIR.
-      * Delete stale .bak / .new files next to this script.
-      * Enforce MAX_HF_CACHE_GB by dropping oldest revisions.
-    Safe to call at any time. Never raises.
-    """
     def _log(msg):
         if log_fn is not None:
-            try:
-                log_fn(msg)
-            except Exception:
-                pass
+            try: log_fn(msg)
+            except Exception: pass
         log.info(msg)
-
     try:
         hf_root = CHECKPOINT_DIR / "hf_weights"
         if hf_root.is_dir():
             revs = [p for p in hf_root.iterdir() if p.is_dir()]
-
             if keep_revision is not None:
                 keep_norm = str(keep_revision).strip().replace("/", "_").replace("\\", "_")
                 for r in revs:
                     if r.name != keep_norm:
-                        sz = _dir_size_bytes(r)
-                        _safe_rmtree(r)
+                        sz = _dir_size_bytes(r); _safe_rmtree(r)
                         _log(f"[cache] pruned stale revision {r.name} ({sz/1024**2:.0f} MB)")
                 revs = [p for p in hf_root.iterdir() if p.is_dir()]
-
             if len(revs) > MAX_CACHED_REVISIONS:
                 revs.sort(key=lambda p: p.stat().st_mtime if p.exists() else 0)
                 for r in revs[:-MAX_CACHED_REVISIONS]:
-                    sz = _dir_size_bytes(r)
-                    _safe_rmtree(r)
+                    sz = _dir_size_bytes(r); _safe_rmtree(r)
                     _log(f"[cache] pruned old revision {r.name} ({sz/1024**2:.0f} MB)")
                 revs = [p for p in hf_root.iterdir() if p.is_dir()]
-
             revs.sort(key=lambda p: p.stat().st_mtime if p.exists() else 0)
             total = sum(_dir_size_bytes(r) for r in revs)
             cap = int(MAX_HF_CACHE_GB * 1024**3)
             while total > cap and revs:
-                victim = revs.pop(0)
-                sz = _dir_size_bytes(victim)
-                _safe_rmtree(victim)
-                total -= sz
+                victim = revs.pop(0); sz = _dir_size_bytes(victim)
+                _safe_rmtree(victim); total -= sz
                 _log(f"[cache] pruned {victim.name} for size cap ({sz/1024**2:.0f} MB)")
-
             try:
-                if hf_root.is_dir() and not any(hf_root.iterdir()):
-                    hf_root.rmdir()
-            except Exception:
-                pass
-
+                if hf_root.is_dir() and not any(hf_root.iterdir()): hf_root.rmdir()
+            except Exception: pass
         now = time.time()
         try:
             for part in CHECKPOINT_DIR.rglob("*.part"):
                 try:
                     if now - part.stat().st_mtime > STALE_PART_AGE_SEC:
-                        part.unlink()
-                        _log(f"[cache] removed stale {part.name}")
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
+                        part.unlink(); _log(f"[cache] removed stale {part.name}")
+                except Exception: pass
+        except Exception: pass
         try:
             here = Path(__file__).resolve().parent
             for pat in ("*.bak", "*.new"):
                 for f in here.glob(pat):
                     try:
                         if now - f.stat().st_mtime > STALE_BAK_AGE_SEC:
-                            f.unlink()
-                            _log(f"[cache] removed stale {f.name}")
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-
+                            f.unlink(); _log(f"[cache] removed stale {f.name}")
+                    except Exception: pass
+        except Exception: pass
     except Exception as e:
         log.warning(f"[cache] prune failed: {e}")
 
 
-# Run once at startup, before anything else touches disk.
-try:
-    prune_hf_cache()
-except Exception:
-    pass
+try: prune_hf_cache()
+except Exception: pass
 
 
 DEFAULT_SERVER = "https://server.crowdgpt.net"
@@ -404,19 +285,15 @@ HEAD_DIM = MODEL_CONFIG["headDim"]
 MAX_SEQ_LEN = MODEL_CONFIG["maxSeqLen"]
 MLP_HIDDEN = MODEL_CONFIG["mlpHidden"]
 ENG_NUM_BUCKETS = 227865
-# The engram table is never read by SotaGPT.forward_features, so it gets no gradients and
-# its delta is always empty. While that holds, don't allocate/load/diff its 1.4 GB.
 ENGRAM_ACTIVE = False
 LOSS_CHUNK = 256
 UPLOAD_BUFFER_MIN = 25
 ALLOWED_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64, 128]
 
-# --- memory-safety knobs ----------------------------------------------------
 SAFETY_MARGIN_GB = 1.0
 ALLOCATOR_RESERVE_GB = 0.5
 MIN_HEADROOM_GB = 0.25
 
-# --- calibration budget -----------------------------------------------------
 CAL_TIME_BUDGET = 90.0
 CAL_MIN_MICRO   = 3
 CAL_MAX_MICRO_HARD = 20
@@ -442,32 +319,24 @@ train_device, train_backend = None, None
 
 def safe_float(v, default=0.0):
     try:
-        if v is None or math.isnan(v) or math.isinf(v):
-            return default
+        if v is None or math.isnan(v) or math.isinf(v): return default
         return float(v)
     except Exception:
         return default
 
 
 def sanitize_for_json(obj):
-    if isinstance(obj, dict):
-        return {str(k): sanitize_for_json(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)):
-        return [sanitize_for_json(v) for v in obj]
+    if isinstance(obj, dict): return {str(k): sanitize_for_json(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)): return [sanitize_for_json(v) for v in obj]
     if isinstance(obj, (int, float, str, bool, type(None))):
-        if isinstance(obj, float) and (math.isnan(obj) or math.isinf(obj)):
-            return 0.0
+        if isinstance(obj, float) and (math.isnan(obj) or math.isinf(obj)): return 0.0
         return obj
     try:
-        if isinstance(obj, np.integer):
-            return int(obj)
+        if isinstance(obj, np.integer): return int(obj)
         if isinstance(obj, np.floating):
-            v = float(obj)
-            return 0.0 if math.isnan(v) or math.isinf(v) else v
-        if isinstance(obj, np.bool_):
-            return bool(obj)
-        if isinstance(obj, np.ndarray):
-            return obj.tolist()
+            v = float(obj); return 0.0 if math.isnan(v) or math.isinf(v) else v
+        if isinstance(obj, np.bool_): return bool(obj)
+        if isinstance(obj, np.ndarray): return obj.tolist()
     except ImportError:
         pass
     return str(obj)
@@ -480,8 +349,7 @@ PREVIEW_EVERY = 10
 
 def start_tokenizer_loader():
     global _tokenizer_started
-    if _tokenizer_started:
-        return
+    if _tokenizer_started: return
     _tokenizer_started = True
     threading.Thread(target=_load_tokenizer_worker, daemon=True).start()
 
@@ -512,14 +380,12 @@ def decode_ids(ids, max_chars=220):
         if TOKENIZER is not None:
             s = TOKENIZER.decode(ids, skip_special_tokens=True)
             s = ' '.join(s.split())
-            if len(s) > max_chars:
-                s = s[:max_chars] + "…"
+            if len(s) > max_chars: s = s[:max_chars] + "…"
             return s or "…"
     except Exception:
         pass
     s = ' '.join(f"#{int(i)}" for i in ids)
-    if len(s) > max_chars:
-        s = s[:max_chars] + "…"
+    if len(s) > max_chars: s = s[:max_chars] + "…"
     return s
 
 
@@ -528,27 +394,18 @@ def decode_one(tok_id):
     return s if s.strip() else "␠"
 
 
-# =========================================================================
-# Logos + window icon
-# =========================================================================
+# =================== LOGOS ===================
 LOGO_URI_LIGHT = ""
 LOGO_URI_DARK = ""
 _lp_light = Path(__file__).parent / "docs/logo-black.svg"
-_lp_app   = Path(__file__).parent / "docs/logo-app.svg"
 _lp_dark  = Path(__file__).parent / "docs/logo-white.svg"
-
 if _lp_light.exists():
-    try:
-        LOGO_URI_LIGHT = "data:image/svg+xml;base64," + base64.b64encode(_lp_light.read_bytes()).decode()
-    except Exception:
-        pass
+    try: LOGO_URI_LIGHT = "data:image/svg+xml;base64," + base64.b64encode(_lp_light.read_bytes()).decode()
+    except Exception: pass
 if _lp_dark.exists():
-    try:
-        LOGO_URI_DARK = "data:image/svg+xml;base64," + base64.b64encode(_lp_dark.read_bytes()).decode()
-    except Exception:
-        pass
-if not LOGO_URI_DARK:
-    LOGO_URI_DARK = LOGO_URI_LIGHT
+    try: LOGO_URI_DARK = "data:image/svg+xml;base64," + base64.b64encode(_lp_dark.read_bytes()).decode()
+    except Exception: pass
+if not LOGO_URI_DARK: LOGO_URI_DARK = LOGO_URI_LIGHT
 
 ICON_PATH = None
 WINDOWS_ICO_PATH = None
@@ -558,29 +415,16 @@ _cleanup_icon = []
 
 def _render_svg_to_png(svg_path, size: int = 256):
     svg_path = Path(svg_path)
-    if not svg_path.exists():
-        return None
-
-    tmp = tempfile.NamedTemporaryFile(suffix='.png', delete=False)
-    tmp.close()
+    if not svg_path.exists(): return None
+    tmp = tempfile.NamedTemporaryFile(suffix='.png', delete=False); tmp.close()
     out = tmp.name
-
     def _ok():
-        try:
-            return os.path.getsize(out) > 100
-        except Exception:
-            return False
-
+        try: return os.path.getsize(out) > 100
+        except Exception: return False
     try:
-        import cairosvg
-        cairosvg.svg2png(url=str(svg_path), write_to=out,
-                         output_width=size, output_height=size)
-        if _ok():
-            log.info("[icon] Rendered SVG via cairosvg")
-            return out
-    except Exception as e:
-        log.debug(f"[icon] cairosvg failed: {e}")
-
+        import cairosvg; cairosvg.svg2png(url=str(svg_path), write_to=out, output_width=size, output_height=size)
+        if _ok(): log.info("[icon] Rendered SVG via cairosvg"); return out
+    except Exception as e: log.debug(f"[icon] cairosvg failed: {e}")
     try:
         from svglib.svglib import svg2rlg
         from reportlab.graphics import renderPM
@@ -588,27 +432,15 @@ def _render_svg_to_png(svg_path, size: int = 256):
         if drawing is not None:
             sw, sh = float(drawing.width or 0), float(drawing.height or 0)
             if sw > 0 and sh > 0:
-                scale = size / max(sw, sh)
-                drawing.scale(scale, scale)
-                drawing.width = sw * scale
-                drawing.height = sh * scale
+                scale = size / max(sw, sh); drawing.scale(scale, scale)
+                drawing.width = sw * scale; drawing.height = sh * scale
             renderPM.drawToFile(drawing, out, fmt='PNG')
-            if _ok():
-                log.info("[icon] Rendered SVG via svglib+reportlab")
-                return out
-    except Exception as e:
-        log.debug(f"[icon] svglib failed: {e}")
-
+            if _ok(): log.info("[icon] Rendered SVG via svglib+reportlab"); return out
+    except Exception as e: log.debug(f"[icon] svglib failed: {e}")
     try:
-        import resvg_py
-        resvg_py.svg_to_bytes(svg_path=str(svg_path), write_to=out,
-                              width=size, height=size)
-        if _ok():
-            log.info("[icon] Rendered SVG via resvg-py")
-            return out
-    except Exception as e:
-        log.debug(f"[icon] resvg-py failed: {e}")
-
+        import resvg_py; resvg_py.svg_to_bytes(svg_path=str(svg_path), write_to=out, width=size, height=size)
+        if _ok(): log.info("[icon] Rendered SVG via resvg-py"); return out
+    except Exception as e: log.debug(f"[icon] resvg-py failed: {e}")
     for mod in ("PySide6", "PyQt5"):
         try:
             if mod == "PySide6":
@@ -620,47 +452,23 @@ def _render_svg_to_png(svg_path, size: int = 256):
                 from PyQt5.QtGui import QImage, QPainter
                 from PyQt5.QtCore import QByteArray
             renderer = QSvgRenderer(QByteArray(svg_path.read_bytes()))
-            if not renderer.isValid():
-                continue
-            img = QImage(size, size, QImage.Format_ARGB32)
-            img.fill(0)
-            painter = QPainter(img)
-            renderer.render(painter)
-            painter.end()
-            if img.save(out, "PNG") and _ok():
-                log.info(f"[icon] Rendered SVG via {mod}")
-                return out
-        except Exception as e:
-            log.debug(f"[icon] {mod} failed: {e}")
-
+            if not renderer.isValid(): continue
+            img = QImage(size, size, QImage.Format_ARGB32); img.fill(0)
+            painter = QPainter(img); renderer.render(painter); painter.end()
+            if img.save(out, "PNG") and _ok(): log.info(f"[icon] Rendered SVG via {mod}"); return out
+        except Exception as e: log.debug(f"[icon] {mod} failed: {e}")
     try:
-        r = subprocess.run(
-            ["magick", "-background", "none", str(svg_path),
-             "-resize", f"{size}x{size}", out],
-            capture_output=True, timeout=30,
-        )
-        if r.returncode == 0 and _ok():
-            log.info("[icon] Rendered SVG via ImageMagick")
-            return out
-    except Exception as e:
-        log.debug(f"[icon] magick failed: {e}")
-
+        r = subprocess.run(["magick", "-background", "none", str(svg_path), "-resize", f"{size}x{size}", out],
+                           capture_output=True, timeout=30)
+        if r.returncode == 0 and _ok(): log.info("[icon] Rendered SVG via ImageMagick"); return out
+    except Exception as e: log.debug(f"[icon] magick failed: {e}")
     try:
-        r = subprocess.run(
-            ["inkscape", str(svg_path),
-             "-w", str(size), "-h", str(size), "-o", out],
-            capture_output=True, timeout=60,
-        )
-        if r.returncode == 0 and _ok():
-            log.info("[icon] Rendered SVG via Inkscape")
-            return out
-    except Exception as e:
-        log.debug(f"[icon] inkscape failed: {e}")
-
-    try:
-        os.unlink(out)
-    except Exception:
-        pass
+        r = subprocess.run(["inkscape", str(svg_path), "-w", str(size), "-h", str(size), "-o", out],
+                           capture_output=True, timeout=60)
+        if r.returncode == 0 and _ok(): log.info("[icon] Rendered SVG via Inkscape"); return out
+    except Exception as e: log.debug(f"[icon] inkscape failed: {e}")
+    try: os.unlink(out)
+    except Exception: pass
     return None
 
 
@@ -668,26 +476,19 @@ def _png_to_ico(png_path: str, sizes=(256, 128, 64, 48, 32, 16)):
     try:
         from PIL import Image
     except ImportError:
-        log.warning("[icon] Pillow not installed — cannot build .ico for Windows. "
-                    "Install with: pip install pillow")
-        return None
+        log.warning("[icon] Pillow not installed"); return None
     try:
         img = Image.open(png_path).convert("RGBA")
-        tmp = tempfile.NamedTemporaryFile(suffix='.ico', delete=False)
-        tmp.close()
+        tmp = tempfile.NamedTemporaryFile(suffix='.ico', delete=False); tmp.close()
         img.save(tmp.name, format="ICO", sizes=[(s, s) for s in sizes])
         return tmp.name
-    except Exception as e:
-        log.warning(f"[icon] PNG→ICO failed: {e}")
-        return None
+    except Exception as e: log.warning(f"[icon] PNG→ICO failed: {e}"); return None
 
 
 def _cleanup_icon_files():
     for p in _cleanup_icon:
-        try:
-            os.unlink(p)
-        except Exception:
-            pass
+        try: os.unlink(p)
+        except Exception: pass
 
 
 atexit.register(_cleanup_icon_files)
@@ -695,143 +496,71 @@ atexit.register(_cleanup_icon_files)
 
 def _find_best_icon():
     base = Path(__file__).parent
-
-    ico_candidates = [base / "icon.ico", base / "docs" / "icon.ico"]
-    svg_candidates = [base / "docs" / "logo-app.svg",
-                      base / "logo-app.svg"]
-    png_candidates = [base / "icon.png",
-                      base / "docs" / "logo-app.png"]
-
-    for ico in ico_candidates:
-        if ico.is_file():
-            log.info(f"[icon] Using existing .ico: {ico}")
-            return str(ico), str(ico)
-
-    for svg in svg_candidates:
+    for ico in [base / "icon.ico", base / "docs" / "icon.ico"]:
+        if ico.is_file(): log.info(f"[icon] Using existing .ico: {ico}"); return str(ico), str(ico)
+    for svg in [base / "docs" / "logo-app.svg", base / "logo-app.svg"]:
         if svg.is_file():
             rendered = _render_svg_to_png(svg, 256)
             if rendered:
-                png_path = Path(rendered)
-                _cleanup_icon.append(rendered)
-                raster = str(png_path)
-                ico_path = None
+                png_path = Path(rendered); _cleanup_icon.append(rendered)
+                raster = str(png_path); ico_path = None
                 if sys.platform == "win32":
                     ico_path = _png_to_ico(raster)
-                    if ico_path:
-                        _cleanup_icon.append(ico_path)
-                        log.info(f"[icon] Built multi-size ICO: {ico_path}")
-                    else:
-                        log.warning("[icon] SVG rendered but PNG→ICO failed. "
-                                    "Install Pillow: pip install pillow")
+                    if ico_path: _cleanup_icon.append(ico_path); log.info(f"[icon] Built multi-size ICO: {ico_path}")
+                    else: log.warning("[icon] SVG rendered but PNG→ICO failed. Install Pillow.")
                 return raster, ico_path
             if sys.platform != "win32":
-                log.info(f"[icon] No SVG renderer found — using SVG directly: {svg}")
-                return str(svg), None
-            log.warning(
-                "[icon] Could not render SVG. Install one of:\n"
-                "    pip install svglib reportlab    (recommended on Windows)\n"
-                "    pip install cairosvg            (Linux/macOS)\n"
-                "    pip install resvg-py\n"
-                "  Or drop a real icon.ico next to client.py."
-            )
-            break
-
-    for png in png_candidates:
+                log.info(f"[icon] No SVG renderer found — using SVG: {svg}"); return str(svg), None
+            log.warning("[icon] Could not render SVG"); break
+    for png in [base / "icon.png", base / "docs" / "logo-app.png"]:
         if png.is_file():
-            raster = str(png)
-            ico_path = None
+            raster = str(png); ico_path = None
             if sys.platform == "win32":
                 ico_path = _png_to_ico(raster)
-                if ico_path:
-                    _cleanup_icon.append(ico_path)
-                    log.info(f"[icon] Built multi-size ICO: {ico_path}")
-                else:
-                    log.warning("[icon] Could not build .ico — window will "
-                                "use the default. Install Pillow: pip install pillow")
-            log.info(f"[icon] Using PNG: {png}")
-            return raster, ico_path
-
-    log.warning("[icon] No icon source found — window will use the default.")
-    return None, None
+                if ico_path: _cleanup_icon.append(ico_path); log.info(f"[icon] Built .ico: {ico_path}")
+                else: log.warning("[icon] Could not build .ico. Install Pillow.")
+            log.info(f"[icon] Using PNG: {png}"); return raster, ico_path
+    log.warning("[icon] No icon source found"); return None, None
 
 
 ICON_PATH, WINDOWS_ICO_PATH = _find_best_icon()
 
 
-# =========================================================================
-# Windows native icon swap
-# =========================================================================
 def set_windows_icon(window_title: str, ico_path: str):
-    if sys.platform != "win32" or not ico_path:
-        return
+    if sys.platform != "win32" or not ico_path: return
     ico_path = os.path.abspath(ico_path)
-    if not os.path.exists(ico_path):
-        log.warning(f"[icon] not found: {ico_path}")
-        return
-    if not ico_path.lower().endswith(".ico"):
-        log.warning(f"[icon] not an .ico file: {ico_path}")
-        return
-
+    if not os.path.exists(ico_path) or not ico_path.lower().endswith(".ico"): return
     user32 = ctypes.WinDLL("user32", use_last_error=True)
-    user32.FindWindowW.argtypes   = [ctypes.c_wchar_p, ctypes.c_wchar_p]
-    user32.FindWindowW.restype    = ctypes.c_void_p
-    user32.LoadImageW.argtypes    = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_uint,
-                                     ctypes.c_int, ctypes.c_int, ctypes.c_uint]
+    user32.FindWindowW.argtypes   = [ctypes.c_wchar_p, ctypes.c_wchar_p]; user32.FindWindowW.restype = ctypes.c_void_p
+    user32.LoadImageW.argtypes    = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_uint, ctypes.c_int, ctypes.c_int, ctypes.c_uint]
     user32.LoadImageW.restype     = ctypes.c_void_p
-    user32.SendMessageW.argtypes  = [ctypes.c_void_p, ctypes.c_uint,
-                                     ctypes.c_void_p, ctypes.c_void_p]
+    user32.SendMessageW.argtypes  = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_void_p, ctypes.c_void_p]
     user32.SendMessageW.restype   = ctypes.c_void_p
-    user32.GetSystemMetrics.argtypes = [ctypes.c_int]
-    user32.GetSystemMetrics.restype  = ctypes.c_int
-
+    user32.GetSystemMetrics.argtypes = [ctypes.c_int]; user32.GetSystemMetrics.restype = ctypes.c_int
     hwnd = user32.FindWindowW(None, window_title)
-    if not hwnd:
-        log.warning(f"[icon] window '{window_title}' not found")
-        return
-
-    IMAGE_ICON      = 1
-    LR_LOADFROMFILE = 0x0010
-    WM_SETICON      = 0x0080
-    ICON_SMALL      = 0
-    ICON_BIG        = 1
-    SM_CXSMICON     = 49
-    SM_CYSMICON     = 50
-
+    if not hwnd: log.warning(f"[icon] window not found"); return
+    IMAGE_ICON, LR_LOADFROMFILE, WM_SETICON, ICON_SMALL, ICON_BIG = 1, 0x0010, 0x0080, 0, 1
+    SM_CXSMICON, SM_CYSMICON = 49, 50
     cx = user32.GetSystemMetrics(SM_CXSMICON) or 16
     cy = user32.GetSystemMetrics(SM_CYSMICON) or 16
-
     hicon_small = user32.LoadImageW(None, ico_path, IMAGE_ICON, cx, cy, LR_LOADFROMFILE)
     hicon_big   = user32.LoadImageW(None, ico_path, IMAGE_ICON, 0, 0, LR_LOADFROMFILE)
-
-    if hicon_small:
-        user32.SendMessageW(hwnd, WM_SETICON, ICON_SMALL, hicon_small)
-    if hicon_big:
-        user32.SendMessageW(hwnd, WM_SETICON, ICON_BIG, hicon_big)
-
-    if not hicon_small and not hicon_big:
-        err = ctypes.get_last_error()
-        log.warning(f"[icon] LoadImageW failed (err={err}) for {ico_path}")
-    else:
-        log.info(f"[icon] Applied window icon: {ico_path}")
+    if hicon_small: user32.SendMessageW(hwnd, WM_SETICON, ICON_SMALL, hicon_small)
+    if hicon_big: user32.SendMessageW(hwnd, WM_SETICON, ICON_BIG, hicon_big)
 
 
 def _wait_for_window(title: str, timeout: float = 5.0) -> bool:
-    if sys.platform != "win32":
-        return False
+    if sys.platform != "win32": return False
     user32 = ctypes.WinDLL("user32", use_last_error=True)
-    user32.FindWindowW.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p]
-    user32.FindWindowW.restype  = ctypes.c_void_p
+    user32.FindWindowW.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p]; user32.FindWindowW.restype = ctypes.c_void_p
     deadline = time.time() + timeout
     while time.time() < deadline:
-        if user32.FindWindowW(None, title):
-            return True
+        if user32.FindWindowW(None, title): return True
         time.sleep(0.1)
     return False
 
 
-# =========================================================================
-# Backend detection
-# =========================================================================
+# =================== BACKEND DETECTION ===================
 def get_available_backends():
     backends = {}
     backends['cuda'] = torch.cuda.is_available() and not (hasattr(torch.version, 'hip') and torch.version.hip)
@@ -840,13 +569,11 @@ def get_available_backends():
     try:
         import intel_extension_for_pytorch
         backends['xpu'] = hasattr(torch, 'xpu') and torch.xpu.is_available()
-    except ImportError:
-        backends['xpu'] = False
+    except ImportError: backends['xpu'] = False
     try:
         import torch_directml
         backends['directml'] = torch_directml.is_available()
-    except ImportError:
-        backends['directml'] = False
+    except ImportError: backends['directml'] = False
     backends['cpu'] = True
     return backends
 
@@ -854,23 +581,18 @@ def get_available_backends():
 def get_best_default_backend():
     avail = get_available_backends()
     for bk in ['cuda', 'rocm', 'mps', 'xpu', 'directml', 'cpu']:
-        if avail.get(bk):
-            return bk
+        if avail.get(bk): return bk
     return 'cpu'
 
 
 def _pick_rocm_device():
-    """Prefer dedicated Radeon RX cards over integrated AMD graphics."""
     candidates = []
     for idx in range(torch.cuda.device_count()):
         try:
             props = torch.cuda.get_device_properties(idx)
-            name = str(props.name)
-            candidates.append((idx, name, int(props.total_memory)))
-        except Exception as exc:
-            log.warning(f"[ROCM-FIX] GPU {idx} unavailable: {exc}")
-    if not candidates:
-        raise RuntimeError("ROCm reports no usable GPU")
+            candidates.append((idx, str(props.name), int(props.total_memory)))
+        except Exception: pass
+    if not candidates: raise RuntimeError("ROCm reports no usable GPU")
     preferred = [g for g in candidates if "radeon rx" in g[1].lower()]
     idx, name, total = max(preferred or candidates, key=lambda g: g[2])
     torch.cuda.set_device(idx)
@@ -879,7 +601,6 @@ def _pick_rocm_device():
 
 
 def _pick_directml_device(dml):
-    """Prefer a Radeon RX to an iGPU when DirectML exposes device names."""
     try:
         devices = [(i, str(dml.device_name(i))) for i in range(dml.device_count())]
         if devices:
@@ -887,16 +608,14 @@ def _pick_directml_device(dml):
             idx, name = (preferred or devices)[0]
             log.info(f"[AMD-AUTO] DirectML device {idx}: {name}")
             return dml.device(idx)
-    except Exception as exc:
-        log.warning(f"[AMD-AUTO] Could not enumerate DirectML GPUs: {exc}")
+    except Exception: pass
     return dml.device(0)
 
 
 def detect_training_backend(force=None):
     if force and force != "auto":
         n = force.lower()
-        if n == "cpu":
-            return torch.device('cpu'), "CPU"
+        if n == "cpu": return torch.device('cpu'), "CPU"
         if n == "cuda" and torch.cuda.is_available() and not getattr(torch.version, "hip", None):
             return torch.device('cuda'), "CUDA"
         if n == "rocm" and hasattr(torch.version, 'hip') and torch.version.hip and torch.cuda.is_available():
@@ -908,15 +627,13 @@ def detect_training_backend(force=None):
                 import intel_extension_for_pytorch
                 if hasattr(torch, 'xpu') and torch.xpu.is_available():
                     return torch.device('xpu'), "XPU"
-            except ImportError:
-                pass
+            except ImportError: pass
         if n == "directml":
             try:
                 import torch_directml
                 if torch_directml.is_available():
                     return _pick_directml_device(torch_directml), "DIRECTML"
-            except ImportError:
-                pass
+            except ImportError: pass
     if torch.cuda.is_available() and not (hasattr(torch.version, 'hip') and torch.version.hip):
         return torch.device('cuda'), "CUDA"
     if hasattr(torch.version, 'hip') and torch.version.hip and torch.cuda.is_available():
@@ -925,109 +642,72 @@ def detect_training_backend(force=None):
         return torch.device('mps'), "MPS"
     try:
         import intel_extension_for_pytorch
-        if hasattr(torch, 'xpu') and torch.xpu.is_available():
-            return torch.device('xpu'), "XPU"
-    except ImportError:
-        pass
+        if hasattr(torch, 'xpu') and torch.xpu.is_available(): return torch.device('xpu'), "XPU"
+    except ImportError: pass
     try:
         import torch_directml
-        if torch_directml.is_available():
-            return _pick_directml_device(torch_directml), "DIRECTML"
-    except ImportError:
-        pass
+        if torch_directml.is_available(): return _pick_directml_device(torch_directml), "DIRECTML"
+    except ImportError: pass
     return torch.device('cpu'), "CPU"
 
 
 def install_hard_vram_cap(device, safety_gb=SAFETY_MARGIN_GB):
-    if device is None or device.type != "cuda":
-        return None
+    if device is None or device.type != "cuda": return None
     try:
         idx = device.index if device.index is not None else 0
         props = torch.cuda.get_device_properties(idx)
         total = int(props.total_memory)
-        cap_bytes = max(int(MIN_HEADROOM_GB * 1024**3),
-                        total - int(safety_gb * 1024**3))
+        cap_bytes = max(int(MIN_HEADROOM_GB * 1024**3), total - int(safety_gb * 1024**3))
         frac = max(0.05, min(1.0, cap_bytes / total))
         torch.cuda.set_per_process_memory_fraction(frac, idx)
-        log.info(f"[VRAM-CAP] hard cap {cap_bytes/1024**3:.2f} GB "
-                 f"({frac*100:.1f}% of {total/1024**3:.2f} GB) on device {idx}")
+        log.info(f"[VRAM-CAP] hard cap {cap_bytes/1024**3:.2f} GB ({frac*100:.1f}% of {total/1024**3:.2f} GB) on device {idx}")
         return cap_bytes / 1024**3
     except Exception as e:
-        log.warning(f"[VRAM-CAP] could not install hard cap: {e}")
-        return None
+        log.warning(f"[VRAM-CAP] could not install hard cap: {e}"); return None
 
 
 def auto_detect_vram_budget():
     global train_backend
-
     if train_backend in ("CUDA", "ROCM") and torch.cuda.is_available():
         try:
             idx = train_device.index if train_device is not None and train_device.index is not None else 0
             fb, tb = torch.cuda.mem_get_info(idx)
-            total_gb = tb / 1024**3
-            free_gb  = fb / 1024**3
-            usable = max(0.25, min(total_gb, free_gb)
-                               - SAFETY_MARGIN_GB
-                               - ALLOCATOR_RESERVE_GB)
-            memory_config.update({"ram_gb": round(usable, 2),
-                                  "is_auto_detected": True})
-            log.info(f"[VRAM-BUDGET] free={free_gb:.2f}GB total={total_gb:.2f}GB "
-                     f"margin={SAFETY_MARGIN_GB:.2f}GB reserve={ALLOCATOR_RESERVE_GB:.2f}GB "
-                     f"→ placement={usable:.2f}GB")
+            total_gb = tb / 1024**3; free_gb = fb / 1024**3
+            usable = max(0.25, min(total_gb, free_gb) - SAFETY_MARGIN_GB - ALLOCATOR_RESERVE_GB)
+            memory_config.update({"ram_gb": round(usable, 2), "is_auto_detected": True})
+            log.info(f"[VRAM-BUDGET] free={free_gb:.2f}GB total={total_gb:.2f}GB → placement={usable:.2f}GB")
             return
-        except Exception:
-            pass
-
+        except Exception: pass
     if train_backend == "MPS":
         try:
             out = subprocess.check_output(["sysctl", "-n", "hw.memsize"]).decode().strip()
             total_gb = int(out) / 1024**3
             usable = max(0.5, total_gb * 0.75 - SAFETY_MARGIN_GB)
-            memory_config.update({"ram_gb": round(usable, 2),
-                                  "is_auto_detected": True})
+            memory_config.update({"ram_gb": round(usable, 2), "is_auto_detected": True})
             return
-        except Exception:
-            pass
-
+        except Exception: pass
     if train_backend == "XPU":
         try:
             total = int(torch.xpu.get_device_properties(0).total_memory)
             free = total
-            try:
-                free, _t = torch.xpu.mem_get_info(0)
-            except Exception:
-                pass
+            try: free, _t = torch.xpu.mem_get_info(0)
+            except Exception: pass
             total_gb, free_gb = total / 1024**3, int(free) / 1024**3
             usable = max(0.25, min(total_gb, free_gb) - SAFETY_MARGIN_GB - ALLOCATOR_RESERVE_GB)
             memory_config.update({"ram_gb": round(usable, 2), "is_auto_detected": True})
-            log.info(f"[VRAM-BUDGET] XPU free={free_gb:.2f}GB total={total_gb:.2f}GB → placement={usable:.2f}GB")
             return
-        except Exception:
-            pass
-
+        except Exception: pass
     if train_backend == "DIRECTML":
-        memory_config.update({"ram_gb": 1.5, "is_auto_detected": True})
-        return
-
+        memory_config.update({"ram_gb": 1.5, "is_auto_detected": True}); return
     try:
         import psutil
-        usable = max(0.5, psutil.virtual_memory().available / 1024**3
-                          - SAFETY_MARGIN_GB)
-        memory_config.update({"ram_gb": round(usable, 2),
-                              "is_auto_detected": True})
-    except Exception:
-        pass
+        usable = max(0.5, psutil.virtual_memory().available / 1024**3 - SAFETY_MARGIN_GB)
+        memory_config.update({"ram_gb": round(usable, 2), "is_auto_detected": True})
+    except Exception: pass
 
 
 def apply_vram_override(user_gb=0.0):
-    """
-    Cap how much VRAM the placement planner may fill. Priority: the UI dropdown, then
-    the CROWDGPT_VRAM_GB env var (CROWDBPT_VRAM_GB is accepted as a deprecated alias);
-    0 / unset = Auto. Lower = less VRAM used, more weights streamed from RAM (slower).
-    Applied each round.
-    """
-    if "auto_gb" not in memory_config:          # budget not detected yet (before first Start)
-        return
+    if "auto_gb" not in memory_config: return
     auto = float(memory_config["auto_gb"])
     cap, src = 0.0, ""
     try:
@@ -1035,61 +715,42 @@ def apply_vram_override(user_gb=0.0):
             cap, src = float(user_gb), "UI"
         else:
             v = os.environ.get("CROWDGPT_VRAM_GB", "").strip()
-            if v:
-                src = "CROWDGPT_VRAM_GB"
+            if v: src = "CROWDGPT_VRAM_GB"
             else:
                 v = os.environ.get("CROWDBPT_VRAM_GB", "").strip()
-                if v:
-                    src = "CROWDBPT_VRAM_GB (deprecated; use CROWDGPT_VRAM_GB)"
-            if v and float(v) > 0:
-                cap = float(v)
+                if v: src = "CROWDBPT_VRAM_GB (deprecated)"
+            if v and float(v) > 0: cap = float(v)
     except ValueError:
         log.warning("[VRAM-BUDGET] ignoring invalid VRAM limit")
     new = min(auto, cap) if cap > 0 else auto
     memory_config["ram_gb"] = round(new, 2)
     if cap > 0:
         memory_config["is_auto_detected"] = False
-        log.info(f"[VRAM-BUDGET] limit {cap:.1f} GB ({src}) → placement budget {new:.2f} GB (auto {auto:.2f} GB)")
+        log.info(f"[VRAM-BUDGET] limit {cap:.1f} GB ({src}) → placement {new:.2f} GB (auto {auto:.2f})")
 
 
 def has_bitsandbytes():
     try:
-        import bitsandbytes
-        return True
-    except Exception:
-        return False
+        import bitsandbytes; return True
+    except Exception: return False
 
 
 def _bytes_per_block_params():
-    return (
-        DIM * 2
-        + DIM * (N_HEADS * HEAD_DIM)
-        + DIM * (N_KV_HEADS * HEAD_DIM)
-        + DIM * (N_KV_HEADS * HEAD_DIM)
-        + DIM * DIM
-        + DIM * 2
-        + DIM * MLP_HIDDEN
-        + DIM * MLP_HIDDEN
-        + MLP_HIDDEN * DIM
-    )
+    return (DIM * 2 + DIM * (N_HEADS * HEAD_DIM) + DIM * (N_KV_HEADS * HEAD_DIM)
+            + DIM * (N_KV_HEADS * HEAD_DIM) + DIM * DIM + DIM * 2
+            + DIM * MLP_HIDDEN + DIM * MLP_HIDDEN + MLP_HIDDEN * DIM)
 
 
 def estimate_vram_bytes(bs, sl, u8):
     per_block = _bytes_per_block_params()
-
     head_params = VOCAB_SIZE * DIM
     head_bytes  = head_params * (4 + 4 + (2 if u8 else 8))
-
     blocks = N_LAYERS * per_block
     opt_state_per_param = 2 if u8 else 8
     block_bytes = blocks * (4 + 4 + opt_state_per_param)
-
     act = bs * sl * DIM * 4 * (2 + 1)
-
     loss = bs * LOSS_CHUNK * VOCAB_SIZE * 4
-
     workspace = int(ALLOCATOR_RESERVE_GB * 1024**3)
-
     return int(head_bytes + block_bytes + act + loss + workspace)
 
 
@@ -1098,79 +759,65 @@ def recommend_batch_size(sl=MAX_SEQ_LEN):
     budget = int(memory_config["ram_gb"] * 1024**3)
     best = 1
     for bs in ALLOWED_BATCH_SIZES:
-        if estimate_vram_bytes(bs, sl, u8) <= budget:
-            best = bs
-        else:
-            break
-
+        if estimate_vram_bytes(bs, sl, u8) <= budget: best = bs
+        else: break
     if train_backend == "ROCM":
         rocm_bs_cap = max(1, min(8, int(os.environ.get("CROWDGPT_ROCM_BATCH", 1))))
         best = min(best, rocm_bs_cap)
-
-    log.info(f"[BATCH] recommended bs={best} for budget={memory_config['ram_gb']:.2f}GB "
-             f"(8bit_opt={u8})")
+    log.info(f"[BATCH] recommended bs={best} for budget={memory_config['ram_gb']:.2f}GB (8bit_opt={u8})")
     return best
 
 
-def _plan_placement(device, backend_name, budget_gb, bs=1, sl=MAX_SEQ_LEN,
-                    u8=False, loss_chunk=LOSS_CHUNK):
-    """
-    Decide where the *master copy* of each tensor lives. All compute (blocks,
-    head, loss) always runs on the accelerator; only storage differs:
+# === NEW: hardware headers ===
+def _hardware_headers():
+    """Hardware fingerprint for server cohort overflow compatibility."""
+    try:
+        bs = recommend_batch_size(MAX_SEQ_LEN)
+    except Exception:
+        bs = 1
+    gpu = "UNKNOWN"
+    try:
+        if train_backend in ("CUDA", "ROCM") and torch.cuda.is_available():
+            gpu = torch.cuda.get_device_name(0)
+        elif train_backend:
+            gpu = str(train_backend)
+    except Exception:
+        pass
+    return {
+        "X-Client-Backend": (train_backend or "UNKNOWN").upper(),
+        "X-Client-Batch-Size": str(bs),
+        "X-Client-Vram-Gb": f"{memory_config.get('ram_gb', 0.0):.2f}",
+        "X-Client-Gpu-Name": gpu,
+    }
 
-      * resident blocks / head : weights + grads + optimizer state on the accelerator
-      * streamed blocks / head : master copy in system RAM, copied to the
-                                 accelerator for each use (grads are copied back
-                                 by autograd, the optimizer step runs on the CPU)
 
-    Blocks are made resident first (their weights are streamed 3x per
-    micro-step: forward, recompute, grads; the head only 2x). The head becomes
-    resident only if every block fits as well. With a small budget the loss chunk
-    (logits buffer) is shrunk first, which costs almost no speed.
-
-    Returns (head_on_gpu, n_resident_blocks, loss_chunk).
-    """
-    if backend_name == "ROCM":
-        loss_chunk = min(loss_chunk, 128)
-    if device is None or device.type == "cpu":
-        return False, 0, loss_chunk
-
+def _plan_placement(device, backend_name, budget_gb, bs=1, sl=MAX_SEQ_LEN, u8=False, loss_chunk=LOSS_CHUNK):
+    if backend_name == "ROCM": loss_chunk = min(loss_chunk, 128)
+    if device is None or device.type == "cpu": return False, 0, loss_chunk
     GB = 1024 ** 3
-    cd = 2 if device.type in ("cuda", "xpu") else 4      # bytes/param of a streamed copy
+    cd = 2 if device.type in ("cuda", "xpu") else 4
     budget = int(max(0.0, budget_gb) * GB)
     per_block = _bytes_per_block_params()
     head_params = VOCAB_SIZE * DIM
     opt_b = 2 if u8 else 8
-
     def fixed_cost(lc):
-        return (
-            N_LAYERS * bs * sl * DIM * 4                  # checkpointed block inputs
-            + bs * sl * (DIM * 12 + MLP_HIDDEN * 3) * 4   # one block's recompute workspace
-            + per_block * cd * 2                          # one streamed block (weights + grads)
-            + bs * lc * VOCAB_SIZE * 4 * 3                # loss-chunk logits (+ fp32 copy + grad)
-            + int(ALLOCATOR_RESERVE_GB * GB)
-        )
-
+        return (N_LAYERS * bs * sl * DIM * 4
+                + bs * sl * (DIM * 12 + MLP_HIDDEN * 3) * 4
+                + per_block * cd * 2
+                + bs * lc * VOCAB_SIZE * 4 * 3
+                + int(ALLOCATOR_RESERVE_GB * GB))
     blk_res = per_block * (4 + 4 + opt_b)
     head_res = head_params * (4 + 4 + opt_b)
     head_stream = head_params * cd * 2
-
     lc = loss_chunk
-    while lc > 32 and budget - fixed_cost(lc) <= head_stream:
-        lc //= 2
-    fixed = fixed_cost(lc)
-    remaining = budget - fixed
-
+    while lc > 32 and budget - fixed_cost(lc) <= head_stream: lc //= 2
+    fixed = fixed_cost(lc); remaining = budget - fixed
     head_gpu, n = False, 0
     if remaining > head_stream:
         n = int((remaining - head_stream) // blk_res)
         n = max(0, min(N_LAYERS, n))
-        if n == N_LAYERS and remaining >= N_LAYERS * blk_res + head_res:
-            head_gpu = True
-
-    if backend_name == "DIRECTML":
-        head_gpu, n = False, min(n, 2)
-
+        if n == N_LAYERS and remaining >= N_LAYERS * blk_res + head_res: head_gpu = True
+    if backend_name == "DIRECTML": head_gpu, n = False, min(n, 2)
     log.info(f"[PLACEMENT] {backend_name}: budget={budget_gb:.2f}GB fixed={fixed/GB:.2f}GB "
              f"blk_res={blk_res/1024**2:.0f}MB head_res={head_res/GB:.2f}GB bs={bs} u8={u8} "
              f"loss_chunk={lc} → {n}/{N_LAYERS} blocks resident, head {'resident' if head_gpu else 'streamed'}")
@@ -1189,39 +836,29 @@ def rotate_half(x):
 
 
 def _is_directml(t):
-    try:
-        return t.device.type == 'privateuseone'
-    except Exception:
-        return False
+    try: return t.device.type == 'privateuseone'
+    except Exception: return False
 
 
 def _is_directml_device(d):
-    try:
-        return d.type == 'privateuseone'
-    except Exception:
-        return False
+    try: return d.type == 'privateuseone'
+    except Exception: return False
 
 
 def _is_accel_error(msg):
     m = msg.lower()
     return any(k in m for k in (
-        "privateuse1", "unbox expects", "not implemented for",
-        "not supported", "unsupported data type", "bfloat16",
-        "internal assert", "dml", "scatter", "compilegraph",
-        "out of memory", "allocation", "device_type",
-        "not implemented for unique",
-    ))
+        "privateuse1", "unbox expects", "not implemented for", "not supported",
+        "unsupported data type", "bfloat16", "internal assert", "dml", "scatter",
+        "compilegraph", "out of memory", "allocation", "device_type",
+        "not implemented for unique"))
 
 
-# =========================================================================
-# Model
-# =========================================================================
+# =================== MODEL ===================
 class GroupedQueryAttention(nn.Module):
     def __init__(self):
         super().__init__()
-        self.nh = N_HEADS
-        self.nkv = N_KV_HEADS
-        self.nrep = N_HEADS // N_KV_HEADS
+        self.nh = N_HEADS; self.nkv = N_KV_HEADS; self.nrep = N_HEADS // N_KV_HEADS
         self.wq = nn.Linear(DIM, N_HEADS * HEAD_DIM, bias=False)
         self.wk = nn.Linear(DIM, N_KV_HEADS * HEAD_DIM, bias=False)
         self.wv = nn.Linear(DIM, N_KV_HEADS * HEAD_DIM, bias=False)
@@ -1237,25 +874,17 @@ class GroupedQueryAttention(nn.Module):
         k = k * ct + rotate_half(k) * st
         k = k.unsqueeze(2).expand(B, self.nkv, self.nrep, T, HEAD_DIM).reshape(B, self.nh, T, HEAD_DIM)
         v = v.unsqueeze(2).expand(B, self.nkv, self.nrep, T, HEAD_DIM).reshape(B, self.nh, T, HEAD_DIM)
-        if q.dtype != v.dtype or k.dtype != v.dtype:
-            q, k = q.to(v.dtype), k.to(v.dtype)
+        if q.dtype != v.dtype or k.dtype != v.dtype: q, k = q.to(v.dtype), k.to(v.dtype)
         if _is_directml(q):
-            o = F.scaled_dot_product_attention(
-                q.contiguous().cpu(), k.contiguous().cpu(), v.contiguous().cpu(),
-                is_causal=True).to(q.device)
+            o = F.scaled_dot_product_attention(q.contiguous().cpu(), k.contiguous().cpu(), v.contiguous().cpu(), is_causal=True).to(q.device)
         elif q.device.type == 'cuda' and getattr(torch.version, 'hip', None):
             if os.environ.get('CROWDGPT_ROCM_SDPA', '1') != '0':
-                try:
-                    o = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=True)
+                try: o = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=True)
                 except RuntimeError as exc:
-                    if _is_oom(exc):
-                        raise
-                    log.warning(f"[ROCM-FIX] SDPA unavailable, using chunked attention: {exc}")
-                    o = self._chunked_attn(q, k, v, T)
-            else:
-                o = self._chunked_attn(q, k, v, T)
-        else:
-            o = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+                    if _is_oom(exc): raise
+                    log.warning(f"[ROCM-FIX] SDPA unavailable: {exc}"); o = self._chunked_attn(q, k, v, T)
+            else: o = self._chunked_attn(q, k, v, T)
+        else: o = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         return self.wo(o.transpose(1, 2).contiguous().view(B, T, C))
 
     def _chunked_attn(self, q, k, v, T, cs=64):
@@ -1277,17 +906,14 @@ class SwiGLU(nn.Module):
         self.w2 = nn.Linear(DIM, MLP_HIDDEN, bias=False)
         self.w3 = nn.Linear(MLP_HIDDEN, DIM, bias=False)
 
-    def forward(self, x):
-        return self.w3(F.silu(self.w1(x)) * self.w2(x))
+    def forward(self, x): return self.w3(F.silu(self.w1(x)) * self.w2(x))
 
 
 class Block(nn.Module):
     def __init__(self):
         super().__init__()
-        self.ln_1 = nn.LayerNorm(DIM)
-        self.attn = GroupedQueryAttention()
-        self.ln_2 = nn.LayerNorm(DIM)
-        self.mlp = SwiGLU()
+        self.ln_1 = nn.LayerNorm(DIM); self.attn = GroupedQueryAttention()
+        self.ln_2 = nn.LayerNorm(DIM); self.mlp = SwiGLU()
 
     def forward(self, x, cos, sin, use_chunked=True):
         x = x + self.attn(self.ln_1(x), cos, sin, use_chunked)
@@ -1314,8 +940,7 @@ class EngramMemory(nn.Module):
 
 def _streamed_block(block, dev, dtype, x, cos, sin, use_chunked):
     if dtype is not None:
-        params = {n: (p.to(dev, dtype=dtype) if p.dim() > 1 else p.to(dev))
-                  for n, p in block.named_parameters()}
+        params = {n: (p.to(dev, dtype=dtype) if p.dim() > 1 else p.to(dev)) for n, p in block.named_parameters()}
         with torch.autocast(device_type=dev.type, dtype=dtype):
             return torch.func.functional_call(block, params, (x, cos, sin, use_chunked))
     params = {n: p.to(dev) for n, p in block.named_parameters()}
@@ -1325,123 +950,82 @@ def _streamed_block(block, dev, dtype, x, cos, sin, use_chunked):
 class SotaGPT(nn.Module):
     def __init__(self, bn, device, gpu_layers=None, bs=1, sl=MAX_SEQ_LEN):
         super().__init__()
-        self.main_device = device
-        self.accel_device = device
-        self.cpu_device  = torch.device('cpu')
-        self.backend_name = bn
+        self.main_device = device; self.accel_device = device
+        self.cpu_device  = torch.device('cpu'); self.backend_name = bn
         is_cpu = (device is None) or (device.type == 'cpu')
-
         if gpu_layers is None:
             head_gpu, gpu_layers, self.loss_chunk_hint = _plan_placement(
                 device, bn, memory_config["ram_gb"], bs=bs, sl=sl,
                 u8=(has_bitsandbytes() and device is not None and device.type in ('cuda',)))
         else:
-            head_gpu = int(gpu_layers) >= N_LAYERS
-            self.loss_chunk_hint = LOSS_CHUNK
-
+            head_gpu = int(gpu_layers) >= N_LAYERS; self.loss_chunk_hint = LOSS_CHUNK
         self.gpu_layers = 0 if is_cpu else max(0, min(N_LAYERS, int(gpu_layers)))
         self.gpu_layer_set = set(range(self.gpu_layers))
         self.head_on_gpu = bool(head_gpu) and not is_cpu
-
         self.wte = nn.Embedding(VOCAB_SIZE, DIM)
         self.engram = EngramMemory(bn, device)
         self.blocks = nn.ModuleList([Block() for _ in range(N_LAYERS)])
         self.ln_f = nn.LayerNorm(DIM)
         self.lm_head = nn.Linear(DIM, VOCAB_SIZE, bias=False)
-        if MODEL_CONFIG["weightTying"]:
-            self.wte.weight = self.lm_head.weight
-
+        if MODEL_CONFIG["weightTying"]: self.wte.weight = self.lm_head.weight
         cm_main, sm_main = precompute_freqs(HEAD_DIM, MAX_SEQ_LEN, device)
-        self.register_buffer("freqs_cos_main", cm_main)
-        self.register_buffer("freqs_sin_main", sm_main)
-
+        self.register_buffer("freqs_cos_main", cm_main); self.register_buffer("freqs_sin_main", sm_main)
         cm_cpu, sm_cpu = precompute_freqs(HEAD_DIM, MAX_SEQ_LEN, self.cpu_device)
-        self.register_buffer("freqs_cos_cpu", cm_cpu)
-        self.register_buffer("freqs_sin_cpu", sm_cpu)
-
+        self.register_buffer("freqs_cos_cpu", cm_cpu); self.register_buffer("freqs_sin_cpu", sm_cpu)
         for i, block in enumerate(self.blocks):
             block.to(device if i in self.gpu_layer_set else self.cpu_device)
-
-        self._place_head()
-        self.engram.table.to('cpu')
-
-        if is_cpu:
-            log.info("🧠 SotaGPT: CPU-only, all weights in system RAM")
-        else:
-            log.info(
-                f"🧠 SotaGPT: compute on {device.type}; {self.gpu_layers}/{N_LAYERS} blocks resident "
-                f"(rest streamed from RAM), head {'resident' if self.head_on_gpu else 'streamed'}"
-            )
+        self._place_head(); self.engram.table.to('cpu')
+        if is_cpu: log.info("🧠 SotaGPT: CPU-only, all weights in system RAM")
+        else: log.info(f"🧠 SotaGPT: compute on {device.type}; {self.gpu_layers}/{N_LAYERS} resident, "
+                       f"head {'resident' if self.head_on_gpu else 'streamed'}")
 
     def _place_head(self):
         head_dev = self.main_device if self.head_on_gpu else self.cpu_device
-        self.wte.to(head_dev)
-        self.lm_head.to(head_dev)
-        self.ln_f.to(self.main_device)
+        self.wte.to(head_dev); self.lm_head.to(head_dev); self.ln_f.to(self.main_device)
 
     def set_gpu_layers(self, n):
         n = max(0, min(N_LAYERS, int(n)))
-        if self.main_device.type == 'cpu':
-            n = 0
-        self.gpu_layers = n
-        self.gpu_layer_set = set(range(n))
-        if n < N_LAYERS:
-            self.head_on_gpu = False
+        if self.main_device.type == 'cpu': n = 0
+        self.gpu_layers = n; self.gpu_layer_set = set(range(n))
+        if n < N_LAYERS: self.head_on_gpu = False
         for i, blk in enumerate(self.blocks):
             blk.to(self.main_device if i < n else self.cpu_device)
         self._place_head()
-        log.info(f"[PLACEMENT] {n}/{N_LAYERS} blocks resident, "
-                 f"head {'resident' if self.head_on_gpu else 'streamed'}")
+        log.info(f"[PLACEMENT] {n}/{N_LAYERS} resident, head {'resident' if self.head_on_gpu else 'streamed'}")
 
     def force_head_cpu(self):
-        self.head_on_gpu = False
-        self._place_head()
-        log.info("[PLACEMENT] head master copy → system RAM (streamed per step)")
+        self.head_on_gpu = False; self._place_head()
+        log.info("[PLACEMENT] head → system RAM")
 
     def to_cpu_only(self):
-        self.gpu_layers = 0
-        self.gpu_layer_set = set()
-        self.head_on_gpu = False
+        self.gpu_layers = 0; self.gpu_layer_set = set(); self.head_on_gpu = False
         self.main_device = self.cpu_device
-        for blk in self.blocks:
-            blk.to(self.cpu_device)
-        self._place_head()
-        self.engram.table.to('cpu')
-        self.engram.device = self.cpu_device
+        for blk in self.blocks: blk.to(self.cpu_device)
+        self._place_head(); self.engram.table.to('cpu'); self.engram.device = self.cpu_device
         log.info("[PLACEMENT] model → CPU-only")
 
     def head_weight(self, dtype=None):
         w = self.lm_head.weight
         if w.device != self.main_device:
             return w.to(self.main_device, dtype=dtype) if dtype is not None else w.to(self.main_device)
-        if dtype is not None and w.dtype != dtype:
-            return w.to(dtype)
+        if dtype is not None and w.dtype != dtype: return w.to(dtype)
         return w
 
     def forward_features(self, idx, use_chunked=True, use_ckpt=True, stream_dtype=None, head_w=None):
-        dev = self.main_device
-        wdev = self.wte.weight.device
+        dev = self.main_device; wdev = self.wte.weight.device
         if head_w is not None and not self.head_on_gpu and head_w.device == dev:
             x = F.embedding(idx.to(dev), head_w)
-            if x.dtype != torch.float32:
-                x = x.float()
+            if x.dtype != torch.float32: x = x.float()
         else:
             x = F.embedding(idx.to(wdev), self.wte.weight)
-            if x.device != dev:
-                x = x.to(dev)
-
-        if dev.type == 'cpu':
-            cos, sin = self.freqs_cos_cpu, self.freqs_sin_cpu
-        else:
-            cos, sin = self.freqs_cos_main, self.freqs_sin_main
-
+            if x.device != dev: x = x.to(dev)
+        if dev.type == 'cpu': cos, sin = self.freqs_cos_cpu, self.freqs_sin_cpu
+        else: cos, sin = self.freqs_cos_main, self.freqs_sin_main
         for i, block in enumerate(self.blocks):
             if dev.type == 'cpu' or i in self.gpu_layer_set:
                 if use_ckpt:
-                    x = checkpoint(block, x, cos, sin, use_chunked,
-                                   use_reentrant=False, preserve_rng_state=False)
-                else:
-                    x = block(x, cos, sin, use_chunked)
+                    x = checkpoint(block, x, cos, sin, use_chunked, use_reentrant=False, preserve_rng_state=False)
+                else: x = block(x, cos, sin, use_chunked)
             else:
                 x = checkpoint(_streamed_block, block, dev, stream_dtype, x, cos, sin, use_chunked,
                                use_reentrant=False, preserve_rng_state=False)
@@ -1451,10 +1035,8 @@ class SotaGPT(nn.Module):
         return F.linear(self.forward_features(idx, use_chunked, use_ckpt), self.head_weight())
 
     def get_base_weights(self):
-        return np.concatenate([
-            p.detach().float().flatten().cpu().numpy()
-            for n, p in self.named_parameters() if not n.startswith('engram.')
-        ])
+        return np.concatenate([p.detach().float().flatten().cpu().numpy()
+                               for n, p in self.named_parameters() if not n.startswith('engram.')])
 
     def load_base_weights(self, fw):
         ft = torch.from_numpy(fw) if not isinstance(fw, torch.Tensor) else fw
@@ -1462,48 +1044,36 @@ class SotaGPT(nn.Module):
         for n, p in self.named_parameters():
             if not n.startswith('engram.'):
                 s = 1
-                for d in p.shape:
-                    s *= int(d)
+                for d in p.shape: s *= int(d)
                 src = ft[o:o + s].view(p.shape)
-                # DirectML's Windows backend does not support BF16 tensors. The
-                # checkpoint is stored as BF16, but model parameters are FP32.
-                # Convert on CPU first, then transfer FP32 to DirectML; never
-                # create a privateuseone/BF16 tensor during weight loading.
                 if p.device.type == 'privateuseone':
-                    src = src.to(device='cpu', dtype=p.dtype).contiguous()
-                    src = src.to(device=p.device)
-                else:
-                    src = src.to(device=p.device, dtype=p.dtype)
-                p.data.copy_(src)
-                o += s
+                    src = src.to(device='cpu', dtype=p.dtype).contiguous(); src = src.to(device=p.device)
+                else: src = src.to(device=p.device, dtype=p.dtype)
+                p.data.copy_(src); o += s
 
 
-# =========================================================================
-# Data + networking
-# =========================================================================
+# =================== DATA / NETWORK ===================
 def _fetch_with_retry(url, headers=None, timeout=60, retries=5):
     for a in range(retries):
         try:
             r = requests.get(url, headers=headers, timeout=timeout, allow_redirects=True)
-            r.raise_for_status()
-            return r
+            r.raise_for_status(); return r
         except (requests.exceptions.ConnectionError, requests.exceptions.Timeout,
                 ChunkedEncodingError, http.client.IncompleteRead):
-            if a < retries - 1:
-                time.sleep(2 ** (a + 1))
-            else:
-                raise
+            if a < retries - 1: time.sleep(2 ** (a + 1))
+            else: raise
 
 
 class StreamingShardDataset:
     STEPS_PER_SUBCHUNK = 500
 
-    def __init__(self, repo_id, ci, ss=10 * 1024 * 1024, tps=65, slot=0, at=None):
+    def __init__(self, repo_id, ci, ss=10 * 1024 * 1024, tps=65, slot=0, at=None, cohort_mode=False):
         self.repo_id = repo_id
         self.ci = ci
         self.sub_size = ss
         self.tps = tps
         self.auth_token = at
+        self.cohort_mode = cohort_mode
         self._fmt = "chunk_{:04d}.bin"
         self.chunk_size = self._discover(ci)
         self.off = (slot * ss) % self.chunk_size
@@ -1527,11 +1097,8 @@ class StreamingShardDataset:
                     r = requests.head(url, allow_redirects=True, timeout=30)
                     if r.status_code == 200:
                         sz = int(r.headers.get('content-length', 0))
-                        if sz > 0:
-                            self._fmt = fmt
-                            return sz
-                except Exception:
-                    time.sleep(1)
+                        if sz > 0: self._fmt = fmt; return sz
+                except Exception: time.sleep(1)
         raise RuntimeError(f"No chunk {idx}")
 
     def _slice(self, off):
@@ -1544,82 +1111,62 @@ class StreamingShardDataset:
         self.n = len(tk) // self.tps
         self.steps_used = 0
 
-    def _load(self, off):
-        self._set(self._slice(off))
-        self.off = off
+    def _load(self, off): self._set(self._slice(off)); self.off = off
 
     def _prefetch(self, off):
-        if off >= self.chunk_size:
-            return
-        with self._lock:
-            self._pfr = None
-
+        if off >= self.chunk_size: return
+        with self._lock: self._pfr = None
         def w():
             try:
                 r = self._slice(off)
-                with self._lock:
-                    self._pfr = (off, r)
-            except Exception:
-                pass
-        self._pft = threading.Thread(target=w, daemon=True)
-        self._pft.start()
+                with self._lock: self._pfr = (off, r)
+            except Exception: pass
+        self._pft = threading.Thread(target=w, daemon=True); self._pft.start()
 
     def needs_new_subchunk(self):
-        return self.n == 0 or self.steps_used >= self.STEPS_PER_SUBCHUNK
+        if self.n == 0: return True
+        if self.cohort_mode: return False    # stay on the same subchunk for the whole cohort
+        return self.steps_used >= self.STEPS_PER_SUBCHUNK
 
     def advance(self, srv=None, fmt="bf16"):
         no = self.off + self.sub_size
         if no < self.chunk_size:
             if self._pft:
-                self._pft.join(timeout=120)
-                self._pft = None
+                self._pft.join(timeout=120); self._pft = None
             with self._lock:
-                r = self._pfr
-                self._pfr = None
-            if r and r[0] == no:
-                self.off = no
-                self._set(r[1])
-            else:
-                self._load(no)
+                r = self._pfr; self._pfr = None
+            if r and r[0] == no: self.off = no; self._set(r[1])
+            else: self._load(no)
             self._prefetch(no + self.sub_size)
             return True
         self._req(srv, fmt)
         self.chunk_size = self._discover(self.ci)
-        self.off = 0
-        self._load(0)
-        self._prefetch(self.sub_size)
+        self.off = 0; self._load(0); self._prefetch(self.sub_size)
         return True
 
     def _req(self, srv, fmt="bf16"):
-        if not srv:
-            return False
+        if not srv: return False
+        if self.cohort_mode: return False     # never re-shard mid-cohort
         try:
             h = {"Authorization": f"Bearer {self.auth_token}"} if self.auth_token else {}
-            r = requests.get(f"{srv}/fl/task?format={fmt}&skip_weights=true", headers=h, timeout=30)
-            if r.status_code != 200:
-                return False
+            req_headers = {**h, **_hardware_headers()}
+            r = requests.get(f"{srv}/fl/task?format={fmt}&skip_weights=true", headers=req_headers, timeout=30)
+            if r.status_code != 200: return False
             ct = (r.headers.get("content-type") or "").lower()
-            if "json" in ct:
-                md = r.json()
+            if "json" in ct: md = r.json()
             else:
                 raw = r.content
-                if len(raw) < 4:
-                    return False
+                if len(raw) < 4: return False
                 ml = struct.unpack('<I', raw[:4])[0]
-                if len(raw) < 4 + ml:
-                    return False
+                if len(raw) < 4 + ml: return False
                 md = json.loads(raw[4:4 + ml].decode())
             ni = md.get("datasetConfig", {}).get("chunkIdx", self.ci)
-            if ni != self.ci:
-                self.ci = ni
-                return True
-        except Exception:
-            pass
+            if ni != self.ci: self.ci = ni; return True
+        except Exception: pass
         return False
 
     def get_batch(self, bs, seed=None):
-        if self.data is None or self.n == 0:
-            self.advance()
+        if self.data is None or self.n == 0: self.advance()
         self.steps_used += 1
         rng = np.random.RandomState(seed)
         s = rng.randint(0, self.n, size=bs) * self.tps
@@ -1629,74 +1176,47 @@ class StreamingShardDataset:
 
 
 def decompress_weights(raw, fmt="bf16"):
-    if fmt == "fp16":
-        return np.frombuffer(raw, dtype=np.uint16).view(np.float16).astype(np.float32)
+    if fmt == "fp16": return np.frombuffer(raw, dtype=np.uint16).view(np.float16).astype(np.float32)
     return torch.from_numpy(np.frombuffer(raw, dtype=np.uint16).copy()).view(torch.bfloat16).to(torch.float32).numpy()
 
 
 def do_login(srv, u, p):
     try:
         r = requests.post(f"{srv}/auth/login", json={"username": u, "password": p}, timeout=30)
-        if r.status_code == 200:
-            return r.json().get("token"), None
-        try:
-            msg = r.json().get("detail", "")
-        except Exception:
-            msg = r.text
-        if "invalid" in msg.lower() or "credentials" in msg.lower():
-            return None, "invalid_credentials"
+        if r.status_code == 200: return r.json().get("token"), None
+        try: msg = r.json().get("detail", "")
+        except Exception: msg = r.text
+        if "invalid" in msg.lower() or "credentials" in msg.lower(): return None, "invalid_credentials"
         return None, "login_failed"
-    except requests.exceptions.ConnectionError:
-        return None, "network"
-    except Exception:
-        return None, "network"
+    except requests.exceptions.ConnectionError: return None, "network"
+    except Exception: return None, "network"
 
 
 def do_register(srv, u, email, p):
     try:
         r = requests.post(f"{srv}/auth/register", json={"username": u, "password": p, "email": email}, timeout=30)
-        if r.status_code == 200:
-            return r.json().get("token"), None
-        try:
-            msg = r.json().get("detail", "")
-        except Exception:
-            msg = r.text
+        if r.status_code == 200: return r.json().get("token"), None
+        try: msg = r.json().get("detail", "")
+        except Exception: msg = r.text
         msg_l = msg.lower()
-        if "username" in msg_l and "taken" in msg_l:
-            return None, "username_taken"
-        if "email" in msg_l and "registered" in msg_l:
-            return None, "email_taken"
-        if "password" in msg_l:
-            return None, "weak_password"
-        if "invalid" in msg_l:
-            return None, "invalid_input"
+        if "username" in msg_l and "taken" in msg_l: return None, "username_taken"
+        if "email" in msg_l and "registered" in msg_l: return None, "email_taken"
+        if "password" in msg_l: return None, "weak_password"
+        if "invalid" in msg_l: return None, "invalid_input"
         return None, "register_failed"
-    except requests.exceptions.ConnectionError:
-        return None, "network"
-    except Exception:
-        return None, "network"
+    except requests.exceptions.ConnectionError: return None, "network"
+    except Exception: return None, "network"
 
 
 class HeartbeatManager:
     def __init__(self, srv, h, cr, se, emit):
-        self.srv = srv
-        self.h = h
-        self.cr = cr
-        self.stop_training = threading.Event()
-        self.shutdown = threading.Event()
-        self.se = se
-        self.emit = emit
+        self.srv = srv; self.h = h; self.cr = cr
+        self.stop_training = threading.Event(); self.shutdown = threading.Event()
+        self.se = se; self.emit = emit
         self._t = threading.Thread(target=self._r, daemon=True)
-
-    def start(self):
-        self._t.start()
-
-    def stop(self):
-        self.shutdown.set()
-
-    def should_stop(self):
-        return self.stop_training.is_set()
-
+    def start(self): self._t.start()
+    def stop(self): self.shutdown.set()
+    def should_stop(self): return self.stop_training.is_set()
     def _r(self):
         while not self.shutdown.is_set() and not self.se.is_set():
             try:
@@ -1705,72 +1225,55 @@ class HeartbeatManager:
                 if r.status_code == 200:
                     st = r.json()
                     if st.get("current_round", self.cr) != self.cr:
-                        self.emit('log', "Next round. Stopping.")
-                        self.stop_training.set()
+                        self.emit('log', "Next round. Stopping."); self.stop_training.set()
                     rm = (st.get("max_round_hours", 2) - st.get("round_elapsed_hours", 0)) * 60
                     if rm <= 3:
-                        self.emit('log', f"ULTIMATUM: {rm:.0f} min left!")
-                        self.stop_training.set()
-            except Exception:
-                pass
+                        self.emit('log', f"ULTIMATUM: {rm:.0f} min left!"); self.stop_training.set()
+            except Exception: pass
             self.shutdown.wait(timeout=15)
 
 
 def wait_for_round(srv, h, se, emit):
     overlay_on = False
-
     def show_wait():
         nonlocal overlay_on
         if not overlay_on:
             emit('overlay_show', {'title_key': 'wait_coord', 'subtitle_key': 'wait_coord_sub', 'indeterminate': True})
             overlay_on = True
-
     def hide():
         nonlocal overlay_on
-        if overlay_on:
-            emit('overlay_hide', {})
-            overlay_on = False
-
+        if overlay_on: emit('overlay_hide', {}); overlay_on = False
     while not se.is_set():
         try:
             r = requests.get(f"{srv}/fl/round_status", headers=h, timeout=30)
             if r.status_code == 200:
                 st = r.json()
                 if st.get("is_aggregating"):
-                    emit('status', 'waiting')
-                    show_wait()
+                    emit('status', 'waiting'); show_wait()
                     for _ in range(30):
-                        if se.is_set():
-                            hide()
-                            return None
+                        if se.is_set(): hide(); return None
                         time.sleep(1)
                     continue
-                if not st.get("in_cooldown", False):
-                    hide()
-                    return st
-                emit('status', 'waiting')
-                show_wait()
+                if not st.get("in_cooldown", False): hide(); return st
+                emit('status', 'waiting'); show_wait()
                 for _ in range(30):
-                    if se.is_set():
-                        hide()
-                        return None
+                    if se.is_set(): hide(); return None
                     time.sleep(1)
-            else:
-                time.sleep(10)
-        except Exception:
-            time.sleep(10)
-    hide()
-    return None
+            else: time.sleep(10)
+        except Exception: time.sleep(10)
+    hide(); return None
 
 
 def fetch_task_metadata(srv, h, se, emit):
+    """Fetch /fl/task?skip_weights=true. Sends hardware headers for cohort overflow."""
     while not se.is_set():
         try:
-            r = requests.get(f"{srv}/fl/task?format=bf16&skip_weights=true", headers=h, timeout=30)
+            req_headers = {**(h or {}), **_hardware_headers()}
+            r = requests.get(f"{srv}/fl/task?format=bf16&skip_weights=true",
+                             headers=req_headers, timeout=30)
             if r.headers.get("X-Status") == "wait":
                 for _ in range(10):
-                    if se.is_set():
-                        return None
+                    if se.is_set(): return None
                     time.sleep(1)
                 continue
             if r.status_code == 200:
@@ -1779,24 +1282,19 @@ def fetch_task_metadata(srv, h, se, emit):
                     md = r.json()
                     if md.get("status") == "wait":
                         for _ in range(10):
-                            if se.is_set():
-                                return None
+                            if se.is_set(): return None
                             time.sleep(1)
                         continue
                     return md
                 raw = r.content
                 if len(raw) >= 4:
                     ml = struct.unpack('<I', raw[:4])[0]
-                    if len(raw) >= 4 + ml:
-                        return json.loads(raw[4:4 + ml].decode())
+                    if len(raw) >= 4 + ml: return json.loads(raw[4:4 + ml].decode())
                 raise RuntimeError("Invalid task metadata response")
-            if r.status_code in (503, 504):
-                time.sleep(10)
-                continue
+            if r.status_code in (503, 504): time.sleep(10); continue
             time.sleep(5)
         except Exception as e:
-            if se.is_set():
-                return None
+            if se.is_set(): return None
             emit('log', f"Task metadata fetch failed: {e}")
             time.sleep(10)
     return None
@@ -1811,75 +1309,54 @@ def _weight_cache_path(revision, filename):
 
 def _download_file_with_progress(url, dest, emit, stop_evt, expected_size=None, label="file"):
     dest.parent.mkdir(parents=True, exist_ok=True)
-
     try:
         leftover = dest.with_suffix(dest.suffix + ".part")
-        if leftover.exists():
-            leftover.unlink()
-    except Exception:
-        pass
-
+        if leftover.exists(): leftover.unlink()
+    except Exception: pass
     if dest.exists():
         sz = dest.stat().st_size
         if expected_size is not None and sz == int(expected_size):
-            log.info(f"Using cached weight file: {dest} ({sz} bytes)")
-            return dest
+            log.info(f"Using cached weight file: {dest} ({sz} bytes)"); return dest
         if expected_size is None and sz > 10_000_000:
-            log.info(f"Using cached weight file: {dest} ({sz} bytes, unverified)")
-            return dest
-        try:
-            dest.unlink()
-        except Exception:
-            pass
+            log.info(f"Using cached weight file: {dest} ({sz} bytes, unverified)"); return dest
+        try: dest.unlink()
+        except Exception: pass
     last_err = None
     for attempt in range(3):
-        if stop_evt.is_set():
-            raise KeyboardInterrupt("Stop requested")
+        if stop_evt.is_set(): raise KeyboardInterrupt("Stop requested")
         tmp = dest.with_suffix(dest.suffix + ".part")
         try:
-            if tmp.exists():
-                tmp.unlink()
-        except Exception:
-            pass
+            if tmp.exists(): tmp.unlink()
+        except Exception: pass
         try:
             log.info(f"Downloading {label}: {url}")
             r = requests.get(url, stream=True, timeout=(15, 3600), allow_redirects=True)
             r.raise_for_status()
             content_length = int(r.headers.get("content-length", 0) or 0)
             total = int(expected_size) if expected_size else content_length
-            done = 0
-            last_emit = 0.0
+            done = 0; last_emit = 0.0
             with open(tmp, "wb") as f:
                 for chunk in r.iter_content(chunk_size=1024 * 1024):
-                    if stop_evt.is_set():
-                        raise KeyboardInterrupt("Stop requested")
-                    if not chunk:
-                        continue
-                    f.write(chunk)
-                    done += len(chunk)
+                    if stop_evt.is_set(): raise KeyboardInterrupt("Stop requested")
+                    if not chunk: continue
+                    f.write(chunk); done += len(chunk)
                     now = time.time()
                     if now - last_emit > 0.25:
-                        emit("overlay_progress", {"done": done, "total": total})
-                        last_emit = now
+                        emit("overlay_progress", {"done": done, "total": total}); last_emit = now
             if expected_size and done != int(expected_size):
                 raise RuntimeError(f"Size mismatch for {label}: got {done}, expected {expected_size}")
-            os.replace(tmp, dest)
-            log.info(f"Finished downloading {label}: {dest}")
+            os.replace(tmp, dest); log.info(f"Finished downloading {label}: {dest}")
             return dest
         except KeyboardInterrupt:
             try:
-                if tmp.exists():
-                    tmp.unlink()
-            except Exception:
-                pass
+                if tmp.exists(): tmp.unlink()
+            except Exception: pass
             raise
         except Exception as e:
             last_err = e
             try:
-                if tmp.exists():
-                    tmp.unlink()
-            except Exception:
-                pass
+                if tmp.exists(): tmp.unlink()
+            except Exception: pass
             if attempt < 2:
                 emit("log", f"Download retry {attempt + 1} for {label}: {e}")
                 time.sleep(5 * (attempt + 1))
@@ -1892,19 +1369,13 @@ def _load_safetensors_flat(path, expected_numel, label="weights"):
     except ImportError as e:
         raise RuntimeError("Missing dependency: safetensors.") from e
     tensors = load_file(str(path))
-    if "weights" in tensors:
-        t = tensors["weights"]
-    elif "flat" in tensors:
-        t = tensors["flat"]
-    elif len(tensors) == 1:
-        t = next(iter(tensors.values()))
-    else:
-        raise RuntimeError(f"{label}: cannot identify tensor key. keys={list(tensors.keys())[:20]}")
+    if "weights" in tensors: t = tensors["weights"]
+    elif "flat" in tensors: t = tensors["flat"]
+    elif len(tensors) == 1: t = next(iter(tensors.values()))
+    else: raise RuntimeError(f"{label}: cannot identify tensor key. keys={list(tensors.keys())[:20]}")
     t = t.contiguous().reshape(-1)
-    if t.dtype not in (torch.bfloat16, torch.float32):
-        t = t.to(torch.float32)
-    del tensors
-    gc.collect()
+    if t.dtype not in (torch.bfloat16, torch.float32): t = t.to(torch.float32)
+    del tensors; gc.collect()
     if t.numel() != int(expected_numel):
         raise RuntimeError(f"{label} size mismatch: got {t.numel()}, expected {expected_numel}.")
     _ = float(t[0]) + float(t[-1])
@@ -1917,24 +1388,20 @@ def fetch_weights_from_hf(md, se, emit):
         raise RuntimeError("Task metadata does not advertise Hugging Face weights.")
     revision = wcfg.get("revision") or "main"
     files = wcfg.get("files") or {}
-    model_info = files.get("model") or {}
-    engram_info = files.get("engram") or {}
+    model_info = files.get("model") or {}; engram_info = files.get("engram") or {}
     model_url = model_info.get("url") or f"https://huggingface.co/{HF_MODEL_REPO_ID}/resolve/{revision}/model_bf16.safetensors"
     engram_url = engram_info.get("url") or f"https://huggingface.co/{HF_MODEL_REPO_ID}/resolve/{revision}/engram_bf16.safetensors"
-    model_size = model_info.get("size")
-    engram_size = engram_info.get("size")
+    model_size = model_info.get("size"); engram_size = engram_info.get("size")
     if not model_size:
         try:
             hr = requests.head(model_url, allow_redirects=True, timeout=30)
             model_size = int(hr.headers.get("content-length", 0) or 0) or None
-        except Exception:
-            model_size = None
+        except Exception: model_size = None
     if ENGRAM_ACTIVE and not engram_size:
         try:
             hr = requests.head(engram_url, allow_redirects=True, timeout=30)
             engram_size = int(hr.headers.get("content-length", 0) or 0) or None
-        except Exception:
-            engram_size = None
+        except Exception: engram_size = None
     model_path = _weight_cache_path(revision, "model_bf16.safetensors")
     engram_path = _weight_cache_path(revision, "engram_bf16.safetensors")
     emit("status", "downloading")
@@ -1942,20 +1409,15 @@ def fetch_weights_from_hf(md, se, emit):
     _download_file_with_progress(model_url, model_path, emit, se, expected_size=model_size, label="model_bf16.safetensors")
     if ENGRAM_ACTIVE:
         _download_file_with_progress(engram_url, engram_path, emit, se, expected_size=engram_size, label="engram_bf16.safetensors")
-    emit("overlay_hide", {})
-    emit("status", "preparing")
+    emit("overlay_hide", {}); emit("status", "preparing")
     emit("log", "Loading weights from safetensors...")
     iw = _load_safetensors_flat(model_path, EXPECTED_MODEL_SIZE, "model weights")
     ie = _load_safetensors_flat(engram_path, EXPECTED_ENGRAM_SIZE, "engram weights") if ENGRAM_ACTIVE else None
-
     try:
         for p in CHECKPOINT_DIR.rglob("*.part"):
-            try:
-                p.unlink()
-            except Exception:
-                pass
-    except Exception:
-        pass
+            try: p.unlink()
+            except Exception: pass
+    except Exception: pass
     return iw, ie
 
 
@@ -1964,69 +1426,45 @@ def fetch_task(srv, h, prec, se, emit):
         try:
             emit('status', 'downloading')
             emit('overlay_show', {'title_key': 'dl_weights', 'indeterminate': False})
-            r = requests.get(f"{srv}/fl/task?format={prec}", headers=h, timeout=(15, 3600), stream=True)
+            req_headers = {**(h or {}), **_hardware_headers()}
+            r = requests.get(f"{srv}/fl/task?format={prec}", headers=req_headers, timeout=(15, 3600), stream=True)
             if r.status_code != 200:
-                r.close()
-                emit('overlay_hide', {})
-                emit('log', f"/fl/task HTTP {r.status_code}")
-                time.sleep(10)
-                continue
+                r.close(); emit('overlay_hide', {}); emit('log', f"/fl/task HTTP {r.status_code}")
+                time.sleep(10); continue
             if r.headers.get("X-Status") == "wait":
-                r.close()
-                emit('overlay_hide', {})
+                r.close(); emit('overlay_hide', {})
                 for _ in range(10):
-                    if se.is_set():
-                        return None, None
+                    if se.is_set(): return None, None
                     time.sleep(1)
                 continue
             cl_total = int(r.headers.get('content-length', 0) or 0)
             total = cl_total if cl_total > 0 else EXPECTED_WEIGHT_BYTES
-            chunks = []
-            done = 0
-            last = 0.0
+            chunks = []; done = 0; last = 0.0
             for chunk in r.iter_content(chunk_size=512 * 1024):
-                if not chunk:
-                    continue
-                chunks.append(chunk)
-                done += len(chunk)
+                if not chunk: continue
+                chunks.append(chunk); done += len(chunk)
                 now = time.time()
                 if now - last > 0.25:
-                    emit('overlay_progress', {'done': done, 'total': total})
-                    last = now
+                    emit('overlay_progress', {'done': done, 'total': total}); last = now
             r.close()
-            emit('overlay_progress', {'done': done, 'total': total})
-            emit('overlay_hide', {})
-            emit('status', 'preparing')
-            raw = b"".join(chunks)
-            del chunks
+            emit('overlay_progress', {'done': done, 'total': total}); emit('overlay_hide', {}); emit('status', 'preparing')
+            raw = b"".join(chunks); del chunks
             if len(raw) < 4:
-                emit('log', f"/fl/task returned only {len(raw)} bytes; retrying")
-                time.sleep(5)
-                continue
+                emit('log', f"/fl/task returned only {len(raw)} bytes; retrying"); time.sleep(5); continue
             ml = struct.unpack('<I', raw[:4])[0]
             if 4 + ml > len(raw):
-                emit('log', f"Truncated header; retrying")
-                time.sleep(5)
-                continue
-            md = json.loads(raw[4:4 + ml].decode())
-            wb = raw[4 + ml:]
+                emit('log', f"Truncated header; retrying"); time.sleep(5); continue
+            md = json.loads(raw[4:4 + ml].decode()); wb = raw[4 + ml:]
             emit('log', f"/fl/task inline: metadata OK, weights={len(wb):,} bytes")
             if len(wb) < EXPECTED_WEIGHT_BYTES:
-                emit('log', f"⚠️ inline truncated at {len(wb):,}; retrying")
-                time.sleep(10)
-                continue
+                emit('log', f"⚠️ inline truncated at {len(wb):,}; retrying"); time.sleep(10); continue
             return md, wb
         except Exception as e:
             emit('overlay_hide', {})
-            if se.is_set():
-                return None, None
+            if se.is_set(): return None, None
             emit('log', f"Task fetch failed: {e}")
             time.sleep(15)
-
-
-# =========================================================================
-# Loss + training step + degrade ladder
-# =========================================================================
+# =================== LOSS / TRAINING ===================
 def _chunk_ce(xs, w, ys):
     logits = F.linear(xs.to(w.dtype), w)
     return F.cross_entropy(logits.reshape(-1, VOCAB_SIZE).float(), ys.reshape(-1))
@@ -2062,12 +1500,10 @@ def _fwl(m, x, y, sl, ua, ad, ls=1.0, preview=False, loss_chunk=LOSS_CHUNK):
                 items = [(b, T - 1) for b in range(min(B, 3))]
                 for offset in (24, 48, 72):
                     p = T - offset - 1
-                    if p >= 9:
-                        items.append((0, p))
+                    if p >= 9: items.append((0, p))
                 items = items[:6]
                 for b, p in items:
-                    if p < 9 or p >= T:
-                        continue
+                    if p < 9 or p >= T: continue
                     start = max(0, p - 9)
                     ctx_ids = x[b, start:p + 1].tolist()
                     target_id = int(y[b, p].item())
@@ -2086,27 +1522,21 @@ def _fwl(m, x, y, sl, ua, ad, ls=1.0, preview=False, loss_chunk=LOSS_CHUNK):
                         'pred_id': int(pred_id),
                     })
         except Exception as e:
-            log.warning(f"Preview extraction failed: {e}")
-            cards = []
+            log.warning(f"Preview extraction failed: {e}"); cards = []
     return lo * ls, cards
 
 
 def _is_oom(e):
-    if isinstance(e, torch.cuda.OutOfMemoryError):
-        return True
-    if isinstance(e, RuntimeError):
-        return "out of memory" in str(e).lower()
+    if isinstance(e, torch.cuda.OutOfMemoryError): return True
+    if isinstance(e, RuntimeError): return "out of memory" in str(e).lower()
     return False
 
 
 def _clear_accel_cache(device):
     try:
-        if device is not None and device.type == 'cuda':
-            torch.cuda.empty_cache()
-        elif device is not None and device.type == 'xpu':
-            torch.xpu.empty_cache()
-    except Exception:
-        pass
+        if device is not None and device.type == 'cuda': torch.cuda.empty_cache()
+        elif device is not None and device.type == 'xpu': torch.xpu.empty_cache()
+    except Exception: pass
     gc.collect()
 
 
@@ -2124,48 +1554,34 @@ class DegradeLadder:
             self.stage += 1
             s = self.stage
             if s == 1:
-                if not m.head_on_gpu:
-                    continue
-                emit('log', "🔻 VRAM rung 1: head weights → system RAM (streamed per step)")
-                m.force_head_cpu()
+                if not m.head_on_gpu: continue
+                emit('log', "🔻 VRAM rung 1: head weights → system RAM"); m.force_head_cpu()
             elif s == 2:
-                if m.gpu_layers <= 0:
-                    continue
+                if m.gpu_layers <= 0: continue
                 cur, nxt = m.gpu_layers, m.gpu_layers // 2
-                emit('log', f"🔻 VRAM rung 2: resident blocks {cur} → {nxt} (rest streamed)")
-                m.set_gpu_layers(nxt)
+                emit('log', f"🔻 VRAM rung 2: resident blocks {cur} → {nxt}"); m.set_gpu_layers(nxt)
             elif s == 3:
-                if m.gpu_layers <= 0:
-                    continue
-                emit('log', "🔻 VRAM rung 3: all blocks streamed from system RAM")
-                m.set_gpu_layers(0)
+                if m.gpu_layers <= 0: continue
+                emit('log', "🔻 VRAM rung 3: all blocks streamed"); m.set_gpu_layers(0)
             elif s == 4:
                 old, new = self.loss_chunk, max(32, self.loss_chunk // 2)
-                if new == old:
-                    continue
+                if new == old: continue
                 self.loss_chunk = new
                 emit('log', f"🔻 VRAM rung 4: LOSS_CHUNK {old} → {new}")
             elif s == 5:
                 old, new = self.loss_chunk, max(16, self.loss_chunk // 2)
-                if new == old:
-                    continue
+                if new == old: continue
                 self.loss_chunk = new
                 emit('log', f"🔻 VRAM rung 5: LOSS_CHUNK {old} → {new}")
             elif s == 6:
-                if m.main_device.type == 'cpu':
-                    return False
-                emit('log', "🔻 VRAM rung 6: hard fallback — CPU-only model")
-                m.to_cpu_only()
+                if m.main_device.type == 'cpu': return False
+                emit('log', "🔻 VRAM rung 6: hard fallback — CPU-only"); m.to_cpu_only()
                 self.loss_chunk = 16
-            else:
-                return False
+            else: return False
             break
-
         if self.on_step_down is not None:
-            try:
-                self.on_step_down(self)
-            except Exception as e:
-                log.warning(f"on_step_down failed: {e}")
+            try: self.on_step_down(self)
+            except Exception as e: log.warning(f"on_step_down failed: {e}")
         _clear_accel_cache(m.accel_device)
         return True
 
@@ -2175,42 +1591,31 @@ def _train_step_safe(model, x, y, sl, ua, ad, ls, preview, ladder, emit):
         try:
             lo, cards = _fwl(model, x, y, sl, ua, ad, ls,
                              preview=preview, loss_chunk=ladder.loss_chunk)
-            lo.backward()
-            return lo, cards
+            lo.backward(); return lo, cards
         except RuntimeError as e:
-            if not _is_oom(e):
-                raise
+            if not _is_oom(e): raise
             emit('log', f"💥 OOM detected: {str(e).splitlines()[0]}")
             _clear_accel_cache(model.accel_device)
             if not ladder.step_down(emit):
-                emit('log', "💀 OOM even at CPU-only — this is a bug, not VRAM.")
-                raise
+                emit('log', "💀 OOM even at CPU-only — this is a bug, not VRAM."); raise
             emit('log', f"   retrying same batch at ladder stage {ladder.stage}")
 
 
-# =========================================================================
-# Upload
-# =========================================================================
-def _sha256_hex(data):
-    return hashlib.sha256(data).hexdigest()
+# =================== UPLOAD ===================
+def _sha256_hex(data): return hashlib.sha256(data).hexdigest()
 
 
 def _post_json_with_retry(url, payload, h, emit, se, timeout=60, retries=4):
     last_err = None
     for attempt in range(retries):
-        if se.is_set():
-            raise KeyboardInterrupt("Stop requested")
+        if se.is_set(): raise KeyboardInterrupt("Stop requested")
         try:
             r = requests.post(url, json=payload, headers=h, timeout=timeout)
             if r.status_code == 503:
                 emit("log", "Server busy, waiting...")
-                last_err = RuntimeError("server busy 503")
-                time.sleep(10)
-                continue
-            r.raise_for_status()
-            return r
-        except KeyboardInterrupt:
-            raise
+                last_err = RuntimeError("server busy 503"); time.sleep(10); continue
+            r.raise_for_status(); return r
+        except KeyboardInterrupt: raise
         except Exception as e:
             last_err = e
             if attempt < retries - 1:
@@ -2226,17 +1631,12 @@ def _chunked_submit_once(srv, h, compressed_data, meta, emit, se, chunk_size):
     init_payload = {**meta, "totalBytes": total, "chunkSize": chunk_size, "chunks": chunks, "checksum": checksum}
     emit("log", f"Initializing chunked upload: {chunks} chunks, {total / (1024 * 1024):.1f} MB total")
     r = _post_json_with_retry(f"{srv}/fl/submit/init", init_payload, h, emit, se, timeout=60, retries=4)
-    j = r.json()
-    upload_id = j.get("uploadId")
-    if not upload_id:
-        raise RuntimeError("Server did not return uploadId")
+    j = r.json(); upload_id = j.get("uploadId")
+    if not upload_id: raise RuntimeError("Server did not return uploadId")
     for idx in range(chunks):
-        if se.is_set():
-            raise KeyboardInterrupt("Stop requested")
-        start = idx * chunk_size
-        end = min(total, start + chunk_size)
-        part = compressed_data[start:end]
-        part_sha = _sha256_hex(part)
+        if se.is_set(): raise KeyboardInterrupt("Stop requested")
+        start = idx * chunk_size; end = min(total, start + chunk_size)
+        part = compressed_data[start:end]; part_sha = _sha256_hex(part)
         attempt = 0
         while True:
             try:
@@ -2246,18 +1646,13 @@ def _chunked_submit_once(srv, h, compressed_data, meta, emit, se, chunk_size):
                     headers={**h, "Content-Type": "application/octet-stream", "X-Chunk-Sha256": part_sha},
                     timeout=300,
                 )
-                if rr.status_code == 413:
-                    raise RuntimeError("CHUNK_TOO_LARGE")
-                rr.raise_for_status()
-                break
-            except KeyboardInterrupt:
-                raise
+                if rr.status_code == 413: raise RuntimeError("CHUNK_TOO_LARGE")
+                rr.raise_for_status(); break
+            except KeyboardInterrupt: raise
             except Exception as e:
-                if "CHUNK_TOO_LARGE" in str(e):
-                    raise
+                if "CHUNK_TOO_LARGE" in str(e): raise
                 attempt += 1
-                if se.is_set() or attempt >= MAX_CHUNK_RETRY:
-                    raise
+                if se.is_set() or attempt >= MAX_CHUNK_RETRY: raise
                 emit("log", f"Chunk {idx + 1}/{chunks} retry {attempt}: {e}")
                 time.sleep(min(20, 2 ** attempt))
         emit("overlay_progress", {"done": end, "total": total})
@@ -2269,8 +1664,7 @@ def _chunked_submit_once(srv, h, compressed_data, meta, emit, se, chunk_size):
 def chunked_submit_delta(srv, h, compressed_data, meta, emit, se):
     chunk_size = UPLOAD_CHUNK_BYTES
     while True:
-        try:
-            return _chunked_submit_once(srv, h, compressed_data, meta, emit, se, chunk_size)
+        try: return _chunked_submit_once(srv, h, compressed_data, meta, emit, se, chunk_size)
         except Exception as e:
             msg = str(e)
             if ("CHUNK_TOO_LARGE" in msg or "413" in msg) and chunk_size > 8 * 1024 * 1024:
@@ -2281,25 +1675,18 @@ def chunked_submit_delta(srv, h, compressed_data, meta, emit, se):
 
 
 def stream_with_progress(data, emit_cb, total_size, stop_evt):
-    chunk_size = 128 * 1024
-    uploaded = 0
-    last_emit = 0.0
+    chunk_size = 128 * 1024; uploaded = 0; last_emit = 0.0
     for i in range(0, len(data), chunk_size):
-        if stop_evt.is_set():
-            raise KeyboardInterrupt("Stop requested")
-        chunk = data[i:i + chunk_size]
-        uploaded += len(chunk)
+        if stop_evt.is_set(): raise KeyboardInterrupt("Stop requested")
+        chunk = data[i:i + chunk_size]; uploaded += len(chunk)
         now = time.time()
         if now - last_emit > 0.25:
-            emit_cb("overlay_progress", {"done": uploaded, "total": total_size})
-            last_emit = now
+            emit_cb("overlay_progress", {"done": uploaded, "total": total_size}); last_emit = now
         yield chunk
     emit_cb("overlay_progress", {"done": total_size, "total": total_size})
 
 
-# =========================================================================
-# Model build + optimizer construction
-# =========================================================================
+# =================== MODEL BUILD ===================
 def _build_model(bn, device, iw, ie, emit, bs=1, sl=MAX_SEQ_LEN):
     model = SotaGPT(bn, device, gpu_layers=None, bs=bs, sl=sl)
     model.engram.table.to('cpu')
@@ -2312,26 +1699,18 @@ def _build_model(bn, device, iw, ie, emit, bs=1, sl=MAX_SEQ_LEN):
 
 
 class _MultiOpt:
-    def __init__(self, opts):
-        self.opts = [o for o in opts if o is not None]
-
+    def __init__(self, opts): self.opts = [o for o in opts if o is not None]
     def zero_grad(self, set_to_none=True):
-        for o in self.opts:
-            o.zero_grad(set_to_none=set_to_none)
-
+        for o in self.opts: o.zero_grad(set_to_none=set_to_none)
     def step(self):
-        for o in self.opts:
-            o.step()
+        for o in self.opts: o.step()
 
 
 def _build_optimizers(model, lr=1e-4):
     bp = [p for n, p in model.named_parameters() if not n.startswith('engram.')]
     ep = list(model.engram.parameters())
-
     groups = {}
-    for p in bp:
-        groups.setdefault(p.device.type, []).append(p)
-
+    for p in bp: groups.setdefault(p.device.type, []).append(p)
     opts = []
     for dev_type, ps in groups.items():
         o = None
@@ -2339,27 +1718,21 @@ def _build_optimizers(model, lr=1e-4):
             try:
                 import bitsandbytes as bnb
                 o = bnb.optim.AdamW8bit(ps, lr=lr, betas=(0.9, 0.95), weight_decay=0.01)
-            except Exception:
-                o = None
+            except Exception: o = None
         if o is None:
             kw = {} if dev_type in ('cpu', 'cuda') else {"foreach": False}
             o = torch.optim.AdamW(ps, lr=lr, betas=(0.9, 0.95), weight_decay=0.01, **kw)
         opts.append(o)
     ob = _MultiOpt(opts)
-
-    try:
-        oe = torch.optim.SparseAdam(ep, lr=lr)
-    except Exception:
-        oe = torch.optim.AdamW(ep, lr=lr, weight_decay=0.01)
+    try: oe = torch.optim.SparseAdam(ep, lr=lr)
+    except Exception: oe = torch.optim.AdamW(ep, lr=lr, weight_decay=0.01)
     return ob, oe
 
 
 def _trim_heap():
     gc.collect()
-    try:
-        ctypes.CDLL("libc.so.6").malloc_trim(0)
-    except Exception:
-        pass
+    try: ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception: pass
 
 
 def _bf16_from_bytes(buf, offset, nbytes):
@@ -2367,16 +1740,14 @@ def _bf16_from_bytes(buf, offset, nbytes):
     return torch.from_numpy(a).view(torch.bfloat16)
 
 
-def _to_bf16_exact(arr):
-    return torch.from_numpy(arr).to(torch.bfloat16)
+def _to_bf16_exact(arr): return torch.from_numpy(arr).to(torch.bfloat16)
 
 
 def _base_delta_bf16(model, iw_bf16):
     out = torch.empty(iw_bf16.numel(), dtype=torch.bfloat16)
     o = 0
     for n, p in model.named_parameters():
-        if n.startswith('engram.'):
-            continue
+        if n.startswith('engram.'): continue
         s = p.numel()
         cur = p.detach().to('cpu', torch.float32).reshape(-1)
         out[o:o + s] = cur - iw_bf16[o:o + s].float()
@@ -2387,15 +1758,11 @@ def _base_delta_bf16(model, iw_bf16):
 
 
 def _engram_sparse_delta(table, iew_bf16, frac=0.10, chunk=32768):
-    n = table.shape[0]
-    rn = torch.empty(n)
+    n = table.shape[0]; rn = torch.empty(n)
     for i in range(0, n, chunk):
         rn[i:i + chunk] = (table[i:i + chunk] - iew_bf16[i:i + chunk].float()).abs().sum(dim=1)
-    k = max(1, int(n * frac))
-    tv, ti = torch.topk(rn, k)
-    ai = ti[tv > 1e-8]
-    if len(ai) == 0:
-        return np.array([], dtype=np.uint32), np.array([], dtype=np.uint16)
+    k = max(1, int(n * frac)); tv, ti = torch.topk(rn, k); ai = ti[tv > 1e-8]
+    if len(ai) == 0: return np.array([], dtype=np.uint32), np.array([], dtype=np.uint16)
     sv = (table[ai] - iew_bf16[ai].float()).to(torch.bfloat16).view(torch.int16).numpy().view(np.uint16)
     return ai.numpy().astype(np.uint32), sv
 
@@ -2406,67 +1773,76 @@ def _gzip_stream(header_bytes, arrays, level=6, piece=64 * 1024 * 1024):
         gz.write(header_bytes)
         for a in arrays:
             mv = memoryview(np.ascontiguousarray(a)).cast('B')
-            for i in range(0, len(mv), piece):
-                gz.write(mv[i:i + piece])
+            for i in range(0, len(mv), piece): gz.write(mv[i:i + piece])
     return buf.getvalue()
 
 
 def _pick_autocast(backend):
-    # DirectML and CPU use FP32. In particular, do not pass BF16 tensors to
-    # torch-directml: its Windows backend aborts on unsupported BF16 dtypes.
-    if backend in ("DIRECTML", "CPU"):
-        return False, None
+    if backend in ("DIRECTML", "CPU"): return False, None
     try:
         if backend in ("CUDA", "ROCM") and torch.cuda.is_available() and torch.cuda.is_bf16_supported():
             return True, torch.bfloat16
         if backend == "XPU" and hasattr(torch, "xpu") and torch.xpu.is_bf16_supported():
             return True, torch.bfloat16
-    except Exception:
-        pass
+    except Exception: pass
     return False, None
 
 
 def _cpu_calibration_batch(x, y, full_sl):
-    """Use a small, bounded sequence for CPU calibration, not the full 2048 tokens."""
-    try:
-        limit = int(os.environ.get("CROWDGPT_CPU_CAL_TOKENS", "32"))
-    except (TypeError, ValueError):
-        limit = 32
+    try: limit = int(os.environ.get("CROWDGPT_CPU_CAL_TOKENS", "32"))
+    except (TypeError, ValueError): limit = 32
     limit = max(8, min(128, limit))
     step_sl = max(1, min(int(full_sl), int(x.shape[1]), int(y.shape[1]), limit))
     return x[:, :step_sl].contiguous(), y[:, :step_sl].contiguous(), step_sl
 
 
-# =========================================================================
-# Round
-# =========================================================================
+# === NEW: parse task metadata + cross-check config ===
+def _parse_task_meta(md, emit):
+    """Returns (tid, gs, sl, cohort_mode, cc_seed, cc_steps, cc_bs, cc_accum)."""
+    tid = md.get("taskId")
+    gs = md.get("globalStep")
+    sl = MAX_SEQ_LEN
+    cc_cfg = md.get("crossCheck") or {}
+    cohort_mode = bool(cc_cfg.get("enabled", False))
+    cc_seed = cc_cfg.get("targetSeed") if cohort_mode else None
+    cc_steps = cc_cfg.get("targetLocalSteps") if cohort_mode else None
+    cc_bs = cc_cfg.get("targetBatchSize") if cohort_mode else None
+    cc_accum = cc_cfg.get("targetAccumSteps") if cohort_mode else None
+    if cohort_mode and (cc_seed is None or cc_steps is None or cc_bs is None or cc_accum is None):
+        emit('log', "⚠️ Cross-check metadata incomplete; disabling cohort mode for this round")
+        cohort_mode = False; cc_seed = cc_steps = cc_bs = cc_accum = None
+    if cohort_mode:
+        emit('log', f"[COHORT] ENABLED: seed={cc_seed} steps={cc_steps} bs_target={cc_bs} accum={cc_accum}")
+    else:
+        emit('log', "[COHORT] disabled (server will use Krum for this shard)")
+    return tid, gs, sl, cohort_mode, cc_seed, cc_steps, cc_bs, cc_accum
+
+
+# =================== ROUND ===================
 def run_single_round_wrapper(srv, at, se, emit):
     global train_device, train_backend
     h = {"Authorization": f"Bearer {at}"} if at else {}
     emit('status', 'waiting')
     rs = wait_for_round(srv, h, se, emit)
-    if not rs:
-        return
+    if not rs: return
     cr = rs["current_round"]
-    hb = HeartbeatManager(srv, h, cr, se, emit)
-    hb.start()
+    hb = HeartbeatManager(srv, h, cr, se, emit); hb.start()
     model = ob = oe = x = y = lo = iw = ie = iew = ds = None
     micro_step = 0
     lval = 10.0
     tt = 0
     tid = ""
     tried_cpu_fallback = False
+    cohort_mode = False; cc_seed = cc_steps = cc_bs = None
     try:
         emit('log', "Fetching task metadata...")
         md = fetch_task_metadata(srv, h, se, emit)
-        if md is None:
-            return
-        tid = md.get("taskId")
-        gs = md.get("globalStep")
-        sl = MAX_SEQ_LEN
+        if md is None: return
+        tid, gs, sl, cohort_mode, cc_seed, cc_steps, cc_bs, cc_accum = _parse_task_meta(md, emit)
         if not tid:
-            emit("log", "Task metadata missing taskId.")
-            return
+            emit("log", "Task metadata missing taskId."); return
+
+        # ---- Fetch weights (HF preferred, coordinator fallback) ----
         iw = ie = None
         if USE_HF_WEIGHTS:
             wcfg = md.get("weights") or {}
@@ -2476,8 +1852,7 @@ def run_single_round_wrapper(srv, at, se, emit):
                     iw, ie = fetch_weights_from_hf(md, se, emit)
                     prune_hf_cache(keep_revision=wcfg.get("revision") or "main",
                                    log_fn=lambda m: emit('log', m))
-                except KeyboardInterrupt:
-                    raise
+                except KeyboardInterrupt: raise
                 except Exception as e:
                     import traceback as _tb
                     emit('log', f"Hugging Face weight download failed: {e}")
@@ -2487,14 +1862,12 @@ def run_single_round_wrapper(srv, at, se, emit):
         if iw is None or (ENGRAM_ACTIVE and ie is None):
             emit('log', "Downloading weights from coordinator...")
             md2, wb = fetch_task(srv, h, "bf16", se, emit)
-            if md2 is None:
-                return
+            if md2 is None: return
             md = md2
-            tid = md.get("taskId")
-            gs = md.get("globalStep")
+            # RE-PARSE in case the fallback returned different metadata
+            tid, gs, sl, cohort_mode, cc_seed, cc_steps, cc_bs = _parse_task_meta(md, emit)
             if not tid:
-                emit("log", "Coordinator task metadata missing taskId.")
-                return
+                emit("log", "Coordinator task metadata missing taskId."); return
             bbl = EXPECTED_MODEL_SIZE * 2
             ebl = EXPECTED_ENGRAM_SIZE * 2
             needed = bbl + (ebl if ENGRAM_ACTIVE else 0)
@@ -2502,23 +1875,39 @@ def run_single_round_wrapper(srv, at, se, emit):
                 raise RuntimeError(f"Incomplete coordinator payload: got {len(wb)}, expected {needed}")
             iw = _bf16_from_bytes(wb, 0, bbl)
             ie = _bf16_from_bytes(wb, bbl, ebl) if ENGRAM_ACTIVE else None
-            del wb
-            gc.collect()
+            del wb; gc.collect()
 
-        emit('status', 'preparing')
-        emit('log', "Preparing model...")
-        dc = md.get("datasetConfig", {})
-        sc = md.get("shardConfig", {})
+        # ---- Build dataset ----
+        emit('status', 'preparing'); emit('log', "Preparing model...")
+        dc = md.get("datasetConfig", {}); sc = md.get("shardConfig", {})
+        slot = sc.get("slot", 0)
+        if cohort_mode:
+            slot = 0   # CRITICAL: cohort members must read identical data
+            emit('log', "[COHORT] slot forced to 0 (identical shard for all members)")
         ds = StreamingShardDataset(
             dc.get("repoId", DATASET_REPO_ID),
             dc.get("chunkIdx", 0),
             dc.get("subChunkSize", 10 * 1024 * 1024),
             dc.get("tokensPerSample", sl + 1),
-            sc.get("slot", 0),
-            at,
+            slot, at,
+            cohort_mode=cohort_mode,
         )
-        bs = recommend_batch_size(sl)
 
+        # ---- Batch size (capped in cohort mode) ----
+        # ---- Batch size (capped in cohort mode) ----
+        bs = recommend_batch_size(sl)
+        if cohort_mode and cc_bs and int(cc_bs) > 0:
+            bs = min(bs, int(cc_bs))
+            emit('log', f"[COHORT] bs = min(local, {cc_bs}) = {bs}")
+
+        # ---- Critical invariant: if we can't hit target bs, opt out of cohort ----
+        # Otherwise different accumulation cadence vs peers → guaranteed false positive.
+        if cohort_mode and int(bs) < int(cc_bs):
+            emit('log', f"[COHORT] local bs={bs} < target={cc_bs}; cannot maintain invariants — "
+                        f"FALLING BACK to non-cohort mode (submit with crossCheckUsed=false)")
+            cohort_mode = False
+            cc_seed = cc_steps = cc_bs = cc_accum = None
+        # ---- Build model with OOM retry ----
         model = None
         while bs >= 1:
             try:
@@ -2526,276 +1915,301 @@ def run_single_round_wrapper(srv, at, se, emit):
                     try: torch.cuda.empty_cache()
                     except Exception: pass
                 gc.collect()
-                model = _build_model(train_backend, train_device, iw, ie, emit,
-                                     bs=bs, sl=sl)
+                model = _build_model(train_backend, train_device, iw, ie, emit, bs=bs, sl=sl)
                 break
             except RuntimeError as e:
                 if _is_oom(e):
-                    if model:
-                        del model
-                        model = None
+                    if model: del model; model = None
                     _clear_accel_cache(train_device)
                     bs = max(1, bs // 2)
                     emit('log', f"Model build OOM → bs={bs}")
-                else:
-                    raise
+                else: raise
         if model is None:
-            emit('log', "Failed to initialize model.")
-            return
+            emit('log', "Failed to initialize model."); return
 
         iew = ie.view(model.engram.table.weight.shape) if (ENGRAM_ACTIVE and ie is not None) else None
-        ie = None
-        _trim_heap()
+        ie = None; _trim_heap()
 
         mbt = bs * sl
-        as_ = max(1, round(131072 / mbt))
+        if cohort_mode and cc_accum:
+            as_ = int(cc_accum)
+            emit('log', f"[COHORT] as_ forced to targetAccumSteps={as_}")
+        else:
+            as_ = max(1, round(131072 / mbt))
         ls = 1.0 / as_
 
         ob, oe = _build_optimizers(model, lr=1e-4)
 
         def _on_step_down(_ladder):
             nonlocal ob, oe
+            if cohort_mode:
+                # OOM mid-cohort would force optimizer rebuild → momentum reset → divergence
+                # vs peers. Abort the round cleanly; retry next round.
+                raise RuntimeError(
+                    "OOM during cohort training — aborting round to preserve cross-check integrity"
+                )
             ob, oe = _build_optimizers(model, lr=1e-4)
             emit('log', "   rebuilt optimizers for new placement")
 
         ladder = DegradeLadder(model, on_step_down=_on_step_down)
-
         ua, ad = _pick_autocast(train_backend)
 
         emit('log', f"Backend: {train_backend} | autocast: {ua} | "
                    f"bs={bs} | accum={as_} | dtype={'bf16' if ua else 'fp32'}")
         if train_backend == 'ROCM':
             emit('log', '[ROCM-FIX] Attention: SDPA=' +
-                         ('enabled' if os.environ.get('CROWDGPT_ROCM_SDPA', '1') != '0' else 'disabled') +
-                         '; first micro-step may exceed 90s (timer checks between steps).')
+                         ('enabled' if os.environ.get('CROWDGPT_ROCM_SDPA', '1') != '0' else 'disabled'))
 
-        emit('log', f"Calibrating speed (max {CAL_TIME_BUDGET:.0f}s / {CAL_MAX_MICRO_HARD} micro-steps)...")
+        # ---- Calibration (SKIPPED in cohort mode) ----
         cs_ = time.time()
-        CAL_MAX_MICRO = max(CAL_MIN_MICRO, min(as_, CAL_MAX_MICRO_HARD))
-        if model.main_device.type == 'cpu':
-            # The wall-clock guard is checked between micro-steps, so a single
-            # full-context CPU forward/backward could leave the UI in Calibrating
-            # for a very long time. Use one short calibration step; full training
-            # keeps the original sequence length.
-            CAL_MAX_MICRO = 1
-            emit('log', "[CPU-CAL] CPU-only calibration uses one short sequence (default 32 tokens) to avoid an unbounded wait.")
         target_micro_steps = 100
-        emit('status', 'calibrating')
 
-        ob.zero_grad(set_to_none=True)
-        while (micro_step < CAL_MAX_MICRO) and ((time.time() - cs_) < CAL_TIME_BUDGET):
-            if hb.should_stop() or se.is_set():
-                return
-            if ds.needs_new_subchunk():
-                ds.advance(srv, "bf16")
-            sd = (abs(hash("cal")) % 10000) + micro_step
-            x, y = ds.get_batch(bs, seed=sd)
-            step_x, step_y, step_sl = x, y, sl
+        if cohort_mode:
+            # CRITICAL: any calibration with random seed → different starting weights
+            # → guaranteed false positives. Skip entirely; go straight to fixed-count training.
+            emit('log', f"[COHORT] Skipping calibration; will run exactly {int(cc_steps)} micro-steps")
+            target_micro_steps = int(cc_steps)
+            emit('status', 'training')
+        else:
+            emit('log', f"Calibrating speed (max {CAL_TIME_BUDGET:.0f}s / {CAL_MAX_MICRO_HARD} micro-steps)...")
+            CAL_MAX_MICRO = max(CAL_MIN_MICRO, min(as_, CAL_MAX_MICRO_HARD))
             if model.main_device.type == 'cpu':
-                step_x, step_y, step_sl = _cpu_calibration_batch(x, y, sl)
-                want_preview = False
-            else:
-                want_preview = ((micro_step + 1) % PREVIEW_EVERY == 0) if train_backend == 'ROCM' else ((micro_step == 0) or ((micro_step + 1) % PREVIEW_EVERY == 0))
-            if train_backend == 'ROCM':
-                emit('log', f'[ROCM-FIX] Calibration micro-step {micro_step + 1}/{CAL_MAX_MICRO} starting...')
+                CAL_MAX_MICRO = 1
+                emit('log', "[CPU-CAL] CPU-only calibration uses one short sequence.")
+            emit('status', 'calibrating')
 
-            try:
-                lo, cards = _train_step_safe(model, step_x, step_y, step_sl, ua, ad, ls,
-                                             preview=want_preview,
-                                             ladder=ladder, emit=emit)
-            except RuntimeError as re:
-                if (not tried_cpu_fallback) and _is_accel_error(str(re)):
-                    emit('log', f"⚠️ {train_backend} op failed at fwd: {str(re)[:120]}")
-                    emit('log', "🔻 Falling back to CPU-only model...")
-                    model.to_cpu_only()
-                    ob, oe = _build_optimizers(model, lr=1e-4)
-                    ua = False; ad = None
-                    tried_cpu_fallback = True
+            ob.zero_grad(set_to_none=True)
+            while (micro_step < CAL_MAX_MICRO) and ((time.time() - cs_) < CAL_TIME_BUDGET):
+                if hb.should_stop() or se.is_set(): return
+                if ds.needs_new_subchunk(): ds.advance(srv, "bf16")
+                sd = (abs(hash("cal")) % 10000) + micro_step
+                x, y = ds.get_batch(bs, seed=sd)
+                step_x, step_y, step_sl = x, y, sl
+                if model.main_device.type == 'cpu':
                     step_x, step_y, step_sl = _cpu_calibration_batch(x, y, sl)
                     want_preview = False
-                    CAL_MAX_MICRO = min(CAL_MAX_MICRO, micro_step + 1)
-                    emit('log', f"[CPU-CAL] Retrying with {step_sl} tokens for calibration.")
-                    lo, cards = _train_step_safe(model, step_x, step_y, step_sl, ua, ad, ls,
-                                                 preview=False,
-                                                 ladder=ladder, emit=emit)
                 else:
-                    raise
+                    want_preview = ((micro_step + 1) % PREVIEW_EVERY == 0) if train_backend == 'ROCM' else ((micro_step == 0) or ((micro_step + 1) % PREVIEW_EVERY == 0))
 
-            lval = float(lo.item())
-            micro_step += 1
-            if cards:
-                emit('model_preview', {'step': micro_step, 'cards': cards})
+                try:
+                    lo, cards = _train_step_safe(model, step_x, step_y, step_sl, ua, ad, ls,
+                                                 preview=want_preview, ladder=ladder, emit=emit)
+                except RuntimeError as re:
+                    if (not tried_cpu_fallback) and _is_accel_error(str(re)):
+                        emit('log', f"⚠️ {train_backend} op failed: {str(re)[:120]}")
+                        emit('log', "🔻 Falling back to CPU-only model...")
+                        model.to_cpu_only(); ob, oe = _build_optimizers(model, lr=1e-4)
+                        ua = False; ad = None; tried_cpu_fallback = True
+                        step_x, step_y, step_sl = _cpu_calibration_batch(x, y, sl)
+                        want_preview = False
+                        CAL_MAX_MICRO = min(CAL_MAX_MICRO, micro_step + 1)
+                        lo, cards = _train_step_safe(model, step_x, step_y, step_sl, ua, ad, ls,
+                                                     preview=False, ladder=ladder, emit=emit)
+                    else: raise
 
-            elapsed_cal = max(0.001, time.time() - cs_)
-            current_tps = (tt + step_x.numel()) / elapsed_cal
-            time_left_mins = 0.0
-            if micro_step >= CAL_MIN_MICRO:
-                eta_elapsed = elapsed_cal
-                if model.main_device.type == 'cpu' and step_sl < sl:
-                    eta_elapsed *= (sl / max(1, step_sl))
-                sps_micro = eta_elapsed / micro_step
-                rh = max(0.1, rs.get("max_round_hours", 2.0)
-                              - rs.get("round_elapsed_hours", 0))
-                remaining = max(60, (rh * 3600) - eta_elapsed
-                                     - (UPLOAD_BUFFER_MIN * 60))
-                target_micro_steps = micro_step + int(remaining / sps_micro)
-                time_left_mins = remaining / 60.0
-            emit('cal_stats', {
-                'step': micro_step, 'total': target_micro_steps,
-                'loss': safe_float(lval * as_, 10.0),
-                'microbatch': micro_step,
-                'tps': safe_float(current_tps),
-                'time_left': safe_float(time_left_mins),
-            })
-            oe.step()
-            oe.zero_grad(set_to_none=True)
-            tt += step_x.numel()
-            del lo, x, y, step_x, step_y
+                lval = float(lo.item()); micro_step += 1
+                if cards: emit('model_preview', {'step': micro_step, 'cards': cards})
 
-        if hb.should_stop() or se.is_set():
-            return
-        torch.nn.utils.clip_grad_norm_(
-            [p for p in model.parameters() if p.requires_grad], 1.0)
-        ob.step()
-        ob.zero_grad(set_to_none=True)
-        gc.collect()
-        emit('log', f"Calibration done: {micro_step} micro-steps in "
-                    f"{time.time() - cs_:.1f}s (est. target {target_micro_steps})")
+                elapsed_cal = max(0.001, time.time() - cs_)
+                current_tps = (tt + step_x.numel()) / elapsed_cal
+                time_left_mins = 0.0
+                if micro_step >= CAL_MIN_MICRO:
+                    eta_elapsed = elapsed_cal
+                    if model.main_device.type == 'cpu' and step_sl < sl:
+                        eta_elapsed *= (sl / max(1, step_sl))
+                    sps_micro = eta_elapsed / micro_step
+                    rh = max(0.1, rs.get("max_round_hours", 2.0) - rs.get("round_elapsed_hours", 0))
+                    remaining = max(60, (rh * 3600) - eta_elapsed - (UPLOAD_BUFFER_MIN * 60))
+                    target_micro_steps = micro_step + int(remaining / sps_micro)
+                    time_left_mins = remaining / 60.0
+                emit('cal_stats', {
+                    'step': micro_step, 'total': target_micro_steps,
+                    'loss': safe_float(lval * as_, 10.0), 'microbatch': micro_step,
+                    'tps': safe_float(current_tps), 'time_left': safe_float(time_left_mins),
+                })
+                oe.step(); oe.zero_grad(set_to_none=True)
+                tt += step_x.numel()
+                del lo, x, y, step_x, step_y
 
-        if se.is_set():
-            return
-        rh = max(0.1, rs.get("max_round_hours", 2.0) - rs.get("round_elapsed_hours", 0))
-        eta_elapsed = time.time() - cs_
-        if model.main_device.type == 'cpu':
-            try:
-                cpu_cal_tokens = max(8, min(128, int(os.environ.get("CROWDGPT_CPU_CAL_TOKENS", "32"))))
-            except (TypeError, ValueError):
-                cpu_cal_tokens = 32
-            eta_elapsed *= (sl / max(1, min(sl, cpu_cal_tokens)))
-        remaining = max(60, (rh * 3600) - eta_elapsed - (UPLOAD_BUFFER_MIN * 60))
-        dl = time.time() + remaining
-        if micro_step > 0:
-            sps_micro = eta_elapsed / micro_step
-            target_micro_steps = micro_step + int(remaining / max(sps_micro, 0.001))
+            if hb.should_stop() or se.is_set(): return
+            torch.nn.utils.clip_grad_norm_(
+                [p for p in model.parameters() if p.requires_grad], 1.0)
+            ob.step(); ob.zero_grad(set_to_none=True); gc.collect()
+            emit('log', f"Calibration done: {micro_step} micro-steps in {time.time() - cs_:.1f}s")
+
+        if se.is_set(): return
+
+        # ---- Set up main training loop termination ----
+        if cohort_mode:
+            dl = float('inf')
+            target_micro_steps = int(cc_steps)
+            emit('log', f"[COHORT] Target: exactly {target_micro_steps} micro-steps (no wall-clock)")
         else:
-            target_micro_steps = 1000
+            rh = max(0.1, rs.get("max_round_hours", 2.0) - rs.get("round_elapsed_hours", 0))
+            eta_elapsed = time.time() - cs_
+            if model.main_device.type == 'cpu':
+                try: cpu_cal_tokens = max(8, min(128, int(os.environ.get("CROWDGPT_CPU_CAL_TOKENS", "32"))))
+                except (TypeError, ValueError): cpu_cal_tokens = 32
+                eta_elapsed *= (sl / max(1, min(sl, cpu_cal_tokens)))
+            remaining = max(60, (rh * 3600) - eta_elapsed - (UPLOAD_BUFFER_MIN * 60))
+            dl = time.time() + remaining
+            if micro_step > 0:
+                sps_micro = eta_elapsed / micro_step
+                target_micro_steps = micro_step + int(remaining / max(sps_micro, 0.001))
+            else:
+                target_micro_steps = 1000
+            emit('log', f"Target: ~{target_micro_steps} micro-steps")
         emit('status', 'training')
-        emit('log', f"Target: ~{target_micro_steps} micro-steps")
+
+        # ---- Main training loop ----
         last_stats_emit = 0.0
-        while time.time() < dl:
-            if hb.should_stop() or se.is_set():
-                break
+
+        if cohort_mode:
+            cc_step_cap = int(cc_steps)
+            def _outer_continue():
+                return (not hb.should_stop()) and (not se.is_set()) and (micro_step < cc_step_cap)
+            def _inner_continue():
+                return (not hb.should_stop()) and (not se.is_set()) and (micro_step < cc_step_cap)
+        else:
+            def _outer_continue():
+                return (not hb.should_stop()) and (not se.is_set()) and (time.time() < dl)
+            def _inner_continue():
+                return (not hb.should_stop()) and (not se.is_set()) and (time.time() < dl)
+
+        while _outer_continue():
             ob.zero_grad(set_to_none=True)
             als = 0.0
-            cc = 0
+            accum_count = 0
             for mi in range(as_):
-                if hb.should_stop() or se.is_set() or time.time() >= dl:
-                    break
-                if ds.needs_new_subchunk():
-                    ds.advance(srv, "bf16")
-                sd = (abs(hash("t")) % 10000) + micro_step * 1000 + mi
+                if not _inner_continue(): break
+                if ds.needs_new_subchunk(): ds.advance(srv, "bf16")
+
+                # Fixed seed in cohort mode (NO mi — accumulation cadence must not affect seed);
+                # existing hash-seed otherwise.
+                if cohort_mode:
+                    sd = int(cc_seed) * 100_003 + micro_step * 1009
+                else:
+                    sd = (abs(hash("t")) % 10000) + micro_step * 1000 + mi
                 x, y = ds.get_batch(bs, seed=sd)
+
                 want_preview = (model.main_device.type != 'cpu') and ((micro_step == 0) or ((micro_step + 1) % PREVIEW_EVERY == 0))
 
                 try:
                     lo, cards = _train_step_safe(model, x, y, sl, ua, ad, ls,
-                                                 preview=want_preview,
-                                                 ladder=ladder, emit=emit)
+                                                 preview=want_preview, ladder=ladder, emit=emit)
                 except RuntimeError as re:
                     if (not tried_cpu_fallback) and _is_accel_error(str(re)):
-                        emit('log', f"⚠️ {train_backend} op failed at fwd: {str(re)[:120]}")
+                        emit('log', f"⚠️ {train_backend} op failed: {str(re)[:120]}")
                         emit('log', "🔻 Falling back to CPU-only model...")
-                        model.to_cpu_only()
-                        ob, oe = _build_optimizers(model, lr=1e-4)
-                        ua = False; ad = None
-                        tried_cpu_fallback = True
+                        model.to_cpu_only(); ob, oe = _build_optimizers(model, lr=1e-4)
+                        ua = False; ad = None; tried_cpu_fallback = True
                         lo, cards = _train_step_safe(model, x, y, sl, ua, ad, ls,
-                                                     preview=want_preview,
-                                                     ladder=ladder, emit=emit)
-                    else:
-                        raise
+                                                     preview=want_preview, ladder=ladder, emit=emit)
+                    else: raise
 
                 lval = float(lo.item()) * as_
-                oe.step()
-                oe.zero_grad(set_to_none=True)
-                als += lval
-                tt += x.numel()
-                cc += 1
-                micro_step += 1
-                if cards:
-                    emit('model_preview', {'step': micro_step, 'cards': cards})
-                rem_time = max(1, dl - time.time())
+                oe.step(); oe.zero_grad(set_to_none=True)
+                als += lval; tt += x.numel(); accum_count += 1; micro_step += 1
+                if cards: emit('model_preview', {'step': micro_step, 'cards': cards})
+
                 elapsed_total = time.time() - cs_
-                if micro_step > 5:
-                    sps_micro = elapsed_total / micro_step
-                    future_steps = int(rem_time / sps_micro)
-                    current_target = micro_step + future_steps
-                    if current_target > target_micro_steps:
-                        target_micro_steps = current_target
-                if time.time() - last_stats_emit > 0.25 or time.time() >= dl:
+                if cohort_mode:
+                    steps_left = max(0, int(cc_steps) - micro_step)
+                    sps_micro = max(1e-6, elapsed_total / max(1, micro_step))
+                    rem_time = steps_left * sps_micro
+                else:
+                    rem_time = max(1, dl - time.time())
+                    if micro_step > 5:
+                        sps_micro = elapsed_total / micro_step
+                        future_steps = int(rem_time / sps_micro)
+                        current_target = micro_step + future_steps
+                        if current_target > target_micro_steps:
+                            target_micro_steps = current_target
+
+                at_cohort_end = cohort_mode and micro_step >= int(cc_steps)
+                if time.time() - last_stats_emit > 0.25 or at_cohort_end or (not cohort_mode and time.time() >= dl):
                     last_stats_emit = time.time()
-                    lv = als / cc if cc > 0 else 10.0
-                    ctps = tt / max(time.time() - cs_, 1)
+                    lv = als / accum_count if accum_count > 0 else 10.0
+                    ctps = tt / max(elapsed_total, 1)
                     emit('stats', {
                         'step': micro_step, 'target': target_micro_steps,
                         'loss': safe_float(lv, 10.0), 'tps': safe_float(ctps),
                         'global_step': gs, 'round': cr,
-                        'time_left': safe_float(max(0, (dl - time.time()) / 60)),
+                        'time_left': safe_float(max(0, rem_time / 60)),
                     })
                 del lo, x, y
-            if hb.should_stop() or se.is_set():
-                break
-            if cc == 0:
-                break
+
+            if hb.should_stop() or se.is_set(): break
+            if accum_count == 0: break
             torch.nn.utils.clip_grad_norm_(
                 [p for p in model.parameters() if p.requires_grad], 1.0)
             ob.step()
             ob.zero_grad(set_to_none=True)
 
         if se.is_set():
-            emit('log', "Stopped by user. Skipping upload.")
-            return
+            emit('log', "Stopped by user. Skipping upload."); return
+
+        # Cohort invariant: must complete EXACTLY cc_steps to be comparable to peers.
+        # If interrupted (round timer, ultimatum, etc), don't submit under cohort flag.
+        if cohort_mode and int(micro_step) != int(cc_steps):
+            emit('log', f"[COHORT] ABORT: only completed {micro_step}/{cc_steps} steps; "
+                        f"cannot submit as cohort member (would cause false outlier). "
+                        f"Falling back to non-cohort submission.")
+            cohort_mode = False
+            # Keep cc_seed/steps for reporting but clear crossCheckUsed
+            # (submit_extra computes crossCheckUsed from cohort_mode)
+
         fl = float(lval) if lval else 10.0
         emit('log', f"Done: {micro_step} micro-steps, loss {fl:.4f}")
         emit('status', 'uploading')
 
+        # ---- Compute delta ----
         for _o in (ob, oe):
-            try:
-                _o.zero_grad(set_to_none=True)
-            except Exception:
-                pass
+            try: _o.zero_grad(set_to_none=True)
+            except Exception: pass
         ob = oe = ladder = None
-        for _p in model.parameters():
-            _p.grad = None
-        _clear_accel_cache(train_device)
-        _trim_heap()
+        for _p in model.parameters(): _p.grad = None
+        _clear_accel_cache(train_device); _trim_heap()
 
-        dbf = _base_delta_bf16(model, iw)
-        iw = None
+        dbf = _base_delta_bf16(model, iw); iw = None
         if ENGRAM_ACTIVE and iew is not None:
             si, sv = _engram_sparse_delta(model.engram.table.weight.data, iew)
         else:
             si, sv = np.array([], dtype=np.uint32), np.array([], dtype=np.uint16)
-        iew = None
-        model = None
-        _clear_accel_cache(train_device)
-        _trim_heap()
+        iew = None; model = None
+        _clear_accel_cache(train_device); _trim_heap()
+
         has_engram = bool(len(si) > 0)
         engram_sparse_count = int(len(si))
+
+        # ---- Cohort reporting ----
+        submit_extra = {
+            "crossCheckUsed": cohort_mode,
+            "actualSeed": int(cc_seed) if (cohort_mode and cc_seed is not None) else None,
+            "actualSteps": int(micro_step),
+            "actualBatchSize": int(bs),
+        }
+        if cohort_mode:
+            emit('log', f"[COHORT] Reporting: seed={submit_extra['actualSeed']} "
+                        f"steps={submit_extra['actualSteps']} bs={submit_extra['actualBatchSize']}")
+
         pl = json.dumps({
             "taskId": tid, "loss": fl, "localSteps": micro_step, "tokensProcessed": tt,
             "loraRank": 0, "isDelta": True, "weightFormat": "bf16",
             "hasEngram": has_engram, "engramSparseCount": engram_sparse_count,
+            **submit_extra,
         }).encode()
         compressed_data = _gzip_stream(struct.pack('<I', len(pl)) + pl, (dbf, si, sv))
         upload_size_mb = len(compressed_data) / (1024 * 1024)
-        del dbf, si, sv, pl
-        _trim_heap()
+        del dbf, si, sv, pl; _trim_heap()
+
         meta = {
             "taskId": tid, "loss": fl, "localSteps": micro_step, "tokensProcessed": tt,
             "loraRank": 0, "isDelta": True, "weightFormat": "bf16",
             "hasEngram": has_engram, "engramSparseCount": engram_sparse_count,
+            **submit_extra,
         }
+
         emit('overlay_show', {'title_key': 'uploading', 'indeterminate': False})
         emit('log', f"Uploading {upload_size_mb:.1f} MB delta to server...")
         r = None
@@ -2805,8 +2219,7 @@ def run_single_round_wrapper(srv, at, se, emit):
                     r = requests.post(
                         f"{srv}/fl/submit",
                         headers={"Content-Type": "application/octet-stream", "Content-Encoding": "gzip", **h},
-                        data=compressed_data,
-                        timeout=600,
+                        data=compressed_data, timeout=600,
                     )
                     if r.status_code == 413:
                         emit("log", "Direct upload rejected. Switching to chunked...")
@@ -2815,8 +2228,7 @@ def run_single_round_wrapper(srv, at, se, emit):
                     if len(compressed_data) > 8 * 1024 * 1024:
                         emit("log", f"Direct upload failed ({e}). Trying chunked...")
                         r = chunked_submit_delta(srv, h, compressed_data, meta, emit, se)
-                    else:
-                        raise
+                    else: raise
             else:
                 r = chunked_submit_delta(srv, h, compressed_data, meta, emit, se)
             if r is not None and r.status_code == 200:
@@ -2829,10 +2241,8 @@ def run_single_round_wrapper(srv, at, se, emit):
             emit("log", f"Upload failed: {e}")
         finally:
             emit('overlay_hide', {})
-            try:
-                del compressed_data
-            except Exception:
-                pass
+            try: del compressed_data
+            except Exception: pass
             gc.collect()
     finally:
         hb.stop()
@@ -2840,22 +2250,14 @@ def run_single_round_wrapper(srv, at, se, emit):
         gc.collect()
         if train_backend in ("CUDA", "ROCM"):
             try:
-                torch.cuda.empty_cache()
-                gc.collect()
-                torch.cuda.empty_cache()
-            except Exception:
-                pass
-        try:
-            prune_hf_cache()
-        except Exception:
-            pass
+                torch.cuda.empty_cache(); gc.collect(); torch.cuda.empty_cache()
+            except Exception: pass
+        try: prune_hf_cache()
+        except Exception: pass
 
 
-# =========================================================================
-# Shared backend setup + update check (used by both GUI and headless)
-# =========================================================================
+# =================== BACKEND SETUP ===================
 def _do_backend_setup(selected_backend, vram_gb, emit):
-    """Detect backend + VRAM budget + install hard cap. Shared by GUI and headless."""
     global train_device, train_backend
     train_device, train_backend = detect_training_backend(selected_backend)
     emit('meta', {'backend': train_backend})
@@ -2869,20 +2271,15 @@ def _do_backend_setup(selected_backend, vram_gb, emit):
 
 
 def _check_updates_between_rounds(emit):
-    """Shared between GUI and headless. Exits by re-exec if an update lands."""
     try:
         if check_for_update():
             emit('log', "🔄 Updated to a new version — restarting...")
-            emit('status', 'idle')
-            time.sleep(2)
-            _restart_self()
+            emit('status', 'idle'); time.sleep(2); _restart_self()
     except Exception as e:
         log.warning(f"Update check failed: {e}")
 
 
-# =========================================================================
-# Api (GUI)
-# =========================================================================
+# =================== API CLASS ===================
 class Api:
     def __init__(self):
         self.window = None
@@ -2897,15 +2294,11 @@ class Api:
         try:
             if self._backend_file.exists():
                 saved = json.loads(self._backend_file.read_text()).get("backend")
-        except Exception:
-            saved = None
+        except Exception: saved = None
         available = get_available_backends()
         preferred_backend = get_best_default_backend()
         honor_saved = os.environ.get("CROWDGPT_HONOR_SAVED_BACKEND") == "1"
         if saved and available.get(saved, False):
-            # A previous CPU choice commonly persists through reinstallations.
-            # Prefer an installed accelerator by default; set
-            # CROWDGPT_HONOR_SAVED_BACKEND=1 to keep a saved CPU/DirectML choice.
             should_upgrade = (
                 not honor_saved and (
                     (saved == "cpu" and preferred_backend != "cpu") or
@@ -2914,39 +2307,28 @@ class Api:
             )
             if should_upgrade:
                 self.selected_backend = preferred_backend
-                log.info(f"[AMD-AUTO] Replacing saved backend {saved!r} with available {preferred_backend!r}.")
-            else:
-                self.selected_backend = saved
-        else:
-            self.selected_backend = preferred_backend
+                log.info(f"[AMD-AUTO] Replacing saved backend {saved!r} with {preferred_backend!r}.")
+            else: self.selected_backend = saved
+        else: self.selected_backend = preferred_backend
 
         if sys.platform == "win32" and not available.get("rocm", False) and available.get("directml", False):
-            log.warning(
-                "[ROCM] ROCm is disabled in the selector because this environment's PyTorch "
-                "is not a HIP/ROCm build. Reinstall with install.bat --backend rocm; "
-                "if the installer falls back to DirectML, review its ROCm install/runtime-test warning."
-            )
+            log.warning("[ROCM] ROCm disabled (non-HIP PyTorch); reinstall with install.bat --backend rocm if intended.")
         log.info(f"[CLIENT] Selected backend: {self.selected_backend}")
         self._vram_file = CHECKPOINT_DIR / "selected_vram.json"
         self.vram_gb = 0.0
         try:
             if self._vram_file.exists():
                 self.vram_gb = max(0.0, float(json.loads(self._vram_file.read_text()).get("vram_gb", 0) or 0))
-        except Exception:
-            self.vram_gb = 0.0
+        except Exception: self.vram_gb = 0.0
 
     def emit(self, ev, data):
-        if not self.window:
-            return
+        if not self.window: return
         if ev in ('log', 'status'):
-            try:
-                print(f"[EMIT {ev}] {data}", flush=True)
-            except Exception:
-                pass
+            try: print(f"[EMIT {ev}] {data}", flush=True)
+            except Exception: pass
         if ev == 'preview_loss':
             n = time.time()
-            if n - self._lp < 0.4:
-                return
+            if n - self._lp < 0.4: return
             self._lp = n
         try:
             clean_data = sanitize_for_json(data)
@@ -2960,30 +2342,23 @@ class Api:
         self.emit('vram', {'current': self.vram_gb})
 
     def set_vram(self, gb):
-        try:
-            gb = max(0.0, float(gb))
-        except (TypeError, ValueError):
-            gb = 0.0
+        try: gb = max(0.0, float(gb))
+        except (TypeError, ValueError): gb = 0.0
         self.vram_gb = gb
-        try:
-            self._vram_file.write_text(json.dumps({"vram_gb": gb}))
-        except Exception as e:
-            log.warning(f"Failed to save VRAM limit: {e}")
+        try: self._vram_file.write_text(json.dumps({"vram_gb": gb}))
+        except Exception as e: log.warning(f"Failed to save VRAM limit: {e}")
         apply_vram_override(gb)
         busy = self.thread is not None and self.thread.is_alive()
         label = "Auto" if gb <= 0 else f"{gb:g} GB"
         self.emit('log', f"VRAM limit: {label}" + (" (applies from the next round)" if busy else ""))
 
     def set_backend(self, backend_name):
-        log.info(f"[CLIENT] set_backend called with: {backend_name} (was {self.selected_backend})")
+        log.info(f"[CLIENT] set_backend: {backend_name} (was {self.selected_backend})")
         self.selected_backend = backend_name
-        try:
-            self._backend_file.write_text(json.dumps({"backend": backend_name}))
-        except Exception as e:
-            log.warning(f"Failed to save backend choice: {e}")
+        try: self._backend_file.write_text(json.dumps({"backend": backend_name}))
+        except Exception as e: log.warning(f"Failed to save backend choice: {e}")
         self.get_backends()
-        if self.thread and self.thread.is_alive():
-            self.stop_event.set()
+        if self.thread and self.thread.is_alive(): self.stop_event.set()
 
     def login(self, s, u, p):
         self.server_url = s or self.server_url
@@ -2992,11 +2367,9 @@ class Api:
     def _do_login(self, u, p):
         tok, err = do_login(self.server_url, u, p)
         if tok:
-            self.auth_token = tok
-            self.username = u
+            self.auth_token = tok; self.username = u
             self.emit('login_success', {'username': u})
-        else:
-            self.emit('login_error', {'code': err or 'login_failed'})
+        else: self.emit('login_error', {'code': err or 'login_failed'})
 
     def register(self, s, u, email, p):
         self.server_url = s or self.server_url
@@ -3005,37 +2378,28 @@ class Api:
     def _do_register(self, u, email, p):
         tok, err = do_register(self.server_url, u, email, p)
         if tok:
-            self.auth_token = tok
-            self.username = u
+            self.auth_token = tok; self.username = u
             self.emit('login_success', {'username': u})
-        else:
-            self.emit('login_error', {'code': err or 'register_failed'})
+        else: self.emit('login_error', {'code': err or 'register_failed'})
 
     def login_anon(self):
-        self.auth_token = None
-        self.username = "anonymous"
+        self.auth_token = None; self.username = "anonymous"
         self.emit('login_success', {'username': 'anonymous'})
 
     def start(self):
-        if self.thread and self.thread.is_alive():
-            return
+        if self.thread and self.thread.is_alive(): return
         self.stop_event.clear()
-        self.thread = threading.Thread(target=self._rs, daemon=True)
-        self.thread.start()
+        self.thread = threading.Thread(target=self._rs, daemon=True); self.thread.start()
 
-    def stop(self):
-        self.stop_event.set()
+    def stop(self): self.stop_event.set()
 
     def _check_updates_between_rounds(self):
         _check_updates_between_rounds(self.emit)
 
     def _rs(self):
-        try:
-            _do_backend_setup(self.selected_backend, self.vram_gb, self.emit)
+        try: _do_backend_setup(self.selected_backend, self.vram_gb, self.emit)
         except Exception as e:
-            self.emit('log', f"Error: {e}")
-            self.emit('status', 'idle')
-            return
+            self.emit('log', f"Error: {e}"); self.emit('status', 'idle'); return
         round_count = 0
         while not self.stop_event.is_set():
             round_count += 1
@@ -3043,217 +2407,158 @@ class Api:
             self.emit('log', f"{'='*40}")
             self.emit('log', f"Starting Round Cycle #{round_count}")
             self.emit('log', f"{'='*40}")
-            try:
-                run_single_round_wrapper(self.server_url, self.auth_token, self.stop_event, self.emit)
+            try: run_single_round_wrapper(self.server_url, self.auth_token, self.stop_event, self.emit)
             except KeyboardInterrupt:
-                self.stop_event.set()
-                break
+                self.stop_event.set(); break
             except Exception as e:
                 import traceback
                 tb = traceback.format_exc()
                 print(f"\n[ROUND-FAIL-TRACEBACK]\n{tb}\n", flush=True)
-                for ln in tb.splitlines()[-14:]:
-                    self.emit('log', ln)
+                for ln in tb.splitlines()[-14:]: self.emit('log', ln)
                 self.emit('log', f"Round failed: {e}")
-            if self.stop_event.is_set():
-                break
+            if self.stop_event.is_set(): break
             self._check_updates_between_rounds()
             self.emit('status', 'waiting')
             self.emit('log', "✅ Round complete. Auto-relaunching next round in 10s...")
             for _ in range(10):
-                if self.stop_event.is_set():
-                    break
+                if self.stop_event.is_set(): break
                 time.sleep(1)
         self.emit('status', 'idle')
         self.emit('log', "👋 Training stopped by user.")
 
 
-# =========================================================================
-# GUI windowing
-# =========================================================================
+# =================== GUI ===================
 def startup():
     if sys.platform == "win32" and WINDOWS_ICO_PATH:
         _wait_for_window(WINDOW_TITLE, timeout=5.0)
         time.sleep(0.15)
         set_windows_icon(WINDOW_TITLE, WINDOWS_ICO_PATH)
-
     try:
-        scr = webview.screens[0]
-        aw, ah = scr.width, scr.height
+        scr = webview.screens[0]; aw, ah = scr.width, scr.height
         w = max(480, min(1040, int(aw * 0.80)))
         h = max(360, min(800, int(ah * 0.80)))
-        w = min(w, aw - 16)
-        h = min(h, ah - 48)
-        w = max(320, w)
-        h = max(240, h)
+        w = min(w, aw - 16); h = min(h, ah - 48); w = max(320, w); h = max(240, h)
         window.resize(w, h)
         window.move(max(0, (aw - w) // 2), max(0, (ah - h) // 2))
-    except Exception:
-        pass
+    except Exception: pass
 
 
 def _create_window_safe(title, html, kwargs):
-    try:
-        return webview.create_window(title, html=html, **kwargs)
+    try: return webview.create_window(title, html=html, **kwargs)
     except TypeError:
         kwargs.pop("min_size", None)
         return webview.create_window(title, html=html, **kwargs)
 
 
 def _start_icon_kwargs():
-    if sys.platform == "win32" or not ICON_PATH or not os.path.exists(ICON_PATH):
-        return {}
+    if sys.platform == "win32" or not ICON_PATH or not os.path.exists(ICON_PATH): return {}
     log.info(f"[icon] passing icon to webview.start: {ICON_PATH}")
     return {"icon": ICON_PATH}
 
 
-# =========================================================================
-# CLI / headless
-# =========================================================================
+# =================== CLI / HEADLESS ===================
 def parse_args():
     p = argparse.ArgumentParser(
         prog="client.py",
-        description="CrowdGPT client. Runs the GUI by default; use --headless for SSH/servers.",
+        description="CrowdGPT client. Runs GUI by default; use --headless for SSH/servers.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("--headless", action="store_true",
                    help="no window; train in the terminal (for SSH / systemd / nohup)")
-    p.add_argument("--server", default=DEFAULT_SERVER,
-                   help="coordinator URL")
+    p.add_argument("--server", default=DEFAULT_SERVER, help="coordinator URL")
     p.add_argument("--user", default=None, help="username")
-    p.add_argument("--password", default=None,
-                   help="password (or env CROWDGPT_PASSWORD)")
-    p.add_argument("--token", default=None,
-                   help="auth token (or env CROWDGPT_TOKEN)")
-    p.add_argument("--anon", action="store_true",
-                   help="train without an account")
+    p.add_argument("--password", default=None, help="password (or env CROWDGPT_PASSWORD)")
+    p.add_argument("--token", default=None, help="auth token (or env CROWDGPT_TOKEN)")
+    p.add_argument("--anon", action="store_true", help="train without an account")
     p.add_argument("--backend", default=None,
                    choices=["auto", "cpu", "cuda", "rocm", "mps", "xpu", "directml"],
                    help="force a backend (default: best available)")
     p.add_argument("--vram-gb", type=float, default=0.0,
                    help="cap placement budget in GB (0 = auto, also reads $CROWDGPT_VRAM_GB)")
-    p.add_argument("--rounds", type=int, default=0,
-                   help="stop after N rounds (0 = run forever)")
-    p.add_argument("--no-tokenizer", action="store_true",
-                   help="skip loading the tokenizer (~500 MB RAM); previews show #tok ids")
-    p.add_argument("--no-update", action="store_true",
-                   help="don't check for client.py updates")
+    p.add_argument("--rounds", type=int, default=0, help="stop after N rounds (0 = run forever)")
+    p.add_argument("--no-tokenizer", action="store_true", help="skip loading the tokenizer")
+    p.add_argument("--no-update", action="store_true", help="don't check for client.py updates")
     p.add_argument("--dry-run", action="store_true",
                    help="check auth + backend + task metadata, then exit without training")
-    p.add_argument("--debug", action="store_true",
-                   help="verbose logging")
-    p.add_argument("--version", action="version",
-                   version=f"crowdgpt-client {CLIENT_VERSION}")
+    p.add_argument("--debug", action="store_true", help="verbose logging")
+    p.add_argument("--version", action="version", version=f"crowdgpt-client {CLIENT_VERSION}")
     return p.parse_args()
 
 
 def _headless_emit(verbose=False):
-    """Console emit for --headless. Throttles noisy events, prefixes the rest."""
     _last = {"prog": 0.0, "last_stats": 0.0}
     def emit(ev, data):
-        if ev == 'log':
-            log.info(str(data))
-        elif ev == 'status':
-            log.info(f"[status] {data}")
-        elif ev == 'meta':
-            pass
+        if ev == 'log': log.info(str(data))
+        elif ev == 'status': log.info(f"[status] {data}")
+        elif ev == 'meta': pass
         elif ev == 'stats':
             now = time.time()
-            if now - _last["last_stats"] < 10.0:
-                return
+            if now - _last["last_stats"] < 10.0: return
             _last["last_stats"] = now
-            log.info(
-                f"[train] step {data.get('step')}/{data.get('target')} "
-                f"loss={data.get('loss', 0):.4f} "
-                f"tps={data.get('tps', 0):.0f} "
-                f"left={data.get('time_left', 0):.0f}m"
-            )
+            log.info(f"[train] step {data.get('step')}/{data.get('target')} "
+                     f"loss={data.get('loss', 0):.4f} tps={data.get('tps', 0):.0f} "
+                     f"left={data.get('time_left', 0):.0f}m")
         elif ev == 'cal_stats':
-            log.info(
-                f"[cal]   step {data.get('step')}/{data.get('total')} "
-                f"loss={data.get('loss', 0):.4f}"
-            )
+            log.info(f"[cal]   step {data.get('step')}/{data.get('total')} "
+                     f"loss={data.get('loss', 0):.4f}")
         elif ev == 'model_preview':
             for c in data.get('cards', []):
-                log.info(
-                    f"[preview] {str(c.get('context', ''))[-40:]!r} → "
-                    f"pred={c.get('pred')!r} target={c.get('target')!r} "
-                    f"{'✓' if c.get('match') else '✗'}"
-                )
+                log.info(f"[preview] {str(c.get('context', ''))[-40:]!r} → "
+                         f"pred={c.get('pred')!r} target={c.get('target')!r} "
+                         f"{'✓' if c.get('match') else '✗'}")
         elif ev == 'overlay_progress':
             now = time.time()
-            if now - _last["prog"] < 5.0:
-                return
+            if now - _last["prog"] < 5.0: return
             _last["prog"] = now
-            done  = data.get('done', 0) / (1024 * 1024)
+            done = data.get('done', 0) / (1024 * 1024)
             total = data.get('total', 0) / (1024 * 1024)
             pct = 100.0 * done / total if total > 0 else 0.0
             log.info(f"[progress] {pct:.1f}% ({done:.0f}/{total:.0f} MB)")
-        elif ev in ('overlay_show', 'overlay_hide'):
-            pass
+        elif ev in ('overlay_show', 'overlay_hide'): pass
         else:
-            if verbose:
-                log.debug(f"[{ev}] {data}")
+            if verbose: log.debug(f"[{ev}] {data}")
     return emit
 
 
 def run_headless(args):
-    """No window. Runs the same training loop as the GUI, prints to stdout."""
     emit = _headless_emit(verbose=args.debug)
-
-    # ---- credentials ----
     password = args.password or os.environ.get("CROWDGPT_PASSWORD")
     token    = args.token    or os.environ.get("CROWDGPT_TOKEN")
     if args.anon:
-        auth_token = None
-        log.info("[auth] anonymous")
+        auth_token = None; log.info("[auth] anonymous")
     elif token:
-        auth_token = token
-        log.info("[auth] using provided token")
+        auth_token = token; log.info("[auth] using provided token")
     elif args.user and password:
         log.info(f"[auth] logging in as {args.user}")
         auth_token, err = do_login(args.server, args.user, password)
         if not auth_token:
-            log.error(f"[auth] login failed: {err}")
-            return 2
+            log.error(f"[auth] login failed: {err}"); return 2
     else:
-        log.error("[auth] need --token, --user + --password, or --anon "
-                  "(password may also come from $CROWDGPT_PASSWORD)")
-        return 2
+        log.error("[auth] need --token, --user + --password, or --anon"); return 2
 
     log.info(f"[cfg] server={args.server} rounds={args.rounds or '∞'} "
              f"vram={args.vram_gb or 'auto'}GB backend={args.backend or 'auto'}")
 
-    # ---- backend / VRAM ----
     selected = args.backend if args.backend and args.backend != "auto" else None
     if selected is None:
         bf = CHECKPOINT_DIR / "selected_backend.json"
         try:
             if bf.exists():
                 saved = json.loads(bf.read_text()).get("backend")
-                if saved and get_available_backends().get(saved, False):
-                    selected = saved
-        except Exception:
-            pass
-    if selected is None:
-        selected = get_best_default_backend()
+                if saved and get_available_backends().get(saved, False): selected = saved
+        except Exception: pass
+    if selected is None: selected = get_best_default_backend()
 
-    try:
-        _do_backend_setup(selected, args.vram_gb, emit)
+    try: _do_backend_setup(selected, args.vram_gb, emit)
     except Exception as e:
         log.error(f"[backend] setup failed: {e}")
-        import traceback
-        log.error(traceback.format_exc())
-        return 3
+        import traceback; log.error(traceback.format_exc()); return 3
 
-    # ---- tokenizer (for readable previews) ----
     if not args.no_tokenizer:
         log.info("[tokenizer] loading (skippable with --no-tokenizer)...")
         _load_tokenizer_worker()
-    else:
-        log.info("[tokenizer] skipped (--no-tokenizer)")
+    else: log.info("[tokenizer] skipped (--no-tokenizer)")
 
-    # ---- signal handling ----
     stop_event = threading.Event()
     def _on_signal(signum, frame):
         log.info("[signal] stop requested; finishing current micro-step...")
@@ -3261,25 +2566,25 @@ def run_headless(args):
     for sig_name in ("SIGINT", "SIGTERM"):
         s = getattr(signal, sig_name, None)
         if s is not None:
-            try:
-                signal.signal(s, _on_signal)
-            except (ValueError, OSError):
-                pass
+            try: signal.signal(s, _on_signal)
+            except (ValueError, OSError): pass
 
-    # ---- dry-run ----
     if args.dry_run:
         log.info("[dry-run] fetching task metadata...")
         h = {"Authorization": f"Bearer {auth_token}"} if auth_token else {}
         md = fetch_task_metadata(args.server, h, stop_event, emit)
         if md is None:
-            log.error("[dry-run] no task available")
-            return 5
+            log.error("[dry-run] no task available"); return 5
+        cc_cfg = md.get("crossCheck") or {}
         log.info(f"[dry-run] task OK: taskId={md.get('taskId')} "
                  f"round={md.get('current_round') or md.get('round')} "
-                 f"step={md.get('globalStep')}")
+                 f"step={md.get('globalStep')} "
+                 f"cohort_enabled={bool(cc_cfg.get('enabled'))} "
+                 f"target_seed={cc_cfg.get('targetSeed')} "
+                 f"target_steps={cc_cfg.get('targetLocalSteps')} "
+                 f"target_bs={cc_cfg.get('targetBatchSize')}")
         return 0
 
-    # ---- rounds ----
     max_rounds = args.rounds if args.rounds and args.rounds > 0 else 0
     round_count = 0
     while not stop_event.is_set():
@@ -3288,30 +2593,21 @@ def run_headless(args):
         log.info("=" * 60)
         log.info(f"Round {round_count}" + (f"/{max_rounds}" if max_rounds else ""))
         log.info("=" * 60)
-        try:
-            run_single_round_wrapper(args.server, auth_token, stop_event, emit)
+        try: run_single_round_wrapper(args.server, auth_token, stop_event, emit)
         except KeyboardInterrupt:
-            stop_event.set()
-            break
+            stop_event.set(); break
         except Exception as e:
             import traceback
             log.error(f"Round failed: {e}")
             log.error(traceback.format_exc()[-2000:])
 
-        if stop_event.is_set():
-            break
+        if stop_event.is_set(): break
         if max_rounds and round_count >= max_rounds:
-            log.info(f"Completed {round_count} round(s); exiting.")
-            break
-
-        if not args.no_update:
-            _check_updates_between_rounds(emit)
-        if stop_event.is_set():
-            break
-
+            log.info(f"Completed {round_count} round(s); exiting."); break
+        if not args.no_update: _check_updates_between_rounds(emit)
+        if stop_event.is_set(): break
         log.info("Round complete; next round in 10s (Ctrl+C to stop)...")
         stop_event.wait(timeout=10.0)
-
     log.info("Bye.")
     return 0
 
@@ -3325,116 +2621,71 @@ def run_gui(args):
     api = Api()
     start_tokenizer_loader()
 
-    kwargs = {
-        "js_api": api,
-        "width": 1000,
-        "height": 720,
-        "min_size": (320, 240),
-    }
+    kwargs = {"js_api": api, "width": 1000, "height": 720, "min_size": (320, 240)}
 
     html_path = Path(__file__).resolve().parent / "client.html"
     tmp_html = html_path.with_name(html_path.name + ".new")
 
     try:
-        # Migration path for older installations that updated only client.py.
         if not html_path.is_file():
-            log.info(
-                "client.html is missing; downloading the GUI interface..."
-            )
-
+            log.info("client.html is missing; downloading the GUI interface...")
             response = requests.get(HTML_URL, timeout=60)
             response.raise_for_status()
             downloaded_html = response.text
-
-            if (
-                "<html" not in downloaded_html[:500].lower()
-                or "__LOGO__" not in downloaded_html
-                or "__LOGO_DARK__" not in downloaded_html
-                or "__VERSION__" not in downloaded_html
-            ):
-                raise ValueError(
-                    "Downloaded client.html failed validation"
-                )
-
-            # Write to a temporary file, then replace the destination.
+            if ("<html" not in downloaded_html[:500].lower()
+                    or "__LOGO__" not in downloaded_html
+                    or "__LOGO_DARK__" not in downloaded_html
+                    or "__VERSION__" not in downloaded_html):
+                raise ValueError("Downloaded client.html failed validation")
             try:
-                tmp_html.write_text(
-                    downloaded_html,
-                    encoding="utf-8",
-                )
+                tmp_html.write_text(downloaded_html, encoding="utf-8")
                 os.replace(str(tmp_html), str(html_path))
             finally:
-                try:
-                    tmp_html.unlink(missing_ok=True)
-                except OSError:
-                    pass
-
+                try: tmp_html.unlink(missing_ok=True)
+                except OSError: pass
         html_template = html_path.read_text(encoding="utf-8")
-
         if "<html" not in html_template[:500].lower():
             raise ValueError("Local client.html is invalid")
-
-        if (
-            "__LOGO__" not in html_template
-            or "__LOGO_DARK__" not in html_template
-            or "__VERSION__" not in html_template
-        ):
-            raise ValueError(
-                "Local client.html is missing required template placeholders"
-            )
-
+        if ("__LOGO__" not in html_template
+                or "__LOGO_DARK__" not in html_template
+                or "__VERSION__" not in html_template):
+            raise ValueError("Local client.html is missing required placeholders")
     except Exception as e:
         log.error(f"Could not load/download {html_path}: {e}")
-        log.error(
-            "Keep client.py and client.html in the same directory, "
-            "or check your internet connection."
-        )
+        log.error("Keep client.py and client.html in the same directory, "
+                  "or check your internet connection.")
         return 4
 
-    html_out = (
-        html_template
-        .replace("__LOGO__", LOGO_URI_LIGHT)
-        .replace("__LOGO_DARK__", LOGO_URI_DARK)
-        .replace("__VERSION__", CLIENT_VERSION)
-    )
+    html_out = (html_template
+                .replace("__LOGO__", LOGO_URI_LIGHT)
+                .replace("__LOGO_DARK__", LOGO_URI_DARK)
+                .replace("__VERSION__", CLIENT_VERSION))
 
     window = _create_window_safe("CrowdGPT", html_out, kwargs)
     api.window = window
 
-    try:
-        webview.start(startup, debug=False, **_start_icon_kwargs())
-    except TypeError:
-        webview.start(startup, debug=False)
-
+    try: webview.start(startup, debug=False, **_start_icon_kwargs())
+    except TypeError: webview.start(startup, debug=False)
     return 0
 
 
-# =========================================================================
-# Entry point
-# =========================================================================
+# =================== ENTRY POINT ===================
 if __name__ == "__main__":
     args = parse_args()
-    if args.debug:
-        logging.getLogger().setLevel(logging.DEBUG)
+    if args.debug: logging.getLogger().setLevel(logging.DEBUG)
 
-    print(f"CrowdGPT client v{CLIENT_VERSION}"
-          + (" [headless]" if args.headless else ""), flush=True)
+    print(f"CrowdGPT client v{CLIENT_VERSION}" + (" [headless]" if args.headless else ""), flush=True)
 
     if sys.platform == "win32":
-        try:
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Vxtzq.CrowdGPT.1")
-        except Exception:
-            pass
+        try: ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Vxtzq.CrowdGPT.1")
+        except Exception: pass
 
     if not args.no_update:
         try:
             if check_for_update():
                 print("Update applied. Restarting...", flush=True)
                 _restart_self()
-        except Exception as e:
-            log.warning(f"Auto-update check error: {e}")
+        except Exception as e: log.warning(f"Auto-update check error: {e}")
 
-    if args.headless:
-        sys.exit(run_headless(args))
-    else:
-        sys.exit(run_gui(args))
+    if args.headless: sys.exit(run_headless(args))
+    else: sys.exit(run_gui(args))

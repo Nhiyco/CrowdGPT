@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """
-CrowdGPT GUI Client v1.3
+CrowdGPT GUI Client v1.4
 
-v1.3 changes:
+v1.4 changes:
+  - Adds cc_autocast to cohort invariants (prevents dtype divergence)
+  - Aborts round cleanly on accel errors in cohort mode (prevents false outliers)
+  - Secures auto-update with SHA-256 integrity checks from version.txt
+  - Fixes coordinator fallback crash (ValueError: too many values to unpack)
   - Honors crossCheck cohort mode (targetSeed, targetLocalSteps, targetBatchSize)
   - Skips calibration in cohort mode (avoids inconsistent optimizer state)
   - Forces slot=0 in cohort mode (identical data for all cohort members)
@@ -46,7 +50,7 @@ sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='repla
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s', datefmt='%H:%M:%S')
 log = logging.getLogger(__name__)
 
-CLIENT_VERSION = "1.3"
+CLIENT_VERSION = "1.4"
 VERSION_URL = "https://raw.githubusercontent.com/Vxtzq/CrowdGPT/main/docs/version.txt"
 CLIENT_URL  = "https://raw.githubusercontent.com/Vxtzq/CrowdGPT/main/client.py"
 HTML_URL    = "https://raw.githubusercontent.com/Vxtzq/CrowdGPT/main/client.html"
@@ -64,13 +68,20 @@ def _fetch_remote_version():
     try:
         r = requests.get(VERSION_URL, timeout=5)
         r.raise_for_status()
-        line = r.text.strip().splitlines()[0].strip()
-        return line or None
+        lines = [l.strip() for l in r.text.strip().splitlines() if l.strip()]
+        if not lines: return None, None, None
+        version = lines[0]
+        hash_py = None
+        hash_html = None
+        for l in lines[1:]:
+            if l.startswith("sha256_clientpy:"): hash_py = l.split(":", 1)[1].strip().lower()
+            if l.startswith("sha256_clienthtml:"): hash_html = l.split(":", 1)[1].strip().lower()
+        return version, hash_py, hash_html
     except Exception:
-        return None
+        return None, None, None
 
 
-def _download_new_client(expected_version):
+def _download_new_client(expected_version, expected_hash_py=None, expected_hash_html=None):
     try:
         response = requests.get(CLIENT_URL, timeout=60)
         response.raise_for_status()
@@ -81,6 +92,18 @@ def _download_new_client(expected_version):
     except Exception as e:
         log.warning(f"Could not download client update: {e}")
         return None
+
+    # Security: Verify SHA-256 integrity to prevent arbitrary code execution / transit corruption
+    if expected_hash_py:
+        actual_hash = hashlib.sha256(code.encode('utf-8')).hexdigest()
+        if actual_hash != expected_hash_py:
+            log.warning(f"🚨 client.py SHA256 mismatch! Expected {expected_hash_py}, got {actual_hash}. Aborting update.")
+            return None
+    if expected_hash_html:
+        actual_hash = hashlib.sha256(html.encode('utf-8')).hexdigest()
+        if actual_hash != expected_hash_html:
+            log.warning(f"🚨 client.html SHA256 mismatch! Expected {expected_hash_html}, got {actual_hash}. Aborting update.")
+            return None
 
     try:
         compile(code, "client.py", "exec")
@@ -155,11 +178,11 @@ def check_for_update():
     if getattr(torch.version, "hip", None) and os.environ.get("CROWDGPT_ROCM_AUTOUPDATE") != "1":
         log.info("[ROCM-FIX] Auto-update paused; preserving local ROCm fix.")
         return False
-    remote = _fetch_remote_version()
+    remote, hash_py, hash_html = _fetch_remote_version()
     if not remote: return False
     if _parse_version(remote) <= _parse_version(CLIENT_VERSION): return False
     log.info(f"Update available: {CLIENT_VERSION} -> {remote}")
-    downloaded = _download_new_client(remote)
+    downloaded = _download_new_client(remote, hash_py, hash_html)
     if downloaded is None:
         log.warning("Update download or validation failed."); return False
     if not _apply_update(downloaded):
@@ -1798,7 +1821,7 @@ def _cpu_calibration_batch(x, y, full_sl):
 
 # === NEW: parse task metadata + cross-check config ===
 def _parse_task_meta(md, emit):
-    """Returns (tid, gs, sl, cohort_mode, cc_seed, cc_steps, cc_bs, cc_accum)."""
+    """Returns (tid, gs, sl, cohort_mode, cc_seed, cc_steps, cc_bs, cc_accum, cc_autocast)."""
     tid = md.get("taskId")
     gs = md.get("globalStep")
     sl = MAX_SEQ_LEN
@@ -1808,14 +1831,17 @@ def _parse_task_meta(md, emit):
     cc_steps = cc_cfg.get("targetLocalSteps") if cohort_mode else None
     cc_bs = cc_cfg.get("targetBatchSize") if cohort_mode else None
     cc_accum = cc_cfg.get("targetAccumSteps") if cohort_mode else None
-    if cohort_mode and (cc_seed is None or cc_steps is None or cc_bs is None or cc_accum is None):
+    cc_autocast = cc_cfg.get("targetAutocast") if cohort_mode else None
+    if cohort_mode and (cc_seed is None or cc_steps is None or cc_bs is None
+                        or cc_accum is None or cc_autocast is None):
         emit('log', "⚠️ Cross-check metadata incomplete; disabling cohort mode for this round")
-        cohort_mode = False; cc_seed = cc_steps = cc_bs = cc_accum = None
+        cohort_mode = False; cc_seed = cc_steps = cc_bs = cc_accum = cc_autocast = None
     if cohort_mode:
-        emit('log', f"[COHORT] ENABLED: seed={cc_seed} steps={cc_steps} bs_target={cc_bs} accum={cc_accum}")
+        emit('log', f"[COHORT] ENABLED: seed={cc_seed} steps={cc_steps} "
+                    f"bs_target={cc_bs} accum={cc_accum} autocast={cc_autocast}")
     else:
         emit('log', "[COHORT] disabled (server will use Krum for this shard)")
-    return tid, gs, sl, cohort_mode, cc_seed, cc_steps, cc_bs, cc_accum
+    return tid, gs, sl, cohort_mode, cc_seed, cc_steps, cc_bs, cc_accum, cc_autocast
 
 
 # =================== ROUND ===================
@@ -1833,12 +1859,12 @@ def run_single_round_wrapper(srv, at, se, emit):
     tt = 0
     tid = ""
     tried_cpu_fallback = False
-    cohort_mode = False; cc_seed = cc_steps = cc_bs = None
+    cohort_mode = False; cc_seed = cc_steps = cc_bs = cc_accum = cc_autocast = None
     try:
         emit('log', "Fetching task metadata...")
         md = fetch_task_metadata(srv, h, se, emit)
         if md is None: return
-        tid, gs, sl, cohort_mode, cc_seed, cc_steps, cc_bs, cc_accum = _parse_task_meta(md, emit)
+        tid, gs, sl, cohort_mode, cc_seed, cc_steps, cc_bs, cc_accum, cc_autocast = _parse_task_meta(md, emit)
         if not tid:
             emit("log", "Task metadata missing taskId."); return
 
@@ -1865,7 +1891,7 @@ def run_single_round_wrapper(srv, at, se, emit):
             if md2 is None: return
             md = md2
             # RE-PARSE in case the fallback returned different metadata
-            tid, gs, sl, cohort_mode, cc_seed, cc_steps, cc_bs, cc_accum = _parse_task_meta(md, emit)
+            tid, gs, sl, cohort_mode, cc_seed, cc_steps, cc_bs, cc_accum, cc_autocast = _parse_task_meta(md, emit)
             if not tid:
                 emit("log", "Coordinator task metadata missing taskId."); return
             bbl = EXPECTED_MODEL_SIZE * 2
@@ -1894,14 +1920,12 @@ def run_single_round_wrapper(srv, at, se, emit):
         )
 
         # ---- Batch size (capped in cohort mode) ----
-        # ---- Batch size (capped in cohort mode) ----
         bs = recommend_batch_size(sl)
         if cohort_mode and cc_bs and int(cc_bs) > 0:
             bs = min(bs, int(cc_bs))
             emit('log', f"[COHORT] bs = min(local, {cc_bs}) = {bs}")
 
         # ---- Critical invariant: if we can't hit target bs, opt out of cohort ----
-        # Otherwise different accumulation cadence vs peers → guaranteed false positive.
         if cohort_mode and int(bs) < int(cc_bs):
             emit('log', f"[COHORT] local bs={bs} < target={cc_bs}; cannot maintain invariants — "
                         f"FALLING BACK to non-cohort mode (submit with crossCheckUsed=false)")
@@ -1943,8 +1967,6 @@ def run_single_round_wrapper(srv, at, se, emit):
         def _on_step_down(_ladder):
             nonlocal ob, oe
             if cohort_mode:
-                # OOM mid-cohort would force optimizer rebuild → momentum reset → divergence
-                # vs peers. Abort the round cleanly; retry next round.
                 raise RuntimeError(
                     "OOM during cohort training — aborting round to preserve cross-check integrity"
                 )
@@ -1960,13 +1982,21 @@ def run_single_round_wrapper(srv, at, se, emit):
             emit('log', '[ROCM-FIX] Attention: SDPA=' +
                          ('enabled' if os.environ.get('CROWDGPT_ROCM_SDPA', '1') != '0' else 'disabled'))
 
+        # NEW: verify autocast matches server target.
+        if cohort_mode and cc_autocast and cc_autocast != "any":
+            wants_bf16 = (cc_autocast == "bf16")
+            if wants_bf16 != bool(ua):
+                emit('log', f"[COHORT] autocast mismatch: server wants {cc_autocast}, "
+                            f"backend {train_backend} gives {'bf16' if ua else 'fp32'} — "
+                            f"opting out (submit with crossCheckUsed=false)")
+                cohort_mode = False
+                cc_seed = cc_steps = cc_bs = cc_accum = None
+
         # ---- Calibration (SKIPPED in cohort mode) ----
         cs_ = time.time()
         target_micro_steps = 100
 
         if cohort_mode:
-            # CRITICAL: any calibration with random seed → different starting weights
-            # → guaranteed false positives. Skip entirely; go straight to fixed-count training.
             emit('log', f"[COHORT] Skipping calibration; will run exactly {int(cc_steps)} micro-steps")
             target_micro_steps = int(cc_steps)
             emit('status', 'training')
@@ -1995,6 +2025,9 @@ def run_single_round_wrapper(srv, at, se, emit):
                     lo, cards = _train_step_safe(model, step_x, step_y, step_sl, ua, ad, ls,
                                                  preview=want_preview, ladder=ladder, emit=emit)
                 except RuntimeError as re:
+                    if cohort_mode:
+                        emit('log', f"[COHORT] ⚠️ accel error in calibration — aborting round: {str(re)[:120]}")
+                        raise
                     if (not tried_cpu_fallback) and _is_accel_error(str(re)):
                         emit('log', f"⚠️ {train_backend} op failed: {str(re)[:120]}")
                         emit('log', "🔻 Falling back to CPU-only model...")
@@ -2084,8 +2117,6 @@ def run_single_round_wrapper(srv, at, se, emit):
                 if not _inner_continue(): break
                 if ds.needs_new_subchunk(): ds.advance(srv, "bf16")
 
-                # Fixed seed in cohort mode (NO mi — accumulation cadence must not affect seed);
-                # existing hash-seed otherwise.
                 if cohort_mode:
                     sd = int(cc_seed) * 100_003 + micro_step * 1009
                 else:
@@ -2098,6 +2129,9 @@ def run_single_round_wrapper(srv, at, se, emit):
                     lo, cards = _train_step_safe(model, x, y, sl, ua, ad, ls,
                                                  preview=want_preview, ladder=ladder, emit=emit)
                 except RuntimeError as re:
+                    if cohort_mode:
+                        emit('log', f"[COHORT] ⚠️ accel error in training — aborting round: {str(re)[:120]}")
+                        raise
                     if (not tried_cpu_fallback) and _is_accel_error(str(re)):
                         emit('log', f"⚠️ {train_backend} op failed: {str(re)[:120]}")
                         emit('log', "🔻 Falling back to CPU-only model...")
@@ -2149,15 +2183,11 @@ def run_single_round_wrapper(srv, at, se, emit):
         if se.is_set():
             emit('log', "Stopped by user. Skipping upload."); return
 
-        # Cohort invariant: must complete EXACTLY cc_steps to be comparable to peers.
-        # If interrupted (round timer, ultimatum, etc), don't submit under cohort flag.
         if cohort_mode and int(micro_step) != int(cc_steps):
             emit('log', f"[COHORT] ABORT: only completed {micro_step}/{cc_steps} steps; "
                         f"cannot submit as cohort member (would cause false outlier). "
                         f"Falling back to non-cohort submission.")
             cohort_mode = False
-            # Keep cc_seed/steps for reporting but clear crossCheckUsed
-            # (submit_extra computes crossCheckUsed from cohort_mode)
 
         fl = float(lval) if lval else 10.0
         emit('log', f"Done: {micro_step} micro-steps, loss {fl:.4f}")

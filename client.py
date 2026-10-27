@@ -43,6 +43,7 @@ log = logging.getLogger(__name__)
 CLIENT_VERSION = "1.1"
 VERSION_URL = "https://raw.githubusercontent.com/Vxtzq/CrowdGPT/main/docs/version.txt"
 CLIENT_URL  = "https://raw.githubusercontent.com/Vxtzq/CrowdGPT/main/client.py"
+HTML_URL = "https://raw.githubusercontent.com/Vxtzq/CrowdGPT/main/client.html"
 
 
 def _parse_version(v):
@@ -64,69 +65,182 @@ def _fetch_remote_version():
 
 
 def _download_new_client(expected_version):
+    """Download and validate both files before applying an update."""
     try:
-        r = requests.get(CLIENT_URL, timeout=60)
-        r.raise_for_status()
-        code = r.text
-    except Exception:
+        response = requests.get(CLIENT_URL, timeout=60)
+        response.raise_for_status()
+        code = response.text
+
+        response = requests.get(HTML_URL, timeout=60)
+        response.raise_for_status()
+        html = response.text
+
+    except Exception as e:
+        log.warning(f"Could not download client update: {e}")
         return None
+
+    # Validate Python syntax before replacing the running script.
     try:
         compile(code, "client.py", "exec")
-    except SyntaxError:
+    except (SyntaxError, ValueError, TypeError) as e:
+        log.warning(f"Downloaded client.py is invalid: {e}")
         return None
-    markers = [f'CLIENT_VERSION = "{expected_version}"', f"CLIENT_VERSION = '{expected_version}'"]
-    if not any(m in code for m in markers):
+
+    # Ensure the downloaded script matches version.txt.
+    markers = (
+        f'CLIENT_VERSION = "{expected_version}"',
+        f"CLIENT_VERSION = '{expected_version}'",
+    )
+    if not any(marker in code for marker in markers):
+        log.warning(
+            "Downloaded client.py version does not match version.txt"
+        )
         return None
-    return code
+
+    # Validate the HTML document and required template placeholders.
+    if (
+        not html.lstrip().lower().startswith("<!doctype html")
+        and "<html" not in html[:500].lower()
+    ):
+        log.warning("Downloaded client.html does not look like HTML")
+        return None
+
+    required_placeholders = (
+        "__LOGO__",
+        "__LOGO_DARK__",
+        "__VERSION__",
+    )
+    missing = [
+        placeholder
+        for placeholder in required_placeholders
+        if placeholder not in html
+    ]
+    if missing:
+        log.warning(
+            "Downloaded client.html is missing placeholders: "
+            + ", ".join(missing)
+        )
+        return None
+
+    return code, html
 
 
-def _apply_update(new_code):
-    try:
-        current = Path(__file__).resolve()
-    except Exception:
+def _apply_update(new_files):
+    """Replace client.py and client.html, restoring backups on failure."""
+    if (
+        not isinstance(new_files, tuple)
+        or len(new_files) != 2
+        or not all(isinstance(item, str) for item in new_files)
+    ):
+        log.error("Invalid update payload")
         return False
-    backup = current.with_name(current.name + ".bak")
-    tmp = current.with_name(current.name + ".new")
+
+    code, html = new_files
+    base = Path(__file__).resolve().parent
+
+    targets = {
+        base / "client.py": code,
+        base / "client.html": html,
+    }
+
+    backups = {}
+    temps = {}
+    replaced = []
+
     try:
-        try:
-            shutil.copy2(str(current), str(backup))
-        except Exception:
-            pass
-        tmp.write_text(new_code, encoding="utf-8")
-        try:
-            st = current.stat()
-            os.chmod(str(tmp), st.st_mode)
-        except Exception:
-            pass
-        os.replace(str(tmp), str(current))
+        # Stage both files and create backups before replacing anything.
+        for target, content in targets.items():
+            if target.exists():
+                backup = target.with_name(target.name + ".bak")
+                shutil.copy2(str(target), str(backup))
+                backups[target] = backup
+
+            tmp = target.with_name(target.name + ".new")
+            tmp.write_text(content, encoding="utf-8")
+
+            if target.exists():
+                try:
+                    os.chmod(str(tmp), target.stat().st_mode)
+                except OSError:
+                    pass
+
+            temps[target] = tmp
+
+        # Replace the files only after both staged files are ready.
+        for target, tmp in temps.items():
+            os.replace(str(tmp), str(target))
+            replaced.append(target)
+
+        log.info("Successfully applied client.py and client.html update")
         return True
-    except Exception:
-        try:
-            if tmp.exists():
-                tmp.unlink()
-        except Exception:
-            pass
+
+    except Exception as e:
+        log.error(f"Could not apply update: {e}; attempting rollback")
+
+        rollback_failed = False
+
+        for target in reversed(replaced):
+            try:
+                backup = backups.get(target)
+
+                if backup is not None and backup.exists():
+                    os.replace(str(backup), str(target))
+                elif target.exists():
+                    target.unlink()
+
+            except Exception as rollback_error:
+                rollback_failed = True
+                log.error(
+                    f"Could not restore {target.name}: {rollback_error}"
+                )
+
+        if rollback_failed:
+            log.error(
+                "Rollback was incomplete. Check client.py, client.html "
+                "and their .bak files before restarting."
+            )
+
         return False
+
+    finally:
+        for tmp in temps.values():
+            try:
+                tmp.unlink(missing_ok=True)
+            except Exception:
+                pass
 
 
 def check_for_update():
-    # Keep this local ROCm compatibility fix from being silently overwritten.
-    # Opt in to upstream updates with CROWDGPT_ROCM_AUTOUPDATE=1.
-    if getattr(torch.version, "hip", None) and os.environ.get("CROWDGPT_ROCM_AUTOUPDATE") != "1":
-        log.info("[ROCM-FIX] Auto-update paused; preserving local ROCm fix.")
+    """Check for a newer release and safely apply the downloaded files."""
+    # Preserve the local ROCm compatibility fix unless explicitly opted in.
+    if (
+        getattr(torch.version, "hip", None)
+        and os.environ.get("CROWDGPT_ROCM_AUTOUPDATE") != "1"
+    ):
+        log.info(
+            "[ROCM-FIX] Auto-update paused; preserving local ROCm fix."
+        )
         return False
+
     remote = _fetch_remote_version()
     if not remote:
         return False
+
     if _parse_version(remote) <= _parse_version(CLIENT_VERSION):
         return False
+
     log.info(f"Update available: {CLIENT_VERSION} -> {remote}")
-    new_code = _download_new_client(remote)
-    if not new_code:
+
+    downloaded = _download_new_client(remote)
+    if downloaded is None:
+        log.warning("Update download or validation failed.")
         return False
-    if not _apply_update(new_code):
+
+    if not _apply_update(downloaded):
+        log.warning("Update could not be applied.")
         return False
-    log.info(f"client.py updated to {remote}")
+
+    log.info(f"client.py and client.html updated to {remote}")
     return True
 
 
@@ -3211,22 +3325,87 @@ def run_gui(args):
     api = Api()
     start_tokenizer_loader()
 
-    kwargs = {"js_api": api, "width": 1000, "height": 720, "min_size": (320, 240)}
-    from pathlib import Path
+    kwargs = {
+        "js_api": api,
+        "width": 1000,
+        "height": 720,
+        "min_size": (320, 240),
+    }
 
     html_path = Path(__file__).resolve().parent / "client.html"
-    HTML = html_path.read_text(encoding="utf-8")
-    html_out = (HTML.replace("__LOGO__", LOGO_URI_LIGHT)
-                    .replace("__LOGO_DARK__", LOGO_URI_DARK)
-                    .replace("__VERSION__", CLIENT_VERSION))
-    
+    tmp_html = html_path.with_name(html_path.name + ".new")
+
+    try:
+        # Migration path for older installations that updated only client.py.
+        if not html_path.is_file():
+            log.info(
+                "client.html is missing; downloading the GUI interface..."
+            )
+
+            response = requests.get(HTML_URL, timeout=60)
+            response.raise_for_status()
+            downloaded_html = response.text
+
+            if (
+                "<html" not in downloaded_html[:500].lower()
+                or "__LOGO__" not in downloaded_html
+                or "__LOGO_DARK__" not in downloaded_html
+                or "__VERSION__" not in downloaded_html
+            ):
+                raise ValueError(
+                    "Downloaded client.html failed validation"
+                )
+
+            # Write to a temporary file, then replace the destination.
+            try:
+                tmp_html.write_text(
+                    downloaded_html,
+                    encoding="utf-8",
+                )
+                os.replace(str(tmp_html), str(html_path))
+            finally:
+                try:
+                    tmp_html.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+        html_template = html_path.read_text(encoding="utf-8")
+
+        if "<html" not in html_template[:500].lower():
+            raise ValueError("Local client.html is invalid")
+
+        if (
+            "__LOGO__" not in html_template
+            or "__LOGO_DARK__" not in html_template
+            or "__VERSION__" not in html_template
+        ):
+            raise ValueError(
+                "Local client.html is missing required template placeholders"
+            )
+
+    except Exception as e:
+        log.error(f"Could not load/download {html_path}: {e}")
+        log.error(
+            "Keep client.py and client.html in the same directory, "
+            "or check your internet connection."
+        )
+        return 4
+
+    html_out = (
+        html_template
+        .replace("__LOGO__", LOGO_URI_LIGHT)
+        .replace("__LOGO_DARK__", LOGO_URI_DARK)
+        .replace("__VERSION__", CLIENT_VERSION)
+    )
 
     window = _create_window_safe("CrowdGPT", html_out, kwargs)
     api.window = window
+
     try:
         webview.start(startup, debug=False, **_start_icon_kwargs())
     except TypeError:
         webview.start(startup, debug=False)
+
     return 0
 
 

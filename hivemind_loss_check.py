@@ -185,9 +185,10 @@ def heldout_windows(n_tokens: int, window: int, n: int, seed: int) -> list[int]:
 
 
 def window_losses(model: nn.Module, tokens: np.ndarray, starts: Sequence[int], window: int, *, device: torch.device | str = "cpu",
-                  dtype: torch.dtype = torch.float32, batch: int = 1) -> list[float]:
+                  dtype: torch.dtype = torch.float32, batch: int = 1, stop: Callable[[], bool] | None = None) -> list[float]:
     """Mean next-token cross-entropy (nats) of each window: input tokens[s : s+window-1], targets tokens[s+1 : s+window],
-    the same split as `StreamingShardDataset.get_batch`."""
+    the same split as `StreamingShardDataset.get_batch`. `stop()` is asked before each batch; True raises `Interrupted`
+    (so a shared GPU can be handed back to inference between windows)."""
     vocab = int(getattr(model, "config", {}).get("vocabSize", 0)) or None
     arr = np.asarray(tokens)
     if vocab is not None and len(arr) and int(arr.max()) >= vocab:
@@ -196,12 +197,18 @@ def window_losses(model: nn.Module, tokens: np.ndarray, starts: Sequence[int], w
     out: list[float] = []
     with torch.inference_mode():
         for i in range(0, len(starts), batch):
+            if stop is not None and stop():
+                raise Interrupted(f"stopped after {len(out)} of {len(starts)} windows")
             chunk = np.stack([arr[s: s + window] for s in starts[i: i + batch]]).astype(np.int64)
             t = torch.from_numpy(chunk).to(device)
             logits = model(t[:, :-1]).float()
             ce = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), t[:, 1:].reshape(-1), reduction="none")
             out.extend(float(v) for v in ce.view(t.shape[0], -1).mean(dim=1).cpu())
     return out
+
+
+class Interrupted(RuntimeError):
+    """The evaluation was stopped on request before it finished."""
 
 
 # ---------------------------------------------------------------------------------------------------------- the receipt
@@ -272,14 +279,14 @@ def _replace(r: LossCheckReceipt, **kw: object) -> LossCheckReceipt:
 
 def make_receipt(*, evaluator_id: str, key: bytes, base: torch.Tensor, candidate: torch.Tensor, heldout: np.ndarray, window: int, n: int,
                  seed: int, model_factory: Callable[[], nn.Module], device: torch.device | str, dtype: torch.dtype = torch.float32,
-                 round_id: str = "", batch: int = 1) -> LossCheckReceipt:
+                 round_id: str = "", batch: int = 1, stop: Callable[[], bool] | None = None) -> LossCheckReceipt:
     """Evaluator side: losses of the base and the candidate on the same n windows, signed."""
     starts = heldout_windows(len(heldout), window, n, seed)
     losses = []
     for flat in (base, candidate):
         m = model_factory()
         m.load_flat(flat)
-        losses.append(tuple(window_losses(m, heldout, starts, window, device=device, dtype=dtype, batch=batch)))
+        losses.append(tuple(window_losses(m, heldout, starts, window, device=device, dtype=dtype, batch=batch, stop=stop)))
         del m
         if str(device).startswith("cuda"):
             torch.cuda.empty_cache()
@@ -396,119 +403,3 @@ def cpu_recompute_fn(model_factory: Callable[[], nn.Module], base: torch.Tensor,
         return window_losses(m, heldout, starts, window, device="cpu", dtype=dtype)
 
     return run
-
-
-# ------------------------------------------------------------------------------------------------------------------ cli
-
-
-def _parse_hf_spec(spec: str) -> tuple[str, str, str]:
-    """hf://OWNER/NAME@REVISION/FILE -> (repo, revision, file). The revision is required: no moving targets."""
-    repo, _, rest = spec[len("hf://"):].partition("@")
-    rev, _, filename = rest.partition("/")
-    if not repo or not rev or not filename:
-        raise SystemExit(f"hf:// spec needs OWNER/NAME@REVISION/FILE, got {spec!r}")
-    return repo, rev, filename
-
-
-def _resolve(spec: str) -> Path:
-    if not spec.startswith("hf://"):
-        return Path(spec)
-    from huggingface_hub import hf_hub_download
-
-    repo, rev, filename = _parse_hf_spec(spec)
-    return Path(hf_hub_download(repo, filename, revision=rev))
-
-
-def _load_tokens(path: Path) -> np.ndarray:
-    return np.frombuffer(path.read_bytes(), dtype=TOKEN_DTYPE)
-
-
-def _pick_dtype(name: str) -> torch.dtype:
-    return {"float32": torch.float32, "bfloat16": torch.bfloat16, "float16": torch.float16}[name]
-
-
-def _main(argv: list[str] | None = None) -> int:
-    import argparse
-    import time
-
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    sub = ap.add_subparsers(dest="cmd", required=True)
-    e = sub.add_parser("evaluate")
-    e.add_argument("--base", required=True)
-    e.add_argument("--candidate", required=True)
-    e.add_argument("--heldout", required=True)
-    e.add_argument("--evaluator-id", required=True)
-    e.add_argument("--key-file", required=True)
-    e.add_argument("--out", required=True)
-    e.add_argument("--window", type=int, default=2048)
-    e.add_argument("--n", type=int, default=32)
-    e.add_argument("--seed", type=int, required=True, help="published by the backend for this round")
-    e.add_argument("--round-id", default="")
-    e.add_argument("--device", default="cuda")
-    e.add_argument("--dtype", default="float32", choices=("float32", "bfloat16", "float16"))
-    e.add_argument("--batch", type=int, default=1)
-    v = sub.add_parser("verify")
-    v.add_argument("--receipt", required=True)
-    v.add_argument("--base", required=True)
-    v.add_argument("--candidate", required=True)
-    v.add_argument("--heldout", required=True)
-    v.add_argument("--evaluator", action="append", required=True, help="NAME=KEYFILE, repeatable")
-    v.add_argument("--secret-file", required=True)
-    v.add_argument("--k", type=int, default=2)
-    v.add_argument("--tol", type=float, default=2e-3)
-    v.add_argument("--max-regression", type=float, default=0.0)
-    v.add_argument("--min-windows", type=int, default=8)
-    v.add_argument("--threads", type=int, default=2)
-    c = sub.add_parser("calibrate")
-    c.add_argument("--base", required=True)
-    c.add_argument("--heldout", required=True)
-    c.add_argument("--window", type=int, default=2048)
-    c.add_argument("--n", type=int, default=2)
-    c.add_argument("--seed", type=int, default=0)
-    c.add_argument("--device", default="cuda")
-    c.add_argument("--dtype", default="float32", choices=("float32", "bfloat16", "float16"))
-    a = ap.parse_args(argv)
-    if a.cmd == "evaluate":
-        base, cand = load_flat_safetensors(_resolve(a.base)), load_flat_safetensors(_resolve(a.candidate))
-        held = _load_tokens(Path(a.heldout))
-        t = time.time()
-        r = make_receipt(evaluator_id=a.evaluator_id, key=Path(a.key_file).read_bytes().strip(), base=base, candidate=cand, heldout=held,
-                         window=a.window, n=a.n, seed=a.seed, model_factory=CrowdV1, device=a.device, dtype=_pick_dtype(a.dtype),
-                         round_id=a.round_id, batch=a.batch)
-        Path(a.out).write_text(r.to_json())
-        print(json.dumps({"out": a.out, "seconds": round(time.time() - t, 1), "mean_before": r.mean_before, "mean_after": r.mean_after,
-                          "delta": r.mean_after - r.mean_before, "commitment": r.commitment()}))
-        return 0
-    if a.cmd == "verify":
-        r = LossCheckReceipt.from_json(Path(a.receipt).read_text())
-        keys = {name: Path(path).read_bytes().strip() for item in a.evaluator for name, _, path in [item.partition("=")]}
-        base, cand = load_flat_safetensors(_resolve(a.base)), load_flat_safetensors(_resolve(a.candidate))
-        held = _load_tokens(Path(a.heldout))
-        torch.set_num_threads(a.threads)
-        t = time.time()
-        ver = verify_receipt(r, evaluator_keys=keys, server_secret=Path(a.secret_file).read_bytes().strip(),
-                             expected_base_sha256=weights_sha256(base), expected_candidate_sha256=weights_sha256(cand), heldout=held,
-                             recompute=cpu_recompute_fn(CrowdV1, base, cand, held, r.window), k=a.k, tol=a.tol,
-                             max_regression_tolerance=a.max_regression, min_windows=a.min_windows)
-        print(json.dumps({"accepted": ver.accepted, "reason": ver.reason, "loss_before": ver.loss_before, "loss_after": ver.loss_after,
-                          "delta_loss": ver.delta_loss, "checked": list(ver.checked), "detail": ver.detail, "seconds": round(time.time() - t, 1)}))
-        return 0 if ver.accepted else 1
-    flat = load_flat_safetensors(_resolve(a.base))
-    held = _load_tokens(Path(a.heldout))
-    starts = heldout_windows(len(held), a.window, a.n, a.seed)
-    m = CrowdV1()
-    m.load_flat(flat)
-    t = time.time()
-    dev = window_losses(m, held, starts, a.window, device=a.device, dtype=_pick_dtype(a.dtype))
-    dev_s = round(time.time() - t, 2)
-    t = time.time()
-    cpu = window_losses(m, held, starts, a.window, device="cpu", dtype=torch.float32)
-    cpu_s = round(time.time() - t, 2)
-    print(json.dumps({"window": a.window, "starts": starts, "device": a.device, "dtype": a.dtype, "device_seconds": dev_s,
-                      "cpu_seconds": cpu_s, "device_losses": dev, "cpu_losses": cpu,
-                      "max_abs_diff": max(abs(x - y) for x, y in zip(dev, cpu))}))
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(_main())

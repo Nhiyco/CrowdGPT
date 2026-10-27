@@ -1,4 +1,4 @@
 CrowdGPT v1.7 changelog:
-- Stronger client/server security
+- Server is now much more robust, with cross-checks between clients
 - Auto restart training after an update finally seems to work
 - RAM usage reduction on client

@@ -47,7 +47,16 @@ HTML_URL    = "https://raw.githubusercontent.com/Vxtzq/CrowdGPT/main/client.html
 class AuthRejected(Exception):
     """Raised when the coordinator rejects our bearer token (401/403)."""
     pass
+    
+class CohortAbort(Exception):
+    """Raised to abort a cohort round cleanly when invariants can't be maintained.
 
+    Under matchmaking, a pool member that can't honor targetSeed /
+    targetLocalSteps / targetBatchSize / targetAutocast would produce a delta
+    the cross-check flags as an outlier. That burns a byzantine strike on a
+    legitimate client. We abort instead and re-match next round.
+    """
+    pass
 
 def _parse_version(v):
     try:
@@ -1304,6 +1313,14 @@ def fetch_task_metadata(srv, h, se, emit):
                 emit('login_error', {'code': 'session_expired'})
                 raise AuthRejected(f"auth rejected: HTTP {r.status_code}")
             if r.headers.get("X-Status") == "wait":
+                pool_fill = r.headers.get("X-Pool-Fill")
+                pool_size_hdr = r.headers.get("X-Pool-Size")
+                if pool_fill:
+                    msg = f"⏳ Pool matchmaking {pool_fill}"
+                    if pool_size_hdr: msg += f"/{pool_size_hdr}"
+                    emit('log', msg + " (waiting for peers)")
+                try: r.close()
+                except Exception: pass
                 for _ in range(10):
                     if se.is_set(): return None
                     time.sleep(1)
@@ -1313,6 +1330,11 @@ def fetch_task_metadata(srv, h, se, emit):
                 if "json" in ct:
                     md = r.json()
                     if md.get("status") == "wait":
+                        fill = md.get("poolFill"); total = md.get("poolSize")
+                        if fill and total:
+                            emit('log', f"⏳ Pool matchmaking {fill}/{total} (waiting for peers)")
+                        elif md.get("message"):
+                            emit('log', f"⏳ {md.get('message')}")
                         for _ in range(10):
                             if se.is_set(): return None
                             time.sleep(1)
@@ -1473,7 +1495,13 @@ def fetch_task(srv, h, prec, se, emit):
                 r.close(); emit('overlay_hide', {}); emit('log', f"/fl/task HTTP {r.status_code}")
                 time.sleep(10); continue
             if r.headers.get("X-Status") == "wait":
+                pool_fill = r.headers.get("X-Pool-Fill")
+                pool_size_hdr = r.headers.get("X-Pool-Size")
                 r.close(); emit('overlay_hide', {})
+                if pool_fill:
+                    msg = f"⏳ Pool matchmaking {pool_fill}"
+                    if pool_size_hdr: msg += f"/{pool_size_hdr}"
+                    emit('log', msg + " (waiting for peers)")
                 for _ in range(10):
                     if se.is_set(): return None, None
                     time.sleep(1)
@@ -1623,8 +1651,12 @@ class DegradeLadder:
             else: return False
             break
         if self.on_step_down is not None:
-            try: self.on_step_down(self)
-            except Exception as e: log.warning(f"on_step_down failed: {e}")
+            try:
+                self.on_step_down(self)
+            except CohortAbort:
+                raise                       # propagate: abort round cleanly
+            except Exception as e:
+                log.warning(f"on_step_down failed: {e}")
         _clear_accel_cache(m.accel_device)
         return True
 
@@ -1996,11 +2028,11 @@ def run_single_round_wrapper(srv, at, se, emit):
             emit('log', f"[COHORT] bs = min(local, {cc_bs}) = {bs}")
 
         # ---- Critical invariant: if we can't hit target bs, opt out of cohort ----
+        # ---- Critical invariant: if we can't hit target bs, abort ----
         if cohort_mode and int(bs) < int(cc_bs):
             emit('log', f"[COHORT] local bs={bs} < target={cc_bs}; cannot maintain invariants — "
-                        f"FALLING BACK to non-cohort mode (submit with crossCheckUsed=false)")
-            cohort_mode = False
-            cc_seed = cc_steps = cc_bs = cc_accum = None
+                        f"aborting round (would be flagged as outlier)")
+            return
         # ---- Build model with OOM retry ----
         model = None
         while bs >= 1:
@@ -2037,7 +2069,7 @@ def run_single_round_wrapper(srv, at, se, emit):
         def _on_step_down(_ladder):
             nonlocal ob, oe
             if cohort_mode:
-                raise RuntimeError(
+                raise CohortAbort(
                     "OOM during cohort training — aborting round to preserve cross-check integrity"
                 )
             ob, oe = _build_optimizers(model, lr=1e-4)
@@ -2052,15 +2084,14 @@ def run_single_round_wrapper(srv, at, se, emit):
             emit('log', '[ROCM-FIX] Attention: SDPA=' +
                          ('enabled' if os.environ.get('CROWDGPT_ROCM_SDPA', '1') != '0' else 'disabled'))
 
-        # NEW: verify autocast matches server target.
+        # Verify autocast matches server target — abort if not.
         if cohort_mode and cc_autocast and cc_autocast != "any":
             wants_bf16 = (cc_autocast == "bf16")
             if wants_bf16 != bool(ua):
                 emit('log', f"[COHORT] autocast mismatch: server wants {cc_autocast}, "
                             f"backend {train_backend} gives {'bf16' if ua else 'fp32'} — "
-                            f"opting out (submit with crossCheckUsed=false)")
-                cohort_mode = False
-                cc_seed = cc_steps = cc_bs = cc_accum = None
+                            f"aborting round (would be flagged as outlier)")
+                return
 
         # ---- Calibration (SKIPPED in cohort mode) ----
         cs_ = time.time()
@@ -2094,6 +2125,9 @@ def run_single_round_wrapper(srv, at, se, emit):
                 try:
                     lo, cards = _train_step_safe(model, step_x, step_y, step_sl, ua, ad, ls,
                                                  preview=want_preview, ladder=ladder, emit=emit)
+                except CohortAbort as ce:
+                    emit('log', f"[COHORT] {ce} — skipping upload")
+                    return
                 except RuntimeError as re:
                     if cohort_mode:
                         emit('log', f"[COHORT] ⚠️ accel error in calibration — aborting round: {str(re)[:120]}")
@@ -2198,6 +2232,9 @@ def run_single_round_wrapper(srv, at, se, emit):
                 try:
                     lo, cards = _train_step_safe(model, x, y, sl, ua, ad, ls,
                                                  preview=want_preview, ladder=ladder, emit=emit)
+                except CohortAbort as ce:
+                    emit('log', f"[COHORT] {ce} — skipping upload")
+                    return
                 except RuntimeError as re:
                     if cohort_mode:
                         emit('log', f"[COHORT] ⚠️ accel error in training — aborting round: {str(re)[:120]}")
@@ -2264,10 +2301,9 @@ def run_single_round_wrapper(srv, at, se, emit):
             return
 
         if cohort_mode and int(micro_step) != int(cc_steps):
-            emit('log', f"[COHORT] ABORT: only completed {micro_step}/{cc_steps} steps; "
-                        f"cannot submit as cohort member (would cause false outlier). "
-                        f"Falling back to non-cohort submission.")
-            cohort_mode = False
+            emit('log', f"[COHORT] only completed {micro_step}/{cc_steps} steps; "
+                        f"aborting upload (would be flagged as outlier)")
+            return
 
         fl = float(lval) if lval else 10.0
         emit('log', f"Done: {micro_step} micro-steps, loss {fl:.4f}")
@@ -2355,7 +2391,13 @@ def run_single_round_wrapper(srv, at, se, emit):
             else:
                 r = chunked_submit_delta(srv, h, delta_path, meta, emit, se)
             if r is not None and r.status_code == 200:
-                emit("log", "Submitted successfully!")
+                try: j = r.json()
+                except Exception: j = {}
+                if j.get("duplicate"):
+                    emit("log", f"⏭️  Not counted by server ({j.get('reason','duplicate')}) — "
+                                f"trained {micro_step} steps, {tt:,} tokens this round.")
+                else:
+                    emit("log", "✅ Submitted successfully!")
             elif r is not None:
                 emit("log", f"Submit failed: {r.text[:200]}")
         except KeyboardInterrupt:

@@ -1674,6 +1674,14 @@ def _chunked_submit_once(srv, h, compressed_data, meta, emit, se, chunk_size):
             except KeyboardInterrupt: raise
             except Exception as e:
                 if "CHUNK_TOO_LARGE" in str(e): raise
+                # Respect Retry-After on 429 (server-side rate limit)
+                if getattr(e, "response", None) is not None and e.response.status_code == 429:
+                    retry_after = int(e.response.headers.get("Retry-After", "60"))
+                    emit("log", f"⏳ Server rate-limited chunk {idx+1}/{chunks}; "
+                                f"waiting {retry_after}s ({e.response.text[:120]})")
+                    time.sleep(min(retry_after, 3600))
+                    # Don't increment attempt; this is a legitimate wait, not a failure
+                    continue
                 attempt += 1
                 if se.is_set() or attempt >= MAX_CHUNK_RETRY: raise
                 emit("log", f"Chunk {idx + 1}/{chunks} retry {attempt}: {e}")

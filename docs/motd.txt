@@ -1,4 +1,5 @@
 CrowdGPT v1.8 important notice:
 - Rolled back a broken model weight
 - Fixed the aggregation logic server-side
+- Made Engrams of the model actually be used
 Check GitHub for more infos

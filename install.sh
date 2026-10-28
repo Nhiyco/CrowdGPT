@@ -562,21 +562,35 @@ fi
 
 if [[ "$GTK_WORKS" -eq 0 ]]; then
     log "GTK not available inside venv — installing PyQt6 fallback..."
-    if ! "$APP_PY" -m pip install PyQt6 PyQt6-WebEngine; then
+    # QtPy is required by pywebview's Qt backend (it's part of pywebview[qt]).
+    if ! "$APP_PY" -m pip install QtPy PyQt6 PyQt6-WebEngine; then
         warn "PyQt6 install failed. Trying PyQt5 as last resort..."
-        if ! "$APP_PY" -m pip install PyQt5 PyQtWebEngine; then
+        if ! "$APP_PY" -m pip install QtPy PyQt5 PyQtWebEngine; then
             die "Could not install any Qt backend. pywebview needs GTK or Qt."
         fi
     fi
     ok "Qt backend installed"
 fi
 
+# Import the backend modules, not just `webview`: that import always succeeds, while a
+# missing GTK/Qt piece only shows up when the client opens its window.
 if ! "$APP_PY" - <<'PYEOF'
+import importlib
 try:
     import webview  # noqa
-    print("  pywebview: OK")
 except Exception as e:
     print(f"  pywebview import error: {e}")
+    raise SystemExit(1)
+errors = []
+for name, mod in (("GTK", "webview.platforms.gtk"), ("Qt", "webview.platforms.qt")):
+    try:
+        importlib.import_module(mod)
+        print(f"  pywebview: OK ({name} backend)")
+        break
+    except Exception as e:
+        errors.append(f"{name}: {e}")
+else:
+    print("  pywebview has no usable GUI backend (" + "; ".join(errors) + ")")
     raise SystemExit(1)
 PYEOF
 then

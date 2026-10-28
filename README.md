@@ -26,7 +26,7 @@
 </p>
 
 # ⚠️ CrowdGPT v1.8 Changelog ⚠️
-- Revert back from broken weights (7 steps on server)
+- Revert back from broken weights (7 steps back on server)
 - UI fixes
 - client.py cryptographical signing
 ## What is CrowdGPT?

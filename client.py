@@ -9,7 +9,7 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 os.environ.setdefault("PYTORCH_HIP_ALLOC_CONF", "expandable_segments:False")
 os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
 
-import sys, io, json, time, struct, math, gc, threading, base64, logging, tempfile, atexit, subprocess, hashlib, shutil, ctypes, signal, argparse, datetime
+import sys, io, json, time, struct, math, gc, threading, queue, base64, logging, tempfile, atexit, subprocess, hashlib, shutil, ctypes, signal, argparse, datetime
 from pathlib import Path
 
 try:
@@ -2615,6 +2615,10 @@ class Api:
         self.username = None
         self.server_url = DEFAULT_SERVER
         self._lp = 0.0
+        # Events go to the window from their own thread: evaluate_js blocks until
+        # the GUI thread runs the script, and the training loop must never wait on it.
+        self._ui_queue = queue.Queue(maxsize=256)
+        threading.Thread(target=self._ui_pump, daemon=True, name="ui-emit").start()
         # Restore session from disk (survives auto-update restarts)
         try:
             if AUTH_TOKEN_FILE.exists():
@@ -2668,10 +2672,22 @@ class Api:
             if n - self._lp < 0.4: return
             self._lp = n
         try:
-            clean_data = sanitize_for_json(data)
-            self.window.evaluate_js(f"window.handleEvent({json.dumps(ev)}, {json.dumps(clean_data)});")
+            script = f"window.handleEvent({json.dumps(ev)}, {json.dumps(sanitize_for_json(data))});"
         except Exception as e:
             log.warning(f"Emit failed for {ev}: {e}")
+            return
+        try:
+            self._ui_queue.put_nowait(script)
+        except queue.Full:
+            pass  # GUI isn't keeping up (or is hung); drop rather than block training
+
+    def _ui_pump(self):
+        while True:
+            script = self._ui_queue.get()
+            try:
+                self.window.evaluate_js(script)
+            except Exception as e:
+                log.warning(f"Emit failed: {e}")
 
     def get_backends(self):
         available = get_available_backends()

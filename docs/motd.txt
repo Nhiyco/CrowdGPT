@@ -1,3 +1,4 @@
-CrowdGPT v1.7 important notice:
-- Server is currently working again!!
-- If you don’t see v1.7 on the client’s UI, update the client manually (or your user will get banned due to new server checks)
+CrowdGPT v1.8 important notice:
+- Rolled back a broken model weight
+- Fixed the aggregation logic server-side
+Check GitHub for more infos

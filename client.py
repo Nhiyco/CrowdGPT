@@ -1372,6 +1372,7 @@ class HeartbeatManager:
         self.srv = srv; self.h = h; self.cr = cr
         self.stop_training = threading.Event(); self.shutdown = threading.Event()
         self.se = se; self.emit = emit
+        self.tid = None  # set while training; the server reports if the task is gone
         self._t = threading.Thread(target=self._r, daemon=True)
     def start(self): self._t.start()
     def stop(self): self.shutdown.set()
@@ -1379,7 +1380,14 @@ class HeartbeatManager:
     def _r(self):
         while not self.shutdown.is_set() and not self.se.is_set():
             try:
-                requests.get(f"{self.srv}/fl/heartbeat", headers=self.h, timeout=10)
+                tid = self.tid
+                r = requests.get(f"{self.srv}/fl/heartbeat", headers=self.h, timeout=10,
+                                 params={"taskId": tid} if tid else None)
+                # Older servers don't send "task"; only act on an explicit "gone".
+                if tid and r.status_code == 200 and r.json().get("task") == "gone":
+                    self.emit('log', f"Task {tid} no longer exists on the server "
+                                     f"(restarted or pool closed). Stopping.")
+                    self.stop_training.set()
                 r = requests.get(f"{self.srv}/fl/round_status", headers=self.h, timeout=10)
                 if r.status_code == 200:
                     st = r.json()
@@ -2093,6 +2101,7 @@ def run_single_round_wrapper(srv, at, se, emit):
         tid, gs, sl, cohort_mode, cc_seed, cc_steps, cc_bs, cc_accum, cc_autocast = _parse_task_meta(md, emit)
         if not tid:
             emit("log", "Task metadata missing taskId."); return
+        hb.tid = tid
 
         # ---- Fetch weights (HF preferred, coordinator fallback) ----
         iw = ie = None
@@ -2118,6 +2127,7 @@ def run_single_round_wrapper(srv, at, se, emit):
             md = md2
             # RE-PARSE in case the fallback returned different metadata
             tid, gs, sl, cohort_mode, cc_seed, cc_steps, cc_bs, cc_accum, cc_autocast = _parse_task_meta(md, emit)
+            hb.tid = tid
             if not tid:
                 emit("log", "Coordinator task metadata missing taskId."); return
             bbl = EXPECTED_MODEL_SIZE * 2
@@ -2420,9 +2430,10 @@ def run_single_round_wrapper(srv, at, se, emit):
         # waste 10+ minutes of wall clock per attempt. Bail now and let the next
         # cycle fetch a fresh task.
         if hb.should_stop():
-            emit('log', f"Round changed mid-training (was round {cr}); "
+            emit('log', f"Stopped mid-training (round {cr} ended or task gone); "
                         f"discarding partial delta — no upload.")
             return
+        hb.tid = None  # training done; the pool closing during upload is expected
 
         if cohort_mode and int(micro_step) != int(cc_steps):
             emit('log', f"[COHORT] only completed {micro_step}/{cc_steps} steps; "

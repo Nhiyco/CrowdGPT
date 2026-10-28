@@ -1,2 +1,3 @@
-CrowdGPT v1.7 changelog:
-- Server is currently undergoing issues. Keep your client idle and it should start training eventually.
+CrowdGPT v1.7 important notice:
+- Server is currently working again!!
+- If you don’t see v1.7 on the client’s UI, update the client manually (or your user will get banned due to new server checks)

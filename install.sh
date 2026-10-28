@@ -550,6 +550,20 @@ if [[ "$NEED_OLD_TRANSFORMERS" -eq 1 ]]; then
 fi
 
 # ============================================================
+# 8c. bitsandbytes (8-bit Adam) on NVIDIA
+#     Without it the client sizes the batch for fp32 Adam state,
+#     and 8-12 GB cards can't reach the cohort batch size.
+# ============================================================
+if [[ "$BACKEND" == "nvidia" ]]; then
+    log "Installing bitsandbytes (8-bit optimizer)..."
+    if "$APP_PY" -m pip install bitsandbytes; then
+        ok "bitsandbytes installed"
+    else
+        warn "bitsandbytes failed to install; GPUs under ~12 GB may not be able to join a cohort."
+    fi
+fi
+
+# ============================================================
 # 9. GUI backend for pywebview
 # ============================================================
 hdr "GUI backend for pywebview"

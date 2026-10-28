@@ -1,6 +1,14 @@
 #!/usr/bin/env python3
 """
-CrowdGPT GUI Client v1.7
+CrowdGPT GUI Client v1.8
+
+v1.8 changes:
+  - Engram training ENABLED by default (CROWDGPT_ENGRAM=0 to disable)
+  - Engram wired into forward pass (x = x + self.engram(idx))
+  - Reports X-Client-Autocast and X-Client-Optim to the coordinator
+  - Honors targetAutocast=fp32 from the pool (disables AMP)
+  - CPU batch-size capped at 2 (prevents "bs=128 on CPU" advertisement)
+  - Reports X-Client-Engram for forward-compat server matching
 """
 
 import os
@@ -38,7 +46,7 @@ sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='repla
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s', datefmt='%H:%M:%S')
 log = logging.getLogger(__name__)
 
-CLIENT_VERSION = "1.7"
+CLIENT_VERSION = "1.8"
 VERSION_URL = "https://raw.githubusercontent.com/Vxtzq/CrowdGPT/main/docs/version.txt"
 CLIENT_URL  = "https://raw.githubusercontent.com/Vxtzq/CrowdGPT/main/client.py"
 HTML_URL    = "https://raw.githubusercontent.com/Vxtzq/CrowdGPT/main/client.html"
@@ -47,9 +55,6 @@ VERSION_SIG_URL = VERSION_URL + ".sig"
 # ---------------------------------------------------------------------------------------------------------------
 # Signed auto-update.  A release is only installed if docs/version.txt carries a valid Ed25519 signature
 # (docs/version.txt.sig) made with one of these keys.  The PRIVATE keys never touch GitHub; see RELEASING.md.
-# Put two keys here: the day-to-day signing key and an offline recovery key (a lost key then does not strand users).
-# Generate with:  python tools/sign_release.py gen-key --out <private.pem>   (it prints the line to paste below)
-# While this list is empty the client refuses ALL updates (fail closed).
 # ---------------------------------------------------------------------------------------------------------------
 UPDATE_PUBKEYS = [
     "rVmzV5syTbiv3okEACObqUyZDNa1S5iWZHKpTJJs8kc=",
@@ -124,21 +129,15 @@ def ed25519_verify(public_key, message, signature):
         return False
 
 
-
-
 class AuthRejected(Exception):
     """Raised when the coordinator rejects our bearer token (401/403)."""
     pass
-    
-class CohortAbort(Exception):
-    """Raised to abort a cohort round cleanly when invariants can't be maintained.
 
-    Under matchmaking, a pool member that can't honor targetSeed /
-    targetLocalSteps / targetBatchSize / targetAutocast would produce a delta
-    the cross-check flags as an outlier. That burns a byzantine strike on a
-    legitimate client. We abort instead and re-match next round.
-    """
+
+class CohortAbort(Exception):
+    """Raised to abort a cohort round cleanly when invariants can't be maintained."""
     pass
+
 
 def _parse_version(v):
     try:
@@ -149,7 +148,6 @@ def _parse_version(v):
 
 
 def _verify_manifest(manifest_bytes, sig_text, pubkeys=None):
-    """Signature over the exact bytes of version.txt, valid under ANY configured key."""
     try:
         sig = base64.b64decode(str(sig_text).strip(), validate=True)
     except Exception:
@@ -164,7 +162,6 @@ def _verify_manifest(manifest_bytes, sig_text, pubkeys=None):
 
 
 def _parse_manifest(manifest_bytes):
-    """version.txt: line 1 = version, then 'key: value' lines (sha256_clientpy, sha256_clienthtml, expires)."""
     lines = [l.strip() for l in manifest_bytes.decode("utf-8").replace("\r\n", "\n").split("\n") if l.strip()]
     m = {"version": lines[0]}
     for l in lines[1:]:
@@ -179,7 +176,6 @@ def _is_sha256(h):
 
 
 def _fetch_remote_version():
-    """Return (version, sha256_py, sha256_html) ONLY if version.txt is correctly signed, unexpired and carries both hashes."""
     if not UPDATE_PUBKEYS:
         log.info("Auto-update disabled: no update signing keys are built into this client.")
         return None, None, None
@@ -193,7 +189,6 @@ def _fetch_remote_version():
         m = _parse_manifest(manifest)
         exp = m.get("expires")
         if exp and datetime.datetime.now(datetime.timezone.utc).date() > datetime.date.fromisoformat(exp):
-            # a signed expiry stops an attacker replaying an old (vulnerable) signed release forever
             log.warning("Update refused: signed release metadata expired (%s).", exp)
             return None, None, None
         hash_py, hash_html = m.get("sha256_clientpy", "").lower(), m.get("sha256_clienthtml", "").lower()
@@ -217,7 +212,6 @@ def _download_new_client(expected_version, expected_hash_py=None, expected_hash_
         log.warning(f"Could not download client update: {e}")
         return None
 
-    # Security: the hashes come from the SIGNED manifest and are mandatory.
     if not (_is_sha256(expected_hash_py) and _is_sha256(expected_hash_html)):
         log.warning("Update refused: missing SHA-256 hashes."); return None
     if expected_hash_py:
@@ -329,8 +323,7 @@ def _restart_self():
 
 
 # Weight cache, session and settings live next to client.py, which is where the
-# installers already preserve checkpoints/ across updates. A relative path would
-# follow whatever directory the client happens to be started from.
+# installers already preserve checkpoints/ across updates.
 CHECKPOINT_DIR = Path(__file__).resolve().parent / "checkpoints"
 CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -338,16 +331,14 @@ AUTH_TOKEN_FILE = CHECKPOINT_DIR / "auth_token.json"
 
 
 def _write_private(path, text):
-    """Write a file only the current user can read (used for the session token)."""
     fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         f.write(text)
-    try: os.chmod(str(path), 0o600)  # also tightens a file created by an older version
+    try: os.chmod(str(path), 0o600)
     except OSError: pass
 
 
 def _migrate_cwd_checkpoints():
-    """Move data older versions wrote to ./checkpoints in the working directory."""
     old = Path.cwd() / "checkpoints"
     try:
         if not old.is_dir() or old.resolve() == CHECKPOINT_DIR: return
@@ -360,7 +351,7 @@ def _migrate_cwd_checkpoints():
                 log.info(f"[cache] moved {src} -> {dst}")
             except Exception as e:
                 log.warning(f"[cache] could not move {src}: {e}")
-    try: old.rmdir()  # only succeeds if nothing else is left in it
+    try: old.rmdir()
     except OSError: pass
 
 
@@ -435,7 +426,6 @@ def prune_hf_cache(keep_revision: str = None, log_fn=None):
                 except Exception: pass
         except Exception: pass
         try:
-            # Upload payloads left behind if the client was killed mid-upload.
             for f in CHECKPOINT_DIR.glob("delta-*.gz"):
                 try:
                     if now - f.stat().st_mtime > STALE_PART_AGE_SEC:
@@ -481,7 +471,12 @@ HEAD_DIM = MODEL_CONFIG["headDim"]
 MAX_SEQ_LEN = MODEL_CONFIG["maxSeqLen"]
 MLP_HIDDEN = MODEL_CONFIG["mlpHidden"]
 ENG_NUM_BUCKETS = 227865
-ENGRAM_ACTIVE = False
+
+# v1.8: Engram training is ON by default. Set CROWDGPT_ENGRAM=0 to disable
+# (useful on RAM-constrained machines: engram adds ~1.4 GB of table + ~700 MB
+# of safetensors cache on top of the base model).
+ENGRAM_ACTIVE = os.environ.get("CROWDGPT_ENGRAM", "1") == "1"
+
 LOSS_CHUNK = 256
 UPLOAD_BUFFER_MIN = 25
 ALLOWED_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64, 128]
@@ -511,6 +506,21 @@ EXPECTED_ENGRAM_BYTES = EXPECTED_ENGRAM_SIZE * 2
 EXPECTED_WEIGHT_BYTES = EXPECTED_MODEL_BYTES + EXPECTED_ENGRAM_BYTES
 memory_config = {"ram_gb": 12, "is_auto_detected": False}
 train_device, train_backend = None, None
+
+if ENGRAM_ACTIVE:
+    log.info("🧠 Engram training ENABLED — client will learn ~350M sparse bucket rows")
+    log.info("   Adds ~1.4 GB for the table + ~700 MB for the safetensors cache")
+    log.info("   Disable with CROWDGPT_ENGRAM=0 if RAM constrained")
+    try:
+        import psutil
+        _avail = psutil.virtual_memory().available / 1024**3
+        if _avail < 12:
+            log.warning(f"⚠️ Only {_avail:.1f} GB RAM available; engram training needs ~5 GB extra. "
+                        f"Set CROWDGPT_ENGRAM=0 to disable.")
+    except Exception:
+        pass
+else:
+    log.info("🧠 Engram training DISABLED (CROWDGPT_ENGRAM=0)")
 
 
 def safe_float(v, default=0.0):
@@ -960,13 +970,32 @@ def recommend_batch_size(sl=MAX_SEQ_LEN):
     if train_backend == "ROCM":
         rocm_bs_cap = max(1, min(8, int(os.environ.get("CROWDGPT_ROCM_BATCH", 1))))
         best = min(best, rocm_bs_cap)
-    log.info(f"[BATCH] recommended bs={best} for budget={memory_config['ram_gb']:.2f}GB (8bit_opt={u8})")
+    if train_backend == "CPU":
+        # CPU throughput is token-bound; a large bs is a memory fit, not a
+        # speedup, and inflates X-Client-Batch-Size for no benefit. Cap to 2
+        # (the server's targetBatchSize).
+        best = min(best, 2)
+    log.info(f"[BATCH] recommended bs={best} for budget={memory_config['ram_gb']:.2f}GB "
+             f"(8bit_opt={u8}, backend={train_backend})")
     return best
 
 
-# === NEW: hardware headers ===
+def _predict_optim(backend):
+    """Predict which base-parameter optimizer _build_optimizers will use.
+    Must stay in sync with _build_optimizers below, or the header will lie."""
+    if backend not in ("CUDA", "ROCM"):
+        return "adamw32"
+    try:
+        import bitsandbytes as bnb
+        if not hasattr(bnb, "optim") or not hasattr(bnb.optim, "AdamW8bit"):
+            return "adamw32"
+        return "adamw8bit"
+    except Exception:
+        return "adamw32"
+
+
 def _hardware_headers():
-    """Hardware fingerprint for server cohort overflow compatibility."""
+    """Hardware + precision + optim fingerprint for tiered matchmaking."""
     try:
         bs = recommend_batch_size(MAX_SEQ_LEN)
     except Exception:
@@ -979,11 +1008,23 @@ def _hardware_headers():
             gpu = str(train_backend)
     except Exception:
         pass
+
+    try:
+        _ua, _ad = _pick_autocast(train_backend)
+        autocast_str = "bf16" if _ua else "fp32"
+    except Exception:
+        autocast_str = "fp32"
+
+    optim_str = _predict_optim(train_backend)
+
     return {
-        "X-Client-Backend": (train_backend or "UNKNOWN").upper(),
+        "X-Client-Backend":   (train_backend or "UNKNOWN").upper(),
         "X-Client-Batch-Size": str(bs),
-        "X-Client-Vram-Gb": f"{memory_config.get('ram_gb', 0.0):.2f}",
-        "X-Client-Gpu-Name": gpu,
+        "X-Client-Vram-Gb":   f"{memory_config.get('ram_gb', 0.0):.2f}",
+        "X-Client-Gpu-Name":  gpu,
+        "X-Client-Autocast":  autocast_str,
+        "X-Client-Optim":     optim_str,
+        "X-Client-Engram":    "1" if ENGRAM_ACTIVE else "0",  # forward-compat; server may ignore
     }
 
 
@@ -1117,6 +1158,7 @@ class Block(nn.Module):
 
 
 class EngramMemory(nn.Module):
+    """Bigram-hash memory. Returns zeros when disabled (rows=1)."""
     def __init__(self, bn, device):
         super().__init__()
         self.device = device
@@ -1125,6 +1167,10 @@ class EngramMemory(nn.Module):
         nn.init.normal_(self.table.weight, mean=0.0, std=0.02)
 
     def forward(self, idx):
+        if self.table.num_embeddings <= 1:
+            # Engram disabled — zero contribution, no gradient.
+            return torch.zeros(idx.shape[0], idx.shape[1], DIM,
+                               device=self.device, dtype=torch.float32)
         idx_cpu = idx.detach().cpu()
         px = torch.cat([torch.zeros_like(idx_cpu[:, :1]), idx_cpu[:, :-1]], dim=1)
         hi = (px * 1000003 + idx_cpu) % ENG_NUM_BUCKETS
@@ -1215,6 +1261,14 @@ class SotaGPT(nn.Module):
         else:
             x = F.embedding(idx.to(wdev), self.wte.weight)
             if x.device != dev: x = x.to(dev)
+
+        # v1.8: engram residual — gradient flows sparsely to table.weight
+        if ENGRAM_ACTIVE:
+            eng = self.engram(idx)
+            if eng.dtype != x.dtype:
+                eng = eng.to(x.dtype)
+            x = x + eng
+
         if dev.type == 'cpu': cos, sin = self.freqs_cos_cpu, self.freqs_sin_cpu
         else: cos, sin = self.freqs_cos_main, self.freqs_sin_main
         for i, block in enumerate(self.blocks):
@@ -1321,7 +1375,7 @@ class StreamingShardDataset:
 
     def needs_new_subchunk(self):
         if self.n == 0: return True
-        if self.cohort_mode: return False    # stay on the same subchunk for the whole cohort
+        if self.cohort_mode: return False
         return self.steps_used >= self.STEPS_PER_SUBCHUNK
 
     def advance(self, srv=None, fmt="bf16"):
@@ -1342,7 +1396,7 @@ class StreamingShardDataset:
 
     def _req(self, srv, fmt="bf16"):
         if not srv: return False
-        if self.cohort_mode: return False     # never re-shard mid-cohort
+        if self.cohort_mode: return False
         try:
             h = {"Authorization": f"Bearer {self.auth_token}"} if self.auth_token else {}
             req_headers = {**h, **_hardware_headers()}
@@ -1409,7 +1463,7 @@ class HeartbeatManager:
         self.srv = srv; self.h = h; self.cr = cr
         self.stop_training = threading.Event(); self.shutdown = threading.Event()
         self.se = se; self.emit = emit
-        self.tid = None  # set while training; the server reports if the task is gone
+        self.tid = None
         self._t = threading.Thread(target=self._r, daemon=True)
     def start(self): self._t.start()
     def stop(self): self.shutdown.set()
@@ -1420,7 +1474,6 @@ class HeartbeatManager:
                 tid = self.tid
                 r = requests.get(f"{self.srv}/fl/heartbeat", headers=self.h, timeout=10,
                                  params={"taskId": tid} if tid else None)
-                # Older servers don't send "task"; only act on an explicit "gone".
                 if tid and r.status_code == 200 and r.json().get("task") == "gone":
                     self.emit('log', f"Task {tid} no longer exists on the server "
                                      f"(restarted or pool closed). Stopping.")
@@ -1469,7 +1522,6 @@ def wait_for_round(srv, h, se, emit):
 
 
 def fetch_task_metadata(srv, h, se, emit):
-    """Fetch /fl/task?skip_weights=true. Sends hardware headers for cohort overflow."""
     while not se.is_set():
         try:
             req_headers = {**(h or {}), **_hardware_headers()}
@@ -1704,6 +1756,8 @@ def fetch_task(srv, h, prec, se, emit):
             if se.is_set(): return None, None
             emit('log', f"Task fetch failed: {e}")
             time.sleep(15)
+
+
 # =================== LOSS / TRAINING ===================
 def _chunk_ce(xs, w, ys):
     logits = F.linear(xs.to(w.dtype), w)
@@ -1823,7 +1877,7 @@ class DegradeLadder:
             try:
                 self.on_step_down(self)
             except CohortAbort:
-                raise                       # propagate: abort round cleanly
+                raise
             except Exception as e:
                 log.warning(f"on_step_down failed: {e}")
         _clear_accel_cache(m.accel_device)
@@ -1857,8 +1911,6 @@ def _sha256_file(path, piece=8 * 1024 * 1024):
 
 
 def _post_json_with_retry(url, payload, h, emit, se, timeout=60, retries=4, max_total_wait_s=7200):
-    """Rate limits (429/503) don't consume retries; only real errors do.
-       Bounded by max_total_wait_s (default 2h) so we don't wait forever."""
     last_err = None
     real_attempts = 0
     total_waited = 0.0
@@ -1878,7 +1930,7 @@ def _post_json_with_retry(url, payload, h, emit, se, timeout=60, retries=4, max_
                             f"({r.text[:120]})")
                 time.sleep(min(retry_after, 3600))
                 total_waited += retry_after
-                continue                            # ← rate limit: no retry consumed
+                continue
             r.raise_for_status()
             return r
         except KeyboardInterrupt:
@@ -1895,7 +1947,6 @@ def _post_json_with_retry(url, payload, h, emit, se, timeout=60, retries=4, max_
 
 
 def _chunked_submit_once(srv, h, delta_path, meta, emit, se, chunk_size):
-    # Reads one chunk at a time from disk, so the whole upload never sits in RAM (#7).
     total = os.path.getsize(delta_path)
     chunks = max(1, math.ceil(total / chunk_size))
     checksum = _sha256_file(delta_path)
@@ -1924,13 +1975,11 @@ def _chunked_submit_once(srv, h, delta_path, meta, emit, se, chunk_size):
             except KeyboardInterrupt: raise
             except Exception as e:
                 if "CHUNK_TOO_LARGE" in str(e): raise
-                # Respect Retry-After on 429 (server-side rate limit)
                 if getattr(e, "response", None) is not None and e.response.status_code == 429:
                     retry_after = int(e.response.headers.get("Retry-After", "60"))
                     emit("log", f"⏳ Server rate-limited chunk {idx+1}/{chunks}; "
                                 f"waiting {retry_after}s ({e.response.text[:120]})")
                     time.sleep(min(retry_after, 3600))
-                    # Don't increment attempt; this is a legitimate wait, not a failure
                     continue
                 attempt += 1
                 if se.is_set() or attempt >= MAX_CHUNK_RETRY: raise
@@ -1992,10 +2041,11 @@ def _build_optimizers(model, lr=1e-4):
     ep = list(model.engram.parameters())
     groups = {}
     for p in bp: groups.setdefault(p.device.type, []).append(p)
+    use_8bit = (_predict_optim(train_backend) == "adamw8bit")
     opts = []
     for dev_type, ps in groups.items():
         o = None
-        if dev_type == 'cuda':
+        if dev_type == 'cuda' and use_8bit:
             try:
                 import bitsandbytes as bnb
                 o = bnb.optim.AdamW8bit(ps, lr=lr, betas=(0.9, 0.95), weight_decay=0.01)
@@ -2025,12 +2075,6 @@ def _to_bf16_exact(arr): return torch.from_numpy(arr).to(torch.bfloat16)
 
 
 def _write_base_delta_bf16(gz, model, iw_bf16, piece=16 * 1024 * 1024):
-    """Write the bf16 base delta into `gz`, a few MB at a time.
-
-    The full delta is never held in RAM. Each parameter's storage is released
-    right after it is written, so memory goes down while this runs. The model
-    is unusable afterwards (#7).
-    """
     o = 0
     for n, p in model.named_parameters():
         if n.startswith('engram.'): continue
@@ -2057,11 +2101,6 @@ def _engram_sparse_delta(table, iew_bf16, frac=0.10, chunk=32768):
 
 
 def _write_delta_file(path, header_bytes, model, iw_bf16, engram_arrays, level=6, piece=64 * 1024 * 1024):
-    """Write the gzip upload payload (header, base delta, engram arrays) to `path`.
-
-    The decompressed bytes match the old in-memory format exactly, so the
-    server side needs no change.
-    """
     with open(path, 'wb') as f, gzip.GzipFile(fileobj=f, mode='wb', compresslevel=level) as gz:
         gz.write(header_bytes)
         _write_base_delta_bf16(gz, model, iw_bf16)
@@ -2090,9 +2129,7 @@ def _cpu_calibration_batch(x, y, full_sl):
     return x[:, :step_sl].contiguous(), y[:, :step_sl].contiguous(), step_sl
 
 
-# === NEW: parse task metadata + cross-check config ===
 def _parse_task_meta(md, emit):
-    """Returns (tid, gs, sl, cohort_mode, cc_seed, cc_steps, cc_bs, cc_accum, cc_autocast)."""
     tid = md.get("taskId")
     gs = md.get("globalStep")
     sl = MAX_SEQ_LEN
@@ -2140,7 +2177,6 @@ def run_single_round_wrapper(srv, at, se, emit):
             emit("log", "Task metadata missing taskId."); return
         hb.tid = tid
 
-        # ---- Fetch weights (HF preferred, coordinator fallback) ----
         iw = ie = None
         if USE_HF_WEIGHTS:
             wcfg = md.get("weights") or {}
@@ -2162,7 +2198,6 @@ def run_single_round_wrapper(srv, at, se, emit):
             md2, wb = fetch_task(srv, h, "bf16", se, emit)
             if md2 is None: return
             md = md2
-            # RE-PARSE in case the fallback returned different metadata
             tid, gs, sl, cohort_mode, cc_seed, cc_steps, cc_bs, cc_accum, cc_autocast = _parse_task_meta(md, emit)
             hb.tid = tid
             if not tid:
@@ -2176,12 +2211,11 @@ def run_single_round_wrapper(srv, at, se, emit):
             ie = _bf16_from_bytes(wb, bbl, ebl) if ENGRAM_ACTIVE else None
             del wb; gc.collect()
 
-        # ---- Build dataset ----
         emit('status', 'preparing'); emit('log', "Preparing model...")
         dc = md.get("datasetConfig", {}); sc = md.get("shardConfig", {})
         slot = sc.get("slot", 0)
         if cohort_mode:
-            slot = 0   # CRITICAL: cohort members must read identical data
+            slot = 0
             emit('log', "[COHORT] slot forced to 0 (identical shard for all members)")
         ds = StreamingShardDataset(
             dc.get("repoId", DATASET_REPO_ID),
@@ -2192,17 +2226,12 @@ def run_single_round_wrapper(srv, at, se, emit):
             cohort_mode=cohort_mode,
         )
 
-        # ---- Batch size (capped in cohort mode) ----
         bs = recommend_batch_size(sl)
         if cohort_mode and cc_bs and int(cc_bs) > 0:
-            # The cohort needs exactly the target bs. recommend_batch_size() assumes
-            # everything is resident on the GPU; _plan_placement() streams blocks
-            # from RAM when they don't fit, so try the target and let OOM decide.
             if bs < int(cc_bs):
                 emit('log', f"[COHORT] estimated bs={bs} < target={cc_bs}; "
                             f"trying {cc_bs} with more layers offloaded")
             bs = int(cc_bs)
-        # ---- Build model with OOM retry ----
         model = None
         while bs >= 1:
             try:
@@ -2252,21 +2281,25 @@ def run_single_round_wrapper(srv, at, se, emit):
         ua, ad = _pick_autocast(train_backend)
 
         emit('log', f"Backend: {train_backend} | autocast: {ua} | "
-                   f"bs={bs} | accum={as_} | dtype={'bf16' if ua else 'fp32'}")
+                   f"bs={bs} | accum={as_} | dtype={'bf16' if ua else 'fp32'} | "
+                   f"engram={'on' if ENGRAM_ACTIVE else 'off'} | "
+                   f"optim={_predict_optim(train_backend)}")
         if train_backend == 'ROCM':
             emit('log', '[ROCM-FIX] Attention: SDPA=' +
                          ('enabled' if os.environ.get('CROWDGPT_ROCM_SDPA', '1') != '0' else 'disabled'))
 
-        # Verify autocast matches server target — abort if not.
+        # v1.8: honor server-mandated autocast. bf16 native + fp32 pool → disable AMP.
         if cohort_mode and cc_autocast and cc_autocast != "any":
             wants_bf16 = (cc_autocast == "bf16")
             if wants_bf16 != bool(ua):
-                emit('log', f"[COHORT] autocast mismatch: server wants {cc_autocast}, "
-                            f"backend {train_backend} gives {'bf16' if ua else 'fp32'} — "
-                            f"aborting round (would be flagged as outlier)")
-                return
+                if not wants_bf16:
+                    emit('log', f"[COHORT] server requires fp32 — disabling autocast")
+                    ua, ad = False, None
+                else:
+                    emit('log', f"[COHORT] cannot reach server bf16 on {train_backend} — "
+                                f"aborting round (would be flagged as outlier)")
+                    return
 
-        # ---- Calibration (SKIPPED in cohort mode) ----
         cs_ = time.time()
         target_micro_steps = 100
 
@@ -2349,7 +2382,6 @@ def run_single_round_wrapper(srv, at, se, emit):
 
         if se.is_set(): return
 
-        # ---- Set up main training loop termination ----
         if cohort_mode:
             dl = float('inf')
             target_micro_steps = int(cc_steps)
@@ -2371,7 +2403,6 @@ def run_single_round_wrapper(srv, at, se, emit):
             emit('log', f"Target: ~{target_micro_steps} micro-steps")
         emit('status', 'training')
 
-        # ---- Main training loop ----
         last_stats_emit = 0.0
 
         if cohort_mode:
@@ -2463,16 +2494,11 @@ def run_single_round_wrapper(srv, at, se, emit):
         if se.is_set():
             emit('log', "Stopped by user. Skipping upload."); return
 
-        # Round changed mid-training: the chunk was already aggregated (or will be)
-        # by the round's closing cohort. Uploading now produces a stale delta for
-        # a consumed chunk — the server rejects it with MIN_TRAIN_TIME_S 429s that
-        # waste 10+ minutes of wall clock per attempt. Bail now and let the next
-        # cycle fetch a fresh task.
         if hb.should_stop():
             emit('log', f"Stopped mid-training (round {cr} ended or task gone); "
                         f"discarding partial delta — no upload.")
             return
-        hb.tid = None  # training done; the pool closing during upload is expected
+        hb.tid = None
 
         if cohort_mode and int(micro_step) != int(cc_steps):
             emit('log', f"[COHORT] only completed {micro_step}/{cc_steps} steps; "
@@ -2483,7 +2509,6 @@ def run_single_round_wrapper(srv, at, se, emit):
         emit('log', f"Done: {micro_step} micro-steps, loss {fl:.4f}")
         emit('status', 'uploading')
 
-        # ---- Compute delta ----
         for _o in (ob, oe):
             try: _o.zero_grad(set_to_none=True)
             except Exception: pass
@@ -2493,6 +2518,8 @@ def run_single_round_wrapper(srv, at, se, emit):
 
         if ENGRAM_ACTIVE and iew is not None:
             si, sv = _engram_sparse_delta(model.engram.table.weight.data, iew)
+            if len(si) > 0:
+                emit('log', f"[ENGRAM] uploading {len(si):,} sparse row updates")
         else:
             si, sv = np.array([], dtype=np.uint32), np.array([], dtype=np.uint16)
         iew = None
@@ -2500,7 +2527,6 @@ def run_single_round_wrapper(srv, at, se, emit):
         has_engram = bool(len(si) > 0)
         engram_sparse_count = int(len(si))
 
-        # ---- Cohort reporting ----
         submit_extra = {
             "crossCheckUsed": cohort_mode,
             "actualSeed": int(cc_seed) if (cohort_mode and cc_seed is not None) else None,
@@ -2517,8 +2543,6 @@ def run_single_round_wrapper(srv, at, se, emit):
             "hasEngram": has_engram, "engramSparseCount": engram_sparse_count,
             **submit_extra,
         }).encode()
-        # The delta goes straight to a gzip file on disk instead of RAM (#7).
-        # Kept next to the weight cache, not in /tmp, which is RAM-backed on many distros.
         delta_fd, delta_path = tempfile.mkstemp(prefix="delta-", suffix=".gz", dir=str(CHECKPOINT_DIR))
         os.close(delta_fd)
         try:
@@ -2628,11 +2652,8 @@ class Api:
         self.username = None
         self.server_url = DEFAULT_SERVER
         self._lp = 0.0
-        # Events go to the window from their own thread: evaluate_js blocks until
-        # the GUI thread runs the script, and the training loop must never wait on it.
         self._ui_queue = queue.Queue(maxsize=256)
         threading.Thread(target=self._ui_pump, daemon=True, name="ui-emit").start()
-        # Restore session from disk (survives auto-update restarts)
         try:
             if AUTH_TOKEN_FILE.exists():
                 j = json.loads(AUTH_TOKEN_FILE.read_text())
@@ -2692,7 +2713,7 @@ class Api:
         try:
             self._ui_queue.put_nowait(script)
         except queue.Full:
-            pass  # GUI isn't keeping up (or is hung); drop rather than block training
+            pass
 
     def _ui_pump(self):
         while True:
@@ -2859,6 +2880,8 @@ def parse_args():
     p.add_argument("--rounds", type=int, default=0, help="stop after N rounds (0 = run forever)")
     p.add_argument("--no-tokenizer", action="store_true", help="skip loading the tokenizer")
     p.add_argument("--no-update", action="store_true", help="don't check for client.py updates")
+    p.add_argument("--no-engram", action="store_true",
+                   help="disable engram training for this run (also: CROWDGPT_ENGRAM=0)")
     p.add_argument("--dry-run", action="store_true",
                    help="check auth + backend + task metadata, then exit without training")
     p.add_argument("--debug", action="store_true", help="verbose logging")
@@ -2915,7 +2938,6 @@ def run_headless(args):
         if not auth_token:
             log.error(f"[auth] login failed: {err}"); return 2
     else:
-        # Try restoring from disk (headless supports persistence too)
         auth_token = None
         try:
             if AUTH_TOKEN_FILE.exists():
@@ -2928,7 +2950,8 @@ def run_headless(args):
             log.error("[auth] need --token, --user + --password, or --anon"); return 2
 
     log.info(f"[cfg] server={args.server} rounds={args.rounds or '∞'} "
-             f"vram={args.vram_gb or 'auto'}GB backend={args.backend or 'auto'}")
+             f"vram={args.vram_gb or 'auto'}GB backend={args.backend or 'auto'} "
+             f"engram={'on' if ENGRAM_ACTIVE else 'off'}")
 
     selected = args.backend if args.backend and args.backend != "auto" else None
     if selected is None:
@@ -2976,7 +2999,8 @@ def run_headless(args):
                  f"cohort_enabled={bool(cc_cfg.get('enabled'))} "
                  f"target_seed={cc_cfg.get('targetSeed')} "
                  f"target_steps={cc_cfg.get('targetLocalSteps')} "
-                 f"target_bs={cc_cfg.get('targetBatchSize')}")
+                 f"target_bs={cc_cfg.get('targetBatchSize')} "
+                 f"target_autocast={cc_cfg.get('targetAutocast')}")
         return 0
 
     max_rounds = args.rounds if args.rounds and args.rounds > 0 else 0
@@ -3064,12 +3088,10 @@ def run_gui(args):
     def _startup_and_resume():
         startup()
         if api.auth_token:
-            # Let the HTML attach handleEvent() before we emit anything
             time.sleep(1.0)
             try:
                 api.emit('login_success', {'username': api.username or 'restored'})
                 log.info(f"[auth] auto-login as {api.username} (restored session)")
-                # Start training unless the HTML already did (harmless if it did — guarded)
                 if api.thread is None or not api.thread.is_alive():
                     api.start()
                     log.info("[auto-resume] training thread started")
@@ -3085,6 +3107,12 @@ def run_gui(args):
 if __name__ == "__main__":
     args = parse_args()
     if args.debug: logging.getLogger().setLevel(logging.DEBUG)
+
+    # --no-engram CLI flag overrides the env var
+    if args.no_engram and ENGRAM_ACTIVE:
+        os.environ["CROWDGPT_ENGRAM"] = "0"
+        ENGRAM_ACTIVE = False
+        log.info("🧠 Engram training DISABLED via --no-engram")
 
     print(f"CrowdGPT client v{CLIENT_VERSION}" + (" [headless]" if args.headless else ""), flush=True)
 

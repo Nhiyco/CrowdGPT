@@ -25,8 +25,9 @@
   <strong>The best 0$ AI.</strong>
 </p>
 
-# ⚠️ CrowdGPT v1.7 Changelog ⚠️
-- Partially fixed the server with strong checks as suggests: https://www.reddit.com/r/LocalLLaMA/comments/1xff9e4/comment/19rpgilufq9tu/?utm_source=share&utm_medium=web3x&utm_name=web3xcss&utm_term=1&utm_content=share_button
+# ⚠️ CrowdGPT v1.8 Changelog ⚠️
+- Revert back from broken weights (7 steps on server)
+- UI fixes
 - client.py cryptographical signing
 ## What is CrowdGPT?
 

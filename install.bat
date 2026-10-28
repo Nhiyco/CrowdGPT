@@ -449,6 +449,22 @@ if not "!PIP_RC!"=="0" (
 :reqs_done
 
 REM ------------------------------------------------------------
+REM 7a. bitsandbytes (8-bit Adam) on NVIDIA
+REM     Without it the client sizes the batch for fp32 Adam state,
+REM     and 8-12 GB cards can't reach the cohort batch size.
+REM ------------------------------------------------------------
+if /I "!BACKEND!"=="nvidia" (
+    echo.
+    echo [INFO] Installing bitsandbytes ^(8-bit optimizer^)...
+    "!APP_PY!" -m pip install bitsandbytes
+    if errorlevel 1 (
+        echo [WARN] bitsandbytes failed to install; GPUs under ~12 GB may not be able to join a cohort.
+    ) else (
+        echo [OK] bitsandbytes installed
+    )
+)
+
+REM ------------------------------------------------------------
 REM 7b. transformers pin, based on installed torch version
 REM     DirectML ships torch 2.4.1; transformers 5.x requires
 REM     torch >= 2.6. Any torch < 2.6 gets transformers 4.x.

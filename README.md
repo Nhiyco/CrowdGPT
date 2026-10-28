@@ -31,7 +31,7 @@
 - UI fixes
 - client.py cryptographical signing
 - Engram training enabled by default
-- Tiered matchmaking (precision & optimizer aware)
+- Full Byzantine Cross-checks implementation (precision & optimizer aware)
 
 ## What is CrowdGPT?
 

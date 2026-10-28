@@ -286,7 +286,20 @@ if "!INTEGRATE!"=="1" (
 )
 
 echo [INFO] Creating venv with Python !PY_VER! at !VENV_DIR!...
-if exist "!VENV_DIR!" rmdir /s /q "!VENV_DIR!" >nul 2>nul
+if exist "!VENV_DIR!" (
+    echo [INFO] Stopping CrowdGPT and Python processes using this venv...
+    echo [WARN] Any unsaved work in CrowdGPT or scripts using this venv may be lost.
+    powershell -NoProfile -ExecutionPolicy Bypass -Command "$v=[IO.Path]::GetFullPath('!VENV_DIR!').TrimEnd('\')+'\'; Get-CimInstance Win32_Process | Where-Object { $_.Name -match '^crowdgpt(\.exe)?$' -or ($_.Name -match '^pythonw?\.exe$' -and $_.ExecutablePath -and $_.ExecutablePath.StartsWith($v,[StringComparison]::OrdinalIgnoreCase)) } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }" >nul 2>nul
+    timeout /t 2 /nobreak >nul
+    echo [INFO] Removing existing virtual environment...
+    rmdir /s /q "!VENV_DIR!" >nul 2>nul
+)
+
+if exist "!VENV_DIR!" (
+    echo [ERROR] Could not remove the existing venv.
+    echo         Close CrowdGPT and any process using its Python environment, then retry.
+    goto :fatal
+)
 
 uv venv --python !PY_VER! --seed "!VENV_DIR!"
 if errorlevel 1 (

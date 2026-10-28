@@ -1,6 +1,15 @@
 #!/usr/bin/env python3
-"""
-The file that signs CrowdGPT releases :)
+"""Offline release signing for CrowdGPT's auto-updater.   Dev-machine tool: clients never run this.
+
+    python tools/sign_release.py gen-key --out ~/secure/crowdgpt_release.pem     # once; prints the line for client.py
+    python tools/sign_release.py release                                         # every release: hash + sign + self-check
+    python tools/sign_release.py verify                                          # re-check what you are about to push
+(`release` uses ~/release.pem unless you pass --key.  Asks for the passphrase once.)
+
+`release` reads CLIENT_VERSION, hashes client.py and client.html, writes docs/version.txt
+(line 1 = version, then sha256_clientpy:, sha256_clienthtml:, expires:) and signs those exact bytes
+into docs/version.txt.sig.
+Needs:  pip install cryptography      (not a client dependency)
 """
 import argparse, base64, datetime, getpass, hashlib, re, sys
 from pathlib import Path
@@ -57,6 +66,10 @@ def _load(path):
     return ser.load_pem_private_key(Path(path).expanduser().read_bytes(), pw)
 
 
+def _embedded_keys(src):
+    return re.findall(r'^\s*"([A-Za-z0-9+/=]{44})",', src[src.index("UPDATE_PUBKEYS"):src.index("# --- minimal pure-Python")], re.M)
+
+
 def cmd_release(a):
     code = _client_bytes()
     version = _client_version(code)
@@ -68,11 +81,16 @@ def cmd_release(a):
         lines.append("expires: " + (datetime.date.today() + datetime.timedelta(days=a.expires_days)).isoformat())
     manifest = ("\n".join(lines) + "\n").encode()
     priv = _load(a.key)
+    if _pub_b64(priv) not in _embedded_keys(CLIENT.read_text(encoding="utf-8")):
+        sys.exit("STOP: this key's public half is NOT in UPDATE_PUBKEYS in client.py, so clients would reject "
+                 f"the release.\nIts public key is: {_pub_b64(priv)}")
     sig = base64.b64encode(priv.sign(manifest)).decode() + "\n"
     VERSION_TXT.write_bytes(manifest)
     SIG.write_text(sig, encoding="ascii", newline="\n")
     print(f"Signed release {version}\n{manifest.decode()}")
-    print(f"signing key: {_pub_b64(priv)}\nNow: git add client.py client.html docs/version.txt docs/version.txt.sig && git commit && git push")
+    print(f"signing key: {_pub_b64(priv)}")
+    cmd_verify(a)      # prove a real client would accept it before you push
+    print("Now: git add client.py client.html docs/version.txt docs/version.txt.sig && git commit && git push  (and merge nothing into client.py afterwards)")
 
 
 def cmd_verify(a):
@@ -82,7 +100,7 @@ def cmd_verify(a):
     mod = types.ModuleType("client_verify"); mod.__dict__.update(base64=base64, hashlib=hashlib, datetime=datetime, UPDATE_PUBKEYS=[])
     start, end = src.index("_ED_P = 2 **"), src.index("def _fetch_remote_version")
     exec(src[start:end], mod.__dict__)
-    keys = [k for k in re.findall(r'^\s*"([A-Za-z0-9+/=]{44})",', src[src.index("UPDATE_PUBKEYS"):src.index("# --- minimal pure-Python")], re.M)]
+    keys = _embedded_keys(src)
     if not keys:
         sys.exit("FAIL: UPDATE_PUBKEYS in client.py is empty.")
     manifest, sig = VERSION_TXT.read_bytes(), SIG.read_text()
@@ -101,7 +119,7 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
     g = sub.add_parser("gen-key"); g.add_argument("--out", required=True); g.set_defaults(fn=cmd_gen_key)
-    r = sub.add_parser("release"); r.add_argument("--key", required=True)
+    r = sub.add_parser("release"); r.add_argument("--key", default="~/release.pem")
     r.add_argument("--expires-days", type=int, default=180); r.add_argument("--no-expiry", action="store_true"); r.set_defaults(fn=cmd_release)
     v = sub.add_parser("verify"); v.set_defaults(fn=cmd_verify)
     a = ap.parse_args(); a.fn(a)

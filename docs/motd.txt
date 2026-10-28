@@ -1,4 +1,2 @@
 CrowdGPT v1.7 changelog:
-- Server is now much more robust, with cross-checks between clients
-- Auto restart training after an update finally seems to work
-- RAM usage reduction on client
+- Server is currently undergoing issues. Keep your client idle and it should start training eventually.

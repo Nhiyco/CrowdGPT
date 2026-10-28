@@ -2185,15 +2185,13 @@ def run_single_round_wrapper(srv, at, se, emit):
         # ---- Batch size (capped in cohort mode) ----
         bs = recommend_batch_size(sl)
         if cohort_mode and cc_bs and int(cc_bs) > 0:
-            bs = min(bs, int(cc_bs))
-            emit('log', f"[COHORT] bs = min(local, {cc_bs}) = {bs}")
-
-        # ---- Critical invariant: if we can't hit target bs, opt out of cohort ----
-        # ---- Critical invariant: if we can't hit target bs, abort ----
-        if cohort_mode and int(bs) < int(cc_bs):
-            emit('log', f"[COHORT] local bs={bs} < target={cc_bs}; cannot maintain invariants — "
-                        f"aborting round (would be flagged as outlier)")
-            return
+            # The cohort needs exactly the target bs. recommend_batch_size() assumes
+            # everything is resident on the GPU; _plan_placement() streams blocks
+            # from RAM when they don't fit, so try the target and let OOM decide.
+            if bs < int(cc_bs):
+                emit('log', f"[COHORT] estimated bs={bs} < target={cc_bs}; "
+                            f"trying {cc_bs} with more layers offloaded")
+            bs = int(cc_bs)
         # ---- Build model with OOM retry ----
         model = None
         while bs >= 1:
@@ -2213,6 +2211,10 @@ def run_single_round_wrapper(srv, at, se, emit):
                 else: raise
         if model is None:
             emit('log', "Failed to initialize model."); return
+        if cohort_mode and cc_bs and bs < int(cc_bs):
+            emit('log', f"[COHORT] OOM at target bs={cc_bs}; cannot maintain invariants — aborting round")
+            del model; _clear_accel_cache(train_device)
+            return
 
         iew = ie.view(model.engram.table.weight.shape) if (ENGRAM_ACTIVE and ie is not None) else None
         ie = None; _trim_heap()

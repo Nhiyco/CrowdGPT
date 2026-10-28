@@ -16,6 +16,7 @@
 </p>
 
 <p align="center">
+  <img src="https://img.shields.io/badge/Python-3.8+-3776AB?style=for-the-badge&logo=python&logoColor=white">
   <img src="https://img.shields.io/badge/License-MIT-green?style=for-the-badge">
   <img src="https://img.shields.io/badge/Version-v1.8-green?style=for-the-badge">
   <a href="https://discord.gg/2Shwqj3Xpx"><img src="https://img.shields.io/badge/Discord-Join%20Server-5865F2?style=for-the-badge&logo=discord&logoColor=white" alt="Discord"></a>
@@ -31,7 +32,7 @@
 - UI fixes
 - client.py cryptographical signing
 - Engram training enabled by default
-- Full Byzantine Cross-checks implementation (precision & optimizer aware)
+- Tiered matchmaking (precision & optimizer aware)
 
 ## What is CrowdGPT?
 
@@ -51,3 +52,59 @@ For Linux/MacOS
 
 ```bash
 curl -sSL https://raw.githubusercontent.com/Vxtzq/CrowdGPT/main/install.sh | bash
+```
+
+For Windows
+
+```
+cmd /c "curl.exe -fsSL -o install.bat https://raw.githubusercontent.com/Vxtzq/CrowdGPT/main/install.bat && install.bat"
+```
+
+## ⏳ Legacy installation (deprecated)
+
+```bash
+git clone https://github.com/Vxtzq/CrowdGPT.git
+cd CrowdGPT
+```
+
+Install the dependencies for your hardware:
+
+```bash
+# NVIDIA
+pip install -r requirements_cuda.txt
+
+# AMD
+pip install -r requirements_rocm.txt
+
+# Windows / DirectML
+pip install -r requirements_directml.txt
+
+# CPU / Apple Silicon
+pip install -r requirements.txt
+```
+
+Then:
+
+```bash
+python client.py
+```
+
+For the **automatic installer**, see [`docs/easy_install.md`](./docs/easy_install.md).
+
+---
+
+## 🧠 Contribute
+
+Training data is curated through pull requests.
+
+See [`docs/DATA.md`](./docs/DATA.md) to contribute.
+
+---
+
+<p align="center">
+  <a href="https://crowdgpt.net"><strong>crowdgpt.net</strong></a>
+  ·
+  <a href="./docs/ARCHITECTURE.md">Architecture</a>
+  ·
+  <a href="./docs/DATA.md">Data</a>
+</p>

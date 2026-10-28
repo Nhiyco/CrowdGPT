@@ -328,10 +328,47 @@ def _restart_self():
         os.execv(python, args)
 
 
-CHECKPOINT_DIR = Path("checkpoints")
+# Weight cache, session and settings live next to client.py, which is where the
+# installers already preserve checkpoints/ across updates. A relative path would
+# follow whatever directory the client happens to be started from.
+CHECKPOINT_DIR = Path(__file__).resolve().parent / "checkpoints"
 CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
 
 AUTH_TOKEN_FILE = CHECKPOINT_DIR / "auth_token.json"
+
+
+def _write_private(path, text):
+    """Write a file only the current user can read (used for the session token)."""
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(text)
+    try: os.chmod(str(path), 0o600)  # also tightens a file created by an older version
+    except OSError: pass
+
+
+def _migrate_cwd_checkpoints():
+    """Move data older versions wrote to ./checkpoints in the working directory."""
+    old = Path.cwd() / "checkpoints"
+    try:
+        if not old.is_dir() or old.resolve() == CHECKPOINT_DIR: return
+    except OSError: return
+    for name in ("hf_weights", "auth_token.json", "selected_backend.json", "selected_vram.json"):
+        src, dst = old / name, CHECKPOINT_DIR / name
+        if src.exists() and not dst.exists():
+            try:
+                shutil.move(str(src), str(dst))
+                log.info(f"[cache] moved {src} -> {dst}")
+            except Exception as e:
+                log.warning(f"[cache] could not move {src}: {e}")
+    try: old.rmdir()  # only succeeds if nothing else is left in it
+    except OSError: pass
+
+
+try: _migrate_cwd_checkpoints()
+except Exception as e: log.warning(f"[cache] migration failed: {e}")
+if AUTH_TOKEN_FILE.exists():
+    try: os.chmod(str(AUTH_TOKEN_FILE), 0o600)
+    except OSError: pass
 
 MAX_CACHED_REVISIONS = 1
 MAX_HF_CACHE_GB      = 6.0
@@ -2669,7 +2706,7 @@ class Api:
         if tok:
             self.auth_token = tok; self.username = u
             try:
-                AUTH_TOKEN_FILE.write_text(json.dumps({"token": tok, "username": u}))
+                _write_private(AUTH_TOKEN_FILE, json.dumps({"token": tok, "username": u}))
             except Exception as e:
                 log.warning(f"[auth] could not persist token: {e}")
             self.emit('login_success', {'username': u})
@@ -2684,7 +2721,7 @@ class Api:
         if tok:
             self.auth_token = tok; self.username = u
             try:
-                AUTH_TOKEN_FILE.write_text(json.dumps({"token": tok, "username": u}))
+                _write_private(AUTH_TOKEN_FILE, json.dumps({"token": tok, "username": u}))
             except Exception as e:
                 log.warning(f"[auth] could not persist token: {e}")
             self.emit('login_success', {'username': u})

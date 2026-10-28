@@ -152,6 +152,7 @@ copy_tree() {
     else
         find "$dst" -mindepth 1 -maxdepth 1 \
             ! -name '.git' ! -name '.venv' ! -name '.installed-version' \
+            ! -name 'checkpoints' ! -name 'pending_uploads' \
             -exec rm -rf {} + 2>/dev/null || true
         ( cd "$src" && tar cf - \
             --exclude='.git' \
